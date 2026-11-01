@@ -1,5 +1,5 @@
 // By hand: the browser tool (core/browser.h) against the real Edge: open a URL, print the page's text, save a
-// picture of it to %TEMP%\aic-browser.jpg, then close the window. Usage: aic_browser_probe [url] (default https://example.com).
+// picture of it to %TEMP%\aic-browser.jpg, then close the window. Usage: aic_browser_probe [url [seconds to keep it open]] (default https://example.com).
 // It opens a visible window and keeps the profile %LOCALAPPDATA%\AIControls\browser.
 #include <windows.h>
 #include <wincrypt.h>
@@ -62,6 +62,9 @@ int wmain(int argc, wchar_t** argv) {
         std::cout << "OK screenshot: " << bytes.size() << " bytes -> " << aic::ToUtf8(path) << "\n\n";
     }
 
+    if (argc > 2) {  // keep the window open for that many seconds, to look at it
+        Sleep(static_cast<DWORD>(_wtoi(argv[2])) * 1000);
+    }
     request = aic::BrowserRequest{};
     request.action = "close";
     ok = Report("close", aic::RunBrowserAction(request, never)) && ok;

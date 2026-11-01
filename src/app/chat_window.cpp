@@ -1203,6 +1203,7 @@ private:
     const Project* RowProject(size_t row) const;
     std::optional<size_t> RevealChat(const std::wstring& folder, const std::string& id);  // its row, made visible
     void SetSidebarOpen(bool open);
+    void ToggleSidebar();  // the toggle and Ctrl+B: with the terminal in the column, they bring the chats back
     void FocusSearch();
     void RefreshSessions();
     void OnSearchKey(WPARAM key);
@@ -2162,11 +2163,11 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
             const Geometry g = Layout();
             previewWide_ = false;  // dragged by hand: that is the width now
             if (dragging_ == Target::SplitSidebar) {
-                const float most = std::max(kMinSidebar, g.width - (g.width - g.area) - MinChat());
+                const float most = std::max(kMinSidebar, g.width - MinChat());
                 sidebarWidth_ = std::clamp(at.x, kMinSidebar, std::min(kMaxSidebar, most));
             } else {
-                const float most = std::max(kMinTerminal, g.width - g.areaLeft - MinChat());
-                terminalWidth_ = std::clamp(g.width - at.x, kMinTerminal, most);
+                const float most = std::max(kMinTerminal, g.width - MinChat());
+                terminalWidth_ = std::clamp(at.x, kMinTerminal, most);
             }
             PlaceChildren();
             Refresh();
@@ -2774,7 +2775,7 @@ void ChatWindow::OnClick(float x, float y) {
     }
     switch (hit.target) {
     case Target::SidebarToggle:
-        SetSidebarOpen(!sidebarOpen_);
+        ToggleSidebar();
         break;
     case Target::WinMin:
         ShowWindow(hwnd_, SW_MINIMIZE);
@@ -3101,7 +3102,7 @@ LRESULT ChatWindow::OnInputFilter(const MSGFILTER& filter) {
             return 1;
         }
         if (filter.wParam == 'B' && control) {  // the sidebar in and out
-            SetSidebarOpen(!sidebarOpen_);
+            ToggleSidebar();
             return 1;
         }
         if (filter.wParam == 'H' && control) {
@@ -3159,17 +3160,18 @@ Geometry ChatWindow::Layout() const {
     g.width = ToDip(client.right);
     g.height = ToDip(client.bottom);
     // The sidebar docks at the left and the chat takes what is left, as in Claude's app.
-    const float sidebarWidth = sidebarOpen_ ? std::min(sidebarWidth_, std::max(0.f, g.width - MinChat())) : 0.f;
-    g.areaLeft = sidebarWidth;
-    const float termWidth =
-        terminalOpen_ ? std::min(terminalWidth_, std::max(0.f, g.width - sidebarWidth - MinChat())) : 0.f;
+    // The terminal takes the sidebar's place (the same left column, the same toggle); the chats come back when it closes.
+    const float termWidth = terminalOpen_ ? std::min(terminalWidth_, std::max(0.f, g.width - MinChat())) : 0.f;
+    const float sidebarWidth =
+        sidebarOpen_ && !terminalOpen_ ? std::min(sidebarWidth_, std::max(0.f, g.width - MinChat())) : 0.f;
+    g.areaLeft = std::max(sidebarWidth, termWidth);
     if (sidebarWidth > 0) {
         g.splitSidebar = D2D1::RectF(sidebarWidth - 3, kHeader, sidebarWidth + 4, g.height);
     }
     if (termWidth > 0) {
-        g.splitTerminal = D2D1::RectF(g.width - termWidth - 4, kHeader, g.width - termWidth + 3, g.height);
+        g.splitTerminal = D2D1::RectF(termWidth - 3, kHeader, termWidth + 4, g.height);
     }
-    g.area = g.width - termWidth;
+    g.area = g.width;
     g.column = std::max(0.f, std::min(g.area - g.areaLeft - 2 * kSide, kColumnMax));
     const float left = g.areaLeft + (g.area - g.areaLeft - g.column) / 2;
     g.left = left;
@@ -3278,7 +3280,7 @@ Geometry ChatWindow::Layout() const {
         }
     }
     if (termWidth > 0) {
-        g.term = D2D1::RectF(g.area, kHeader, g.width, g.height);
+        g.term = D2D1::RectF(0, kHeader, termWidth, g.height);
         g.termScreen = D2D1::RectF(g.term.left + 14, g.term.top + 44, g.term.right - 8, g.term.bottom - 12);
         float tabLeft = g.term.left + 10;
         for (const auto& tab : tabs_) {
@@ -4246,7 +4248,7 @@ void ChatWindow::Paint() {
     PaintTerminal(g);
     for (const Target split : {Target::SplitSidebar, Target::SplitTerminal}) {  // the edge lights up to be dragged
         if ((hover_.target == split && edgeLit_) || dragging_ == split) {
-            const float x = split == Target::SplitSidebar ? g.areaLeft : g.area;
+            const float x = g.areaLeft;  // both are the left column's right edge
             // All of it: a stretch round the pointer looked like a scroll bar's thumb next to the list's own.
             Fill(D2D1::RectF(x - 1.f, kHeader, x + 1.f, g.height), 0.f, kAccent);
         }
@@ -4627,7 +4629,7 @@ void ChatWindow::PaintHeader(const Geometry& g) {
         const D2D1_POINT_2F c{(r.left + r.right) / 2, (r.top + r.bottom) / 2};
         const uint32_t color = active ? kPrimary : kSecondary;
         if (button == Target::SidebarToggle) {  // a window with its left column: filled while the sidebar is shown
-            if (sidebarOpen_) {
+            if (sidebarOpen_ && !terminalOpen_) {
                 Fill(D2D1::RectF(c.x - 7.3f, c.y - 5.8f, c.x - 3.f, c.y + 5.8f), 1.5f, color, 0.55f);
             }
             brush_->SetColor(Color(color));
@@ -5000,7 +5002,10 @@ void ChatWindow::SetSecretsOpen(bool open) {
     ClosePopup();
     searchFocus_ = false;
     if (open) {
-        sidebarOpen_ = true;  // the secrets live in the sidebar
+        sidebarOpen_ = true;  // the secrets live in the sidebar, in the column the terminal would hold
+        if (terminalOpen_) {
+            SetTerminalOpen(false);
+        }
     }
     secretsOpen_ = open;
     hover_ = {};
@@ -5691,7 +5696,7 @@ void ChatWindow::PaintTerminal(const Geometry& g) {
         return;
     }
     Fill(g.term, 0.f, kPanel);
-    Line({g.term.left, g.term.top}, {g.term.left, g.term.bottom}, kLine, 1.f);
+    Line({g.term.right, g.term.top}, {g.term.right, g.term.bottom}, kLine, 1.f);
     for (size_t i = 0; i < tabs_.size() && i < g.termTabs.size(); ++i) {  // the tabs, as in Claude's app
         const D2D1_RECT_F& r = g.termTabs[i];
         const bool active = i == activeTab_;
@@ -7708,7 +7713,7 @@ std::optional<ScrollBar> ChatWindow::Bar(const Geometry& g, Scroller s) const {
     float pos = 0, max = 0, view = 0;      // in the list's units
     switch (s) {
     case Scroller::Feed:
-        right = g.area - 4.f;  // the terminal's splitter begins there
+        right = g.area - 4.f;
         top = g.feed.top;
         bottom = g.feed.bottom;
         pos = scroll_;
@@ -7747,7 +7752,7 @@ std::optional<ScrollBar> ChatWindow::Bar(const Geometry& g, Scroller s) const {
         if (g.term.right <= g.term.left || screen == nullptr) {
             return std::nullopt;
         }
-        right = g.term.right - 3.f;
+        right = g.term.right - 6.f;  // left of the column's splitter
         top = g.termScreen.top;
         bottom = g.termScreen.bottom;
         max = static_cast<float>(screen->ScrollbackSize());
@@ -7983,9 +7988,21 @@ void ChatWindow::SetSidebarOpen(bool open) {
     Refresh();
 }
 
+void ChatWindow::ToggleSidebar() {
+    if (terminalOpen_) {
+        SetTerminalOpen(false);
+        SetSidebarOpen(true);
+        return;
+    }
+    SetSidebarOpen(!sidebarOpen_);
+}
+
 // Ctrl+H or a click on the search: the keys go to it until Esc, Enter or a click elsewhere.
 void ChatWindow::FocusSearch() {
     ClosePopup();
+    if (terminalOpen_) {
+        SetTerminalOpen(false);
+    }
     SetSidebarOpen(true);
     if (secretsOpen_) {
         SetSecretsOpen(false);
@@ -9601,6 +9618,9 @@ void ChatWindow::OpenFile(const std::wstring& path) {
 std::wstring ChatWindow::TooltipText() {
     switch (hover_.target) {
     case Target::SidebarToggle:
+        if (terminalOpen_) {
+            return L"Показать чаты (Ctrl+B)";
+        }
         return sidebarOpen_ ? L"Скрыть боковую панель (Ctrl+B)" : L"Показать боковую панель (Ctrl+B)";
     case Target::TerminalToggle:
         return terminalOpen_ ? L"Скрыть терминал" : L"Показать терминал";
