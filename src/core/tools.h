@@ -75,6 +75,7 @@ private:
     ToolResult EditFile(const Json& input) const;
     ToolResult ListDirectory(const Json& input) const;
     ToolResult Screenshot(const Json& input) const;
+    ToolResult Browser(const Json& input, const std::atomic<bool>& cancel) const;  // Edge with its own profile
     ToolResult ListChats(const Json& input) const;
     ToolResult ReadChat(const Json& input) const;
     std::vector<std::wstring> Projects(const std::string& project) const;  // the given one, else all known

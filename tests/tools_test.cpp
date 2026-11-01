@@ -139,6 +139,20 @@ int main() {
         const std::string listed = tools.Definitions().dump(-1, ' ', false);
         Expect(Has(listed, "\\\"" + spaced + "\\\""), "such a name is quoted in the list", listed);
         Expect(Has(listed, "\"screenshot\"") && aic::ToolNeedsApproval("screenshot"), "screenshot is listed and asks first");
+    Expect(Has(listed, "\"browser\"") && aic::ToolNeedsApproval("browser") && !aic::AutoAllows("browser", aic::Json::object()),
+           "browser is listed, asks first and is not in Auto");
+    r = run("browser", {{"action", "open"}, {"url", "file:///C:/Windows/win.ini"}});
+    Expect(r.isError && Has(r.text, "http"), "browser opens only http and https, before any browser starts", r.text);
+    r = run("browser", {{"action", "nope"}});
+    Expect(r.isError && Has(r.text, "Неизвестное действие"), "an unknown browser action is an error", r.text);
+    r = run("browser", {{"action", "click"}});
+    Expect(r.isError, "a click with no selector and no text is an error", r.text);
+    // Refused before any browser starts: the bridge's local-target test, with the spellings a resolver takes
+    for (const char* local : {"http://192.168.31.1/", "http://127.1/", "http://localhost:8080/", "http://[::1]:80/",
+                              "http://user@10.0.0.1/x", "http://router/", "https://100.64.1.1/", "http://0x7f.1/"}) {
+        r = run("browser", {{"action", "open"}, {"url", local}});
+        Expect(r.isError && Has(r.text, "внутри сети"), "browser does not open a local address", r.text);
+    }
         r = run("screenshot", {{"window", "no such window title 7f3a9"}});
         Expect(r.isError && r.imageBase64.empty(), "a screenshot of a missing window is an error", r.text);
         r = run("screenshot", aic::Json::object());
@@ -195,7 +209,7 @@ int main() {
             if (id == "r1") {
                 Expect(body["result"]["protocolVersion"] == "2025-06-18", "initialize echoes the version");
             } else if (id == "r2") {
-                Expect(body["result"]["tools"].size() == 10, "tools/list has ten tools");
+                Expect(body["result"]["tools"].size() == 11, "tools/list has eleven tools");
             } else if (id == "r3") {
                 Expect(body["id"] == 2 && body["result"]["isError"] == false &&
                            Has(body["result"]["content"][0]["text"], "crlf.txt"),

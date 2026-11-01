@@ -26,6 +26,7 @@ add_library(aic_core STATIC
   src/core/attachment.cpp
   src/core/auth.cpp
   src/core/bridge.cpp
+  src/core/browser.cpp
   src/core/chat_export.cpp
   src/core/claude_install.cpp
   src/core/claude_process.cpp
@@ -92,7 +93,9 @@ endforeach()
 #   aic_memory_probe  the memory folder committed and pushed (GITHUB in the environment)
 #   aic_bridge_probe  the CLIs' way out listening, for curl -x; --no-direct: as with the VPN off
 #   aic_signin_probe  the GitHub browser sign-in with the built-in app: prints the login, keeps no token
-foreach(name e2e grok github store memory bridge signin)
+#   aic_browser_probe the browser tool live: opens a URL in Edge's own profile, prints the text, a picture to
+#                     %TEMP%\aic-browser.jpg, closes the window (opens a visible window, runs a few seconds)
+foreach(name e2e grok github store memory bridge signin browser)
   add_executable(aic_${name}_probe tests/probes/${name}_probe.cpp)
   target_link_libraries(aic_${name}_probe PRIVATE aic_core)
 endforeach()

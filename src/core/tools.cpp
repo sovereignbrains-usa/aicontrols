@@ -19,6 +19,7 @@
 #include <wil/resource.h>
 
 #include "core/attachment.h"
+#include "core/browser.h"
 #include "core/chat_export.h"
 #include "core/gdrive.h"
 #include "core/store.h"
@@ -718,6 +719,15 @@ ToolSummary SummarizeHere(const std::string& name, const Json& input) {
         return {L"Показать папку", path.empty() ? L"." : path};
     }
     const std::wstring project = ToWide(StringArg(input, "project"));
+    if (name == "browser") {
+        std::string detail = StringArg(input, "action");
+        for (const char* field : {"url", "selector", "text", "key"}) {
+            if (const std::string value = StringArg(input, field); !value.empty()) {
+                detail += std::string("\n") + field + ": " + value;
+            }
+        }
+        return {L"Браузер", ToWide(detail)};
+    }
     if (name == "screenshot") {
         const std::wstring window = ToWide(StringArg(input, "window"));
         return {L"Снимок экрана", window.empty() ? L"весь экран" : L"окно «" + window + L"»"};
@@ -789,6 +799,9 @@ std::string Tools::SystemPrompt() {
            "one self-contained HTML file and refine it in place with edit_file. Paths you mention as C:\\... are "
            "clickable for the user. "
            "Prefer non-interactive commands (no pagers, no editors; -y only when the user asked for changes). "
+           "browser drives a visible Edge window with its own profile, not the user's: open an http or https "
+           "address, read the page (text), picture it (screenshot), click (selector or the visible text of a link "
+           "or button) or type into a field (selector, text, key Enter). Each action asks the user first. "
            "Reply in the language the user writes in.";
 }
 
@@ -868,6 +881,23 @@ Json Tools::Definitions() const {
                        {{"type", "string"},
                         {"description", "Part of the window's title; empty or absent: the whole screen"}}}},
                      Json::array())}},
+        Json{{"name", "browser"},
+             {"description",
+              "A browser window on this computer (Microsoft Edge with its own profile, not the user's; it stays open "
+              "between calls): `open` loads an http or https address and returns the page's title, address and text; "
+              "`text` reads the current page again; `screenshot` returns a picture of it; `click` clicks a link or "
+              "button by `selector` or by its visible `text`; `type` puts `text` into the field `selector` and presses "
+              "`key` (Enter) after it; `close` shuts the window. The user is asked before each action."},
+             {"inputSchema",
+              Schema({{"action",
+                       {{"type", "string"},
+                        {"enum", Json::array({"open", "text", "screenshot", "click", "type", "close"})},
+                        {"description", "What to do"}}},
+                      {"url", {{"type", "string"}, {"description", "open: the address, http:// or https://"}}},
+                      {"selector", {{"type", "string"}, {"description", "click, type: a CSS selector"}}},
+                      {"text", {{"type", "string"}, {"description", "click: the visible text of the link or button; type: what to type"}}},
+                      {"key", {{"type", "string"}, {"enum", Json::array({"Enter"})}, {"description", "type: a key to press after the text"}}}},
+                     Json::array({"action"}))}},
         Json{{"name", "list_chats"},
              {"description",
               "List this client's chats, Claude's and Grok's, newest first: id, who answers, last change, title. "
@@ -923,6 +953,8 @@ ToolResult Tools::Execute(const std::string& name, const Json& input, const std:
             result = ListDirectory(input);
         } else if (name == "screenshot") {
             result = Screenshot(input);
+        } else if (name == "browser") {
+            result = Browser(input, cancel);
         } else if (name == "list_chats") {
             result = ListChats(input);
         } else if (name == "read_chat") {
@@ -1147,6 +1179,24 @@ ToolResult Tools::Screenshot(const Json& input) const {
     result.text = StringArg(input, "window").empty() ? "Screenshot of the whole screen." : "Screenshot of the window.";
     result.imageBase64 = data;
     result.imageType = data.starts_with("iVBOR") ? "image/png" : "image/jpeg";
+    return result;
+}
+
+ToolResult Tools::Browser(const Json& input, const std::atomic<bool>& cancel) const {
+    BrowserRequest request;
+    request.action = StringArg(input, "action");
+    request.url = StringArg(input, "url");
+    request.selector = StringArg(input, "selector");
+    request.text = StringArg(input, "text");
+    request.key = StringArg(input, "key");
+    BrowserResult run = RunBrowserAction(request, cancel);
+    if (!run.error.empty()) {
+        return Error(run.error);
+    }
+    ToolResult result;
+    result.text = run.text.empty() ? "Готово." : run.text;
+    result.imageBase64 = run.imageBase64;
+    result.imageType = run.imageType;
     return result;
 }
 
