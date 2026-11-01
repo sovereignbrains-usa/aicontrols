@@ -799,7 +799,7 @@ std::string Tools::SystemPrompt() {
            "one self-contained HTML file and refine it in place with edit_file. Paths you mention as C:\\... are "
            "clickable for the user. "
            "Prefer non-interactive commands (no pagers, no editors; -y only when the user asked for changes). "
-           "browser drives a visible Edge window with its own profile, not the user's: open an http or https "
+           "browser drives a page in a tab of the user's own window (its own profile, not the user's): open an http or https "
            "address, read the page (text), picture it (screenshot), click (selector or the visible text of a link "
            "or button) or type into a field (selector, text, key Enter). Each action asks the user first. "
            "Reply in the language the user writes in.";
@@ -883,11 +883,11 @@ Json Tools::Definitions() const {
                      Json::array())}},
         Json{{"name", "browser"},
              {"description",
-              "A browser window on this computer (Microsoft Edge with its own profile, not the user's; it stays open "
+              "A browser tab in the user's window (its own profile, not the user's; it stays open "
               "between calls): `open` loads an http or https address and returns the page's title, address and text; "
               "`text` reads the current page again; `screenshot` returns a picture of it; `click` clicks a link or "
               "button by `selector` or by its visible `text`; `type` puts `text` into the field `selector` and presses "
-              "`key` (Enter) after it; `close` shuts the window. The user is asked before each action."},
+              "`key` (Enter) after it; `close` shuts the tab. The user is asked before each action."},
              {"inputSchema",
               Schema({{"action",
                        {{"type", "string"},

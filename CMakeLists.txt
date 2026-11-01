@@ -71,6 +71,7 @@ target_link_libraries(aic_core PUBLIC WIL::WIL nlohmann_json::nlohmann_json ws2_
 add_executable(aicontrols WIN32
   src/app/main.cpp
   src/app/chat_window.cpp
+  src/app/browser_view.cpp
   src/app/fonts.cpp
   src/app/popup_menu.cpp
   src/app/aicontrols.manifest

@@ -40,6 +40,7 @@
 #include <utility>
 #include <vector>
 
+#include "app/browser_view.h"
 #include "app/fonts.h"
 #include "app/popup_menu.h"
 #include "app/resource.h"
@@ -108,6 +109,7 @@ constexpr UINT kVoiceText = WM_APP + 16;    // VoiceResult*: what was said, as t
 constexpr UINT kUsage = WM_APP + 15;        // PlanUsage*: the plan's limits as claude.ai has them
 constexpr UINT kMemorySaved = WM_APP + 14;  // MemorySave*: the memory committed and pushed
 constexpr UINT kGithubDone = WM_APP + 17;   // GithubDone*: the token checked, or the browser's sign-in ended
+constexpr UINT kBrowserTask = WM_APP + 18;  // std::function<void()>*: the browser tool's work for this thread
 
 struct GithubDone {
     bool check = false;     // the saved token asked of the API, not a sign-in
@@ -1098,6 +1100,7 @@ private:
         bool exited = false;
         size_t scroll = 0;         // lines scrolled back from the bottom
         std::wstring preview;      // the preview tab (one at most, no shell): the HTML file it shows
+        bool browser = false;      // the browser tab (one at most, no shell): the page the agent drives
     };
     TermTab* Tab() const { return activeTab_ < tabs_.size() ? tabs_[activeTab_].get() : nullptr; }
     VtScreen* Screen() const { return Tab() != nullptr ? Tab()->screen.get() : nullptr; }
@@ -1129,6 +1132,10 @@ private:
     bool PreviewShown() const { return terminalOpen_ && Tab() != nullptr && !Tab()->preview.empty(); }
     // A page with buttons of its own (the mockup): the row above it keeps only its tab's name.
     bool PreviewOwnsControls() const { return PreviewShown() && previewControls_; }
+    // The browser tab: the agent's page (the browser tool), in the same column.
+    bool BrowserShown() const { return terminalOpen_ && Tab() != nullptr && Tab()->browser; }
+    void ShowBrowserTab();
+    void PlaceBrowser();
     TermTab* PreviewTab() const;
     void OpenPreview(const std::wstring& path);
     void EnsureWebView();
@@ -1160,7 +1167,7 @@ private:
     }  // Ctrl+click in the page: the element goes into the message
     // Wide: the sidebar goes and the chat keeps only a strip, the rest is the preview's; again: as it was.
     void SetPreviewWide(bool wide);
-    float MinChat() const { return PreviewShown() ? kMinChatPreview : kMinChat; }
+    float MinChat() const { return PreviewShown() || BrowserShown() ? kMinChatPreview : kMinChat; }
 
     // The sidebar: search, the way to the secrets, the projects with their chats (or the secrets view in their
     // place). A project is a folder its chats work in; the general chats are always last, under the projects.
@@ -1489,6 +1496,7 @@ private:
     std::vector<std::unique_ptr<TermTab>> tabs_;
     size_t activeTab_ = 0;
     WPARAM nextTabId_ = 0;
+    std::unique_ptr<BrowserView> browserView_;  // the browser tool's page (its tab sits among the shells)
     wil::com_ptr<ICoreWebView2Controller> webController_;
     wil::com_ptr<ICoreWebView2> webView_;
     bool webCreating_ = false;
@@ -1775,6 +1783,30 @@ int ChatWindow::Run(int show) {
     RefreshSessions();
     if (gallery_) {  // samples only: no CLI, no network, nothing written
         FillGallery();
+        // For checking the browser tab by eye and by file: the address in AIC_GALLERY_BROWSER is opened through the
+        // tool's own path (the tab appears), read, clicked and refused on a local address; the answers go to
+        // %TEMP%\aicprobe\browser.txt. The tool's approval cards are the model's business; here nobody asks.
+        if (wchar_t address[2048]{}; GetEnvironmentVariableW(L"AIC_GALLERY_BROWSER", address, 2048) > 0) {
+            std::thread([url = ToUtf8(address)] {
+                static const std::atomic<bool> never{false};
+                std::string report;
+                const auto step = [&](const char* label, BrowserRequest request) {
+                    const BrowserResult result = RunBrowserAction(request, never);
+                    report += std::string("== ") + label + "\n" + (result.error.empty() ? result.text : "ERROR: " + result.error) + "\n";
+                };
+                step("open", {"open", url});
+                Sleep(1500);
+                step("text", {"text"});
+                step("click", {"click", "", "", "press me"});
+                step("open local", {"open", "http://127.0.0.1:8765/"});
+                step("open router name", {"open", "http://router/"});
+                wchar_t temp[MAX_PATH]{};
+                GetEnvironmentVariableW(L"TEMP", temp, MAX_PATH);
+                const auto folder = std::filesystem::path(temp) / L"aicprobe";
+                std::filesystem::create_directories(folder);
+                std::ofstream(folder / L"browser.txt", std::ios::binary) << report;
+            }).detach();
+        }
         MSG galleryMessage;
         while (GetMessageW(&galleryMessage, nullptr, 0, 0) > 0) {
             TranslateMessage(&galleryMessage);
@@ -1952,10 +1984,27 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         CreateFonts();
         CreateInput();
         DragAcceptFiles(hwnd_, TRUE);
+        browserView_ = std::make_unique<BrowserView>(
+            hwnd_, kBrowserTask, [this] { ShowBrowserTab(); },
+            [this] {
+                for (size_t i = 0; i < tabs_.size(); ++i) {
+                    if (tabs_[i]->browser) {
+                        CloseTerminalTab(i);
+                        if (terminalOpen_) {
+                            SelectTerminalTab(activeTab_);
+                        }
+                        break;
+                    }
+                }
+            });
+        SetBrowserPage(browserView_.get());
         // The frame is recalculated without the caption (WM_NCCALCSIZE).
         SetWindowPos(hwnd_, nullptr, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER);
         return 0;
     }
+    case kBrowserTask:
+        BrowserView::RunTask(lParam);
+        return 0;
     case WM_NCCALCSIZE:
         // No system caption: the header is the title bar. The side and bottom frames stay (they are the
         // invisible resize borders); a maximized window, which hangs over the screen by its frame, is kept inside.
@@ -2682,6 +2731,11 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
             }
             doomed_.reset();
         }
+        if (browserView_) {
+            SetBrowserPage(nullptr);
+            browserView_->Shutdown();
+            browserView_.reset();
+        }
         if (webController_) {
             webController_->Close();  // the browser processes go with the window
             webController_.reset();
@@ -3291,7 +3345,7 @@ Geometry ChatWindow::Layout() const {
         if (!PreviewOwnsControls()) {
             g.termAdd = D2D1::RectF(tabLeft, g.term.top + 8, tabLeft + 28, g.term.top + 36);
         }
-        if ((PreviewShown() || previewWide_) && !PreviewOwnsControls()) {
+        if ((PreviewShown() || BrowserShown() || previewWide_) && !PreviewOwnsControls()) {
             g.termWide = D2D1::RectF(g.term.right - 12 - 28, g.term.top + 8, g.term.right - 12, g.term.top + 36);
         }
     }
@@ -5280,6 +5334,9 @@ void ChatWindow::TerminalGrid(int& cols, int& rows) const {
 }
 
 std::wstring ChatWindow::TabLabel(const TermTab& tab) const {
+    if (tab.browser) {
+        return L"Браузер";
+    }
     if (!tab.preview.empty()) {
         return L"Превью · " + std::filesystem::path(tab.preview).filename().wstring();
     }
@@ -5342,6 +5399,9 @@ void ChatWindow::CloseTerminalTab(size_t index) {
     if (index >= tabs_.size()) {
         return;
     }
+    if (tabs_[index]->browser && browserView_) {
+        browserView_->Blank();  // the page goes blank and hides; the tool's next open brings the tab back
+    }
     tabs_.erase(tabs_.begin() + static_cast<std::ptrdiff_t>(index));  // the shell ends with it
     selAnchor_.reset();
     selEnd_.reset();
@@ -5369,7 +5429,7 @@ void ChatWindow::SelectTerminalTab(size_t index) {
         selAnchor_.reset();
         selEnd_.reset();
     }
-    termFocus_ = !PreviewShown();  // the page takes its own clicks and keys
+    termFocus_ = !PreviewShown() && !BrowserShown();  // the page takes its own clicks and keys
     searchFocus_ = false;
     SetFocus(hwnd_);
     PlacePreview();
@@ -9044,6 +9104,7 @@ void ChatWindow::NavigatePreview() {
 
 // The page covers the panel under the tabs while its tab is the active one (and no picture is over the window).
 void ChatWindow::PlacePreview() {
+    PlaceBrowser();
     if (!webController_) {
         return;
     }
@@ -9054,6 +9115,43 @@ void ChatWindow::PlacePreview() {
         webController_->put_Bounds(bounds);
     }
     webController_->put_IsVisible(shown ? TRUE : FALSE);
+}
+
+// The browser tool opens its tab (and the column) by itself; the page stays where the user left the tab.
+void ChatWindow::ShowBrowserTab() {
+    size_t at = tabs_.size();
+    for (size_t i = 0; i < tabs_.size(); ++i) {
+        if (tabs_[i]->browser) {
+            at = i;
+        }
+    }
+    if (at == tabs_.size()) {
+        auto created = std::make_unique<TermTab>();
+        created->id = ++nextTabId_;
+        created->browser = true;
+        tabs_.push_back(std::move(created));
+    }
+    activeTab_ = at;
+    selAnchor_.reset();
+    selEnd_.reset();
+    SetTerminalOpen(true);
+    termFocus_ = false;  // typing stays in the chat
+    SetFocus(input_);
+    PlaceBrowser();
+    Refresh();
+}
+
+void ChatWindow::PlaceBrowser() {
+    if (!browserView_) {
+        return;
+    }
+    const bool shown = BrowserShown() && popup_ != Popup::Image;
+    RECT bounds{};
+    if (shown) {
+        const Geometry g = Layout();
+        bounds = RECT{ToPx(g.term.left + 1.f), ToPx(g.termScreen.top), ToPx(g.term.right), ToPx(g.term.bottom)};
+    }
+    browserView_->Place(bounds, shown);
 }
 
 void ChatWindow::CheckPreview() {
@@ -10152,6 +10250,26 @@ void ChatWindow::ShowTabMenu(size_t index, POINT screen) {
     }
     if (!tabs_[index]->preview.empty()) {
         ShowPreviewMenu(index, screen);
+        return;
+    }
+    if (tabs_[index]->browser) {
+        constexpr UINT kNewShell = 1, kCloseBrowser = 2;
+        wil::unique_hmenu menu(CreatePopupMenu());
+        AppendMenuW(menu.get(), MF_STRING, kNewShell, L"Новый терминал");
+        AppendMenuW(menu.get(), MF_STRING, kCloseBrowser, L"Закрыть");
+        switch (Menu(menu.get(), screen)) {
+        case kNewShell:
+            AddTerminalTab();
+            break;
+        case kCloseBrowser:
+            CloseTerminalTab(index);
+            if (terminalOpen_) {
+                SelectTerminalTab(activeTab_);
+            }
+            break;
+        default:
+            break;
+        }
         return;
     }
     constexpr UINT kRename = 1, kClear = 2, kNew = 3, kClose = 4;

@@ -375,6 +375,8 @@ constexpr const char* kClickBody =
     "el.click();"
     "return 'OK';";
 
+std::atomic<BrowserPage*> g_host{nullptr};
+
 class Session {
 public:
     BrowserResult Run(const BrowserRequest& request, const std::atomic<bool>& cancel);
@@ -391,12 +393,63 @@ private:
     // Runs a script in the page; its string value comes back, empty on failure.
     std::string Evaluate(const std::string& expression, std::string& error, const std::atomic<bool>& cancel);
 
+    // The page's load event: forgotten before something that may load, awaited after.
+    void ForgetLoad();
+    void WaitLoad(std::chrono::seconds timeout, const std::atomic<bool>& cancel);
+    // Page.enable, the Network domain and the block on local addresses: before the first navigation of a page.
+    bool Prepare(std::string& error, const std::atomic<bool>& cancel);
+
     std::mutex mutex_;  // one action at a time
     Cdp cdp_;
     std::string page_;  // the session of the page we drive
+    BrowserPage* host_ = nullptr;  // the client's own page when it has one (then no Edge of ours runs)
 };
 
+void Session::ForgetLoad() {
+    if (host_ != nullptr) {
+        host_->Forget("Page.loadEventFired");
+    } else {
+        cdp_.Forget("Page.loadEventFired", page_);
+    }
+}
+
+void Session::WaitLoad(std::chrono::seconds timeout, const std::atomic<bool>& cancel) {
+    if (host_ != nullptr) {
+        host_->WaitEvent("Page.loadEventFired", timeout, cancel);
+    } else {
+        cdp_.WaitEvent("Page.loadEventFired", page_, timeout, cancel);
+    }
+}
+
+bool Session::Prepare(std::string& error, const std::atomic<bool>& cancel) {
+    Json enabled;
+    if (!Command("Page.enable", Json::object(), enabled, error, cancel)) {
+        return false;
+    }
+    // Set before the first navigation. Without it no local page is refused, so a failure here refuses the browser.
+    // The block only works while the Network domain is on for the page.
+    Json networkOn;
+    if (!Command("Network.enable", Json::object(), networkOn, error, cancel)) {
+        error = "Не удалось закрыть браузер от сети: " + error;
+        return false;
+    }
+    Json blocked;
+    if (!Command("Network.setBlockedURLs", Json{{"urlPatterns", LocalPatterns()}, {"urls", LocalGlobs()}}, blocked,
+                 error, cancel)) {
+        error = "Не удалось закрыть браузер от сети: " + error;
+        return false;
+    }
+    return true;
+}
+
 bool Session::Attach(std::string& error, const std::atomic<bool>& cancel) {
+    if (host_ != nullptr) {
+        bool fresh = false;
+        if (!host_->Ready(fresh, error, cancel)) {
+            return false;
+        }
+        return !fresh || Prepare(error, cancel);
+    }
     if (!cdp_.Alive()) {
         cdp_.Stop();  // a reader that ended on its own is joined first
         page_.clear();
@@ -443,27 +496,14 @@ bool Session::Attach(std::string& error, const std::atomic<bool>& cancel) {
         error = "Страница не открылась";
         return false;
     }
-    Json enabled;
-    if (!Command("Page.enable", Json::object(), enabled, error, cancel)) {
-        return false;
-    }
-    // Set before the first navigation. Without it no local page is refused, so a failure here refuses the browser.
-    // The block only works while the Network domain is on for the page.
-    Json networkOn;
-    if (!Command("Network.enable", Json::object(), networkOn, error, cancel)) {
-        error = "Не удалось закрыть браузер от сети: " + error;
-        return false;
-    }
-    Json blocked;
-    if (!Command("Network.setBlockedURLs", Json{{"urlPatterns", LocalPatterns()}, {"urls", LocalGlobs()}}, blocked, error, cancel)) {
-        error = "Не удалось закрыть браузер от сети: " + error;
-        return false;
-    }
-    return true;
+    return Prepare(error, cancel);
 }
 
 bool Session::Command(const std::string& method, const Json& params, Json& result, std::string& error,
                       const std::atomic<bool>& cancel) {
+    if (host_ != nullptr) {
+        return host_->Call(method, params, result, error, cancel, 20s);
+    }
     if (cdp_.Call(method, params, page_, result, error, cancel)) {
         return true;
     }
@@ -521,8 +561,13 @@ BrowserResult Session::Run(const BrowserRequest& request, const std::atomic<bool
     std::lock_guard lock(mutex_);
     BrowserResult out;
     std::string& error = out.error;
+    host_ = g_host.load();
 
     if (request.action == "close") {
+        if (host_ != nullptr) {
+            out.text = host_->Close() ? "Браузер закрыт." : "Браузер не был открыт.";
+            return out;
+        }
         if (cdp_.Alive()) {
             Json ignored;
             std::string ignoredError;
@@ -562,7 +607,7 @@ BrowserResult Session::Run(const BrowserRequest& request, const std::atomic<bool
     }
 
     if (request.action == "open") {
-        cdp_.Forget("Page.loadEventFired", page_);
+        ForgetLoad();
         Json nav;
         if (!Command("Page.navigate", Json{{"url", request.url}}, nav, error, cancel)) {
             return out;
@@ -571,7 +616,7 @@ BrowserResult Session::Run(const BrowserRequest& request, const std::atomic<bool
             error = nav.value("errorText", std::string("не открылся адрес"));
             return out;
         }
-        cdp_.WaitEvent("Page.loadEventFired", page_, 30s, cancel);
+        WaitLoad(30s, cancel);
         if (BlockLocalPage(error, cancel)) {
             return out;
         }
@@ -598,7 +643,7 @@ BrowserResult Session::Run(const BrowserRequest& request, const std::atomic<bool
         out.imageType = "image/jpeg";
         out.text = "Снимок страницы.\n" + PageState(false, error, cancel);
     } else if (request.action == "click") {
-        cdp_.Forget("Page.loadEventFired", page_);
+        ForgetLoad();
         const std::string script = "(() => { const sel = " + Json(request.selector).dump() + "; const txt = " +
                                    Json(request.text).dump() + ";" + kClickBody + "})()";
         const std::string status = Evaluate(script, error, cancel);
@@ -610,7 +655,7 @@ BrowserResult Session::Run(const BrowserRequest& request, const std::atomic<bool
                                              : "Нет элемента по селектору «" + request.selector + "»";
             return out;
         }
-        cdp_.WaitEvent("Page.loadEventFired", page_, 2s, cancel);  // a link may open another page
+        WaitLoad(2s, cancel);  // a link may open another page
         if (BlockLocalPage(error, cancel)) {
             return out;
         }
@@ -634,7 +679,7 @@ BrowserResult Session::Run(const BrowserRequest& request, const std::atomic<bool
             }
         }
         if (request.key == "Enter") {
-            cdp_.Forget("Page.loadEventFired", page_);
+            ForgetLoad();
             Json down{{"type", "keyDown"}, {"key", "Enter"}, {"code", "Enter"}, {"windowsVirtualKeyCode", 13},
                       {"nativeVirtualKeyCode", 13}, {"text", "\r"}};
             Json up{{"type", "keyUp"}, {"key", "Enter"}, {"code", "Enter"}, {"windowsVirtualKeyCode", 13},
@@ -644,7 +689,7 @@ BrowserResult Session::Run(const BrowserRequest& request, const std::atomic<bool
                 !Command("Input.dispatchKeyEvent", up, ignored, error, cancel)) {
                 return out;
             }
-            cdp_.WaitEvent("Page.loadEventFired", page_, 3s, cancel);
+            WaitLoad(3s, cancel);
             if (BlockLocalPage(error, cancel)) {
                 return out;
             }
@@ -655,6 +700,14 @@ BrowserResult Session::Run(const BrowserRequest& request, const std::atomic<bool
 }
 
 }  // namespace
+
+bool LocalBrowserAddress(std::string_view url) {
+    return LocalAddress(url);
+}
+
+void SetBrowserPage(BrowserPage* page) {
+    g_host = page;
+}
 
 BrowserResult RunBrowserAction(const BrowserRequest& request, const std::atomic<bool>& cancel) {
     // Never destroyed: the window's job kills it when the client exits, and no thread is joined on the way out.
