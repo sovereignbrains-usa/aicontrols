@@ -50,8 +50,8 @@ bool LocalAddress(std::string_view url) {
     return LocalTarget(HostOf(url));
 }
 
-// Refused by the page's own network stack, subresources and redirects too (Network.setBlockedURLs takes URLPattern
-// strings with a scheme). Loopback in loose forms (127.1) matches "127.*" as well. A one-label name
+// Refused by the page's own network stack, subresources and redirects too. Live on Edge 156 (01.11.2026): with
+// Network.enable the glob form "urls" blocks an image from 127.0.0.1 and 127.1; "urlPatterns" alone did not. Loopback in loose forms (127.1) matches "127.*" as well. A one-label name
 // (the router's "http://router/") has no pattern: the navigation check catches it when it is the page itself.
 Json LocalPatterns() {
     // Hosts as URLPattern wildcards: each one as "*://host/*" (no port) and "*://host:*/*" (with one).
@@ -70,7 +70,23 @@ Json LocalPatterns() {
     }
     return patterns;
 }
-constexpr size_t kImageBytes = 3'700'000;  // the same limit as a picture the user attaches
+// The older form: globs over the whole URL string, one per scheme and host. Both forms go in one call.
+Json LocalGlobs() {
+    std::vector<std::string> hosts = {"localhost", "localhost:*", "127.*", "0.*", "10.*", "192.168.*", "169.254.*", "[*", "*.localhost/*", "*.localhost:*", "*.local/*", "*.local:*", "*.lan/*", "*.lan:*"};
+    for (int second = 16; second <= 31; ++second) {
+        hosts.push_back("172." + std::to_string(second) + ".*");
+    }
+    for (int second = 64; second <= 127; ++second) {
+        hosts.push_back("100." + std::to_string(second) + ".*");
+    }
+    Json globs = Json::array();
+    for (const char* scheme : {"http://", "https://", "ws://", "wss://"}) {
+        for (const std::string& host : hosts) {
+            globs.push_back(std::string(scheme) + host);
+        }
+    }
+    return globs;
+}constexpr size_t kImageBytes = 3'700'000;  // the same limit as a picture the user attaches
 constexpr size_t kInboxLimit = 1000;       // unread events beyond this are dropped, the oldest first
 
 // Edge first (it is on every Windows), then Chrome.
@@ -432,8 +448,14 @@ bool Session::Attach(std::string& error, const std::atomic<bool>& cancel) {
         return false;
     }
     // Set before the first navigation. Without it no local page is refused, so a failure here refuses the browser.
+    // The block only works while the Network domain is on for the page.
+    Json networkOn;
+    if (!Command("Network.enable", Json::object(), networkOn, error, cancel)) {
+        error = "Не удалось закрыть браузер от сети: " + error;
+        return false;
+    }
     Json blocked;
-    if (!Command("Network.setBlockedURLs", Json{{"urlPatterns", LocalPatterns()}}, blocked, error, cancel)) {
+    if (!Command("Network.setBlockedURLs", Json{{"urlPatterns", LocalPatterns()}, {"urls", LocalGlobs()}}, blocked, error, cancel)) {
         error = "Не удалось закрыть браузер от сети: " + error;
         return false;
     }
