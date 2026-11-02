@@ -1,13 +1,18 @@
 #include "app/browser_view.h"
 
+#include <commctrl.h>
+#include <uxtheme.h>
 #include <wrl/event.h>
 
 #include <wil/resource.h>
 
+#include <algorithm>
 #include <chrono>
 #include <filesystem>
 #include <format>
 #include <memory>
+
+#pragma comment(lib, "uxtheme.lib")
 
 #include "core/claude_process.h"
 
@@ -59,13 +64,221 @@ void BrowserView::Fail(const std::string& why, HRESULT code) {
     }
     creating_ = false;
     changed_.notify_all();
+    if (host_ != nullptr) {
+        InvalidateRect(host_, nullptr, FALSE);
+    }
     if (window_ != nullptr) {
         InvalidateRect(window_, nullptr, FALSE);
     }
 }
 
+int BrowserView::BarHeight() const {
+    const HWND dpiWindow = host_ != nullptr ? host_ : window_;
+    const UINT dpi = dpiWindow != nullptr ? GetDpiForWindow(dpiWindow) : 96;
+    return MulDiv(40, static_cast<int>(dpi), 96);
+}
+
+void BrowserView::EnsureHost() {
+    if (host_ != nullptr || window_ == nullptr) {
+        return;
+    }
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSW windowClass{};
+        windowClass.lpfnWndProc = HostProc;
+        windowClass.hInstance = GetModuleHandleW(nullptr);
+        windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        windowClass.lpszClassName = L"AIControlsBrowserHost";
+        registered = RegisterClassW(&windowClass) != 0 || GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
+    }
+    // Owned popup, not a child: the client's Direct2D present paints the whole client and covers a child
+    // WebView, which is why the tab stayed black with the page already created at the right size.
+    host_ = CreateWindowExW(WS_EX_TOOLWINDOW, L"AIControlsBrowserHost", L"", WS_POPUP | WS_CLIPCHILDREN, 0, 0, 0, 0,
+                            window_, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (host_ == nullptr) {
+        return;
+    }
+    SetWindowLongPtrW(host_, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
+    field_ = CreateSolidBrush(RGB(0x18, 0x18, 0x1a));
+    ground_ = CreateSolidBrush(RGB(0x12, 0x12, 0x13));
+    const UINT dpi = GetDpiForWindow(window_);
+    font_ = CreateFontW(-MulDiv(13, static_cast<int>(dpi), 96), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                        OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+    edit_ = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_LEFT, 0, 0, 0, 0, host_,
+                            reinterpret_cast<HMENU>(1), GetModuleHandleW(nullptr), nullptr);
+    if (edit_ != nullptr) {
+        // Themed edits ignore WM_CTLCOLOREDIT and stay white. No theme: the dark field and the cue show.
+        SetWindowTheme(edit_, L"", L"");
+        SendMessageW(edit_, WM_SETFONT, reinterpret_cast<WPARAM>(font_), FALSE);
+        SendMessageW(edit_, EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(L"Адрес"));
+        SetWindowSubclass(edit_, EditProc, 1, reinterpret_cast<DWORD_PTR>(this));
+    }
+}
+
+void BrowserView::LayoutPage() {
+    if (host_ == nullptr) {
+        return;
+    }
+    RECT client{};
+    GetClientRect(host_, &client);
+    const int width = client.right;
+    const int height = client.bottom;
+    const int bar = BarHeight();
+    const int field = std::max(16, bar - MulDiv(12, bar, 40));
+    if (edit_ != nullptr) {
+        SetWindowPos(edit_, nullptr, 8, std::max(0, (bar - field) / 2), std::max(0, width - 16), field,
+                     SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+    if (controller_) {
+        const RECT page{0, bar, width, std::max(bar, height)};
+        controller_->put_Bounds(page);
+        controller_->put_IsVisible(placeVisible_ ? TRUE : FALSE);
+        controller_->NotifyParentWindowPositionChanged();
+    }
+}
+
+void BrowserView::ApplyPlace() {
+    if (!placeVisible_ || window_ == nullptr || IsIconic(window_) || !IsWindowVisible(window_)) {
+        if (host_ != nullptr) {
+            ShowWindow(host_, SW_HIDE);
+        }
+        if (controller_) {
+            controller_->put_IsVisible(FALSE);
+        }
+        return;
+    }
+    EnsureHost();
+    if (host_ == nullptr) {
+        return;
+    }
+    POINT origin{bounds_.left, bounds_.top};
+    ClientToScreen(window_, &origin);
+    const int width = std::max(0L, bounds_.right - bounds_.left);
+    const int height = std::max(0L, bounds_.bottom - bounds_.top);
+    if (width <= 0 || height <= 0) {
+        ShowWindow(host_, SW_HIDE);
+        return;
+    }
+    RECT now{};
+    GetWindowRect(host_, &now);
+    const bool moved = !IsWindowVisible(host_) || now.left != origin.x || now.top != origin.y ||
+                       now.right - now.left != width || now.bottom - now.top != height;
+    if (moved) {
+        // Above the owner while this app is in front. A move while another app is in front stays put,
+        // so the page does not climb over it.
+        const HWND foreground = GetForegroundWindow();
+        const bool front = foreground == window_ || foreground == host_ || foreground == edit_;
+        SetWindowPos(host_, front ? HWND_TOP : HWND_NOTOPMOST, origin.x, origin.y, width, height,
+                     SWP_NOACTIVATE | SWP_SHOWWINDOW | (front ? 0 : SWP_NOZORDER));
+        LayoutPage();
+    }
+}
+
+void BrowserView::NavigateBar() {
+    if (edit_ == nullptr || !view_) {
+        return;
+    }
+    std::wstring text(GetWindowTextLengthW(edit_) + 1, L'\0');
+    GetWindowTextW(edit_, text.data(), static_cast<int>(text.size()));
+    text.resize(wcslen(text.c_str()));
+    const size_t first = text.find_first_not_of(L" \t");
+    const size_t last = text.find_last_not_of(L" \t");
+    if (first == std::wstring::npos) {
+        return;
+    }
+    text = text.substr(first, last - first + 1);
+    const bool hasScheme = text.find(L"://") != std::wstring::npos;
+    const bool likeUrl = hasScheme || (text.find(L' ') == std::wstring::npos && text.find(L'.') != std::wstring::npos);
+    if (!likeUrl) {
+        std::wstring query;
+        for (const unsigned char byte : ToUtf8(text)) {
+            if ((byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') || (byte >= '0' && byte <= '9') ||
+                byte == '-' || byte == '_' || byte == '.' || byte == '~') {
+                query.push_back(static_cast<wchar_t>(byte));
+            } else {
+                query += std::format(L"%{:02X}", byte);
+            }
+        }
+        text = L"https://yandex.ru/search/?text=" + query;
+    } else if (!hasScheme) {
+        text = L"https://" + text;
+    }
+    view_->Navigate(text.c_str());
+    if (controller_) {  // the page takes the keys, and the bar can follow the address it lands on
+        controller_->MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
+    }
+}
+
+void BrowserView::FocusAddress() {
+    focusBar_ = true;
+    Post([this] {
+        EnsureHost();
+        if (edit_ != nullptr) {
+            SetFocus(edit_);
+        }
+    });
+}
+
+LRESULT CALLBACK BrowserView::HostProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
+    auto* self = reinterpret_cast<BrowserView*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    if (message == WM_CTLCOLOREDIT && self != nullptr && self->field_ != nullptr) {
+        const auto dc = reinterpret_cast<HDC>(wParam);
+        SetTextColor(dc, RGB(0xf2, 0xf4, 0xf8));
+        SetBkColor(dc, RGB(0x18, 0x18, 0x1a));
+        return reinterpret_cast<LRESULT>(self->field_);
+    }
+    if (message == WM_ERASEBKGND && self != nullptr && self->ground_ != nullptr) {
+        RECT client{};
+        GetClientRect(hwnd, &client);
+        FillRect(reinterpret_cast<HDC>(wParam), &client, self->ground_);
+        return 1;
+    }
+    if (message == WM_PAINT && self != nullptr) {
+        PAINTSTRUCT paint{};
+        const HDC dc = BeginPaint(hwnd, &paint);
+        RECT client{};
+        GetClientRect(hwnd, &client);
+        if (self->ground_ != nullptr) {
+            FillRect(dc, &client, self->ground_);
+        }
+        const Status status = self->State();
+        if (!status.ready || !status.failure.empty()) {
+            client.top = self->BarHeight() + 16;
+            client.left += 16;
+            client.right -= 16;
+            SetBkMode(dc, TRANSPARENT);
+            SetTextColor(dc, status.failure.empty() ? RGB(0x9c, 0x9e, 0xa4) : RGB(0xf0, 0x60, 0x60));
+            if (self->font_ != nullptr) {
+                SelectObject(dc, self->font_);
+            }
+            const std::wstring note = status.failure.empty() ? L"Запускаю браузер…" : ToWide(status.failure);
+            DrawTextW(dc, note.c_str(), -1, &client, DT_LEFT | DT_WORDBREAK);
+        }
+        EndPaint(hwnd, &paint);
+        return 0;
+    }
+    return DefWindowProcW(hwnd, message, wParam, lParam);
+}
+
+LRESULT CALLBACK BrowserView::EditProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam, UINT_PTR, DWORD_PTR self) {
+    if (message == WM_KEYDOWN && wParam == VK_RETURN) {
+        reinterpret_cast<BrowserView*>(self)->NavigateBar();
+        return 0;
+    }
+    if (message == WM_KEYDOWN && wParam == VK_ESCAPE) {
+        SetFocus(reinterpret_cast<BrowserView*>(self)->window_);
+        return 0;
+    }
+    return DefSubclassProc(hwnd, message, wParam, lParam);
+}
+
 void BrowserView::Create() {
     if (controller_ || creating_) {
+        return;
+    }
+    EnsureHost();
+    if (host_ == nullptr) {
+        Fail("Окно браузера не создалось", E_FAIL);
         return;
     }
     creating_ = true;
@@ -77,7 +290,13 @@ void BrowserView::Create() {
             return;
         }
     }
-    const std::filesystem::path folder = std::filesystem::path(local) / L"AIControls" / L"browser-view";
+    // AIC_BROWSER_PROFILE lets a gallery check use its own folder while the installed client holds the real one.
+    std::filesystem::path folder = std::filesystem::path(local) / L"AIControls" / L"browser-view";
+    wchar_t profileOverride[MAX_PATH]{};
+    if (const DWORD over = GetEnvironmentVariableW(L"AIC_BROWSER_PROFILE", profileOverride, MAX_PATH);
+        over > 0 && over < MAX_PATH) {
+        folder = profileOverride;
+    }
     std::error_code error;
     std::filesystem::create_directories(folder, error);
     if (error) {
@@ -94,13 +313,22 @@ void BrowserView::Create() {
         nullptr, data.c_str(), nullptr,
         Microsoft::WRL::Callback<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler>(
             [this](HRESULT result, ICoreWebView2Environment* environment) -> HRESULT {
+                if (shutdown_) {
+                    return S_OK;
+                }
                 if (FAILED(result) || environment == nullptr) {
                     Fail("Нужен WebView2 (Microsoft Edge): среда не создалась", FAILED(result) ? result : E_FAIL);
                     return S_OK;
                 }
                 const HRESULT creating = environment->CreateCoreWebView2Controller(
-                    window_, Microsoft::WRL::Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
+                    host_, Microsoft::WRL::Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
                                  [this](HRESULT created, ICoreWebView2Controller* controller) -> HRESULT {
+                                     if (shutdown_) {
+                                         if (controller != nullptr) {
+                                             controller->Close();
+                                         }
+                                         return S_OK;
+                                     }
                                      if (FAILED(created) || controller == nullptr) {
                                          Fail("Окно браузера не создалось", FAILED(created) ? created : E_FAIL);
                                          return S_OK;
@@ -114,7 +342,7 @@ void BrowserView::Create() {
                                      }
                                      controller_->put_IsVisible(FALSE);
                                      if (const auto colored = controller_.try_query<ICoreWebView2Controller2>()) {
-                                         colored->put_DefaultBackgroundColor(COREWEBVIEW2_COLOR{255, 255, 255, 255});
+                                         colored->put_DefaultBackgroundColor(COREWEBVIEW2_COLOR{255, 0x12, 0x12, 0x13});
                                      }
                                      wil::com_ptr<ICoreWebView2Settings> settings;
                                      if (SUCCEEDED(view_->get_Settings(settings.put()))) {
@@ -171,6 +399,22 @@ void BrowserView::Create() {
                                                  .Get(),
                                              &token);
                                      }
+                                     view_->add_SourceChanged(
+                                         Microsoft::WRL::Callback<ICoreWebView2SourceChangedEventHandler>(
+                                             [this](ICoreWebView2* sender, ICoreWebView2SourceChangedEventArgs*) {
+                                                 if (edit_ == nullptr || GetFocus() == edit_ || sender == nullptr) {
+                                                     return S_OK;
+                                                 }
+                                                 wil::unique_cotaskmem_string source;
+                                                 if (FAILED(sender->get_Source(&source)) || source == nullptr ||
+                                                     wcscmp(source.get(), L"about:blank") == 0) {
+                                                     return S_OK;
+                                                 }
+                                                 SetWindowTextW(edit_, source.get());
+                                                 return S_OK;
+                                             })
+                                             .Get(),
+                                         &token);
                                      view_->Navigate(L"about:blank");
                                      creating_ = false;
                                      {
@@ -182,6 +426,19 @@ void BrowserView::Create() {
                                      changed_.notify_all();
                                      if (shown_ && show_) {
                                          show_();  // the page gets its place
+                                     }
+                                     // ApplyPlace skips the layout when the host was already sitting at this rect,
+                                     // which is the usual case: the tab opened before the page finished starting.
+                                     LayoutPage();
+                                     if (focusBar_ && edit_ != nullptr) {
+                                         const HWND focus = GetFocus();
+                                         if (focus == nullptr || focus == window_ || focus == host_ || focus == edit_) {
+                                             SetFocus(edit_);
+                                         }
+                                         focusBar_ = false;
+                                     }
+                                     if (host_ != nullptr) {
+                                         InvalidateRect(host_, nullptr, FALSE);
                                      }
                                      return S_OK;
                                  })
@@ -205,34 +462,56 @@ void BrowserView::Want(bool on) {
 }
 
 void BrowserView::Place(const RECT& bounds, bool visible) {
-    if (!controller_) {
-        return;
-    }
-    if (visible) {
-        controller_->put_Bounds(bounds);
-        controller_->NotifyParentWindowPositionChanged();
-    }
-    controller_->put_IsVisible(visible ? TRUE : FALSE);
+    bounds_ = bounds;
+    placeVisible_ = visible;
+    ApplyPlace();
 }
 
 void BrowserView::Blank() {
     shown_ = false;
+    placeVisible_ = false;
     if (view_) {
         view_->Navigate(L"about:blank");
     }
+    if (edit_ != nullptr) {
+        SetWindowTextW(edit_, L"");
+    }
     if (controller_) {
         controller_->put_IsVisible(FALSE);
+    }
+    if (host_ != nullptr) {
+        ShowWindow(host_, SW_HIDE);
     }
 }
 
 void BrowserView::Shutdown() {
     shutdown_ = true;
     if (controller_) {
-        controller_->Close();  // the browser processes go with it
+        controller_->Close();  // the browser processes go with it; the host goes after
     }
     loadReceiver_.reset();
     view_.reset();
     controller_.reset();
+    if (edit_ != nullptr) {
+        RemoveWindowSubclass(edit_, EditProc, 1);
+        edit_ = nullptr;
+    }
+    if (host_ != nullptr) {
+        DestroyWindow(host_);
+        host_ = nullptr;
+    }
+    if (font_ != nullptr) {
+        DeleteObject(font_);
+        font_ = nullptr;
+    }
+    if (field_ != nullptr) {
+        DeleteObject(field_);
+        field_ = nullptr;
+    }
+    if (ground_ != nullptr) {
+        DeleteObject(ground_);
+        ground_ = nullptr;
+    }
 }
 
 bool BrowserView::Ready(bool& fresh, std::string& error, const std::atomic<bool>& cancel) {
@@ -376,9 +655,7 @@ BrowserView::Status BrowserView::State() {
 }
 
 void BrowserView::ParentMoved() {
-    if (controller_) {
-        controller_->NotifyParentWindowPositionChanged();
-    }
+    ApplyPlace();
 }
 
 }  // namespace aic

@@ -31,6 +31,8 @@ public:
     // UI thread: the user's button wants the page (starts it) or has put it away. The tool's own open and close
     // go through Ready and Close.
     void Want(bool on);
+    // UI thread: the address field, so a person can type where to go. The tool does not call this.
+    void FocusAddress();
     // UI thread: where the page sits (and whether it shows); a page taken away goes blank.
     void Place(const RECT& bounds, bool visible);
     void Blank();
@@ -58,8 +60,23 @@ private:
     bool Post(std::function<void()> task);
     void Create();  // UI thread
     void Fail(const std::string& why, HRESULT code = S_OK);
+    void EnsureHost();   // the page's own window: the client's Direct2D present paints over child windows
+    void ApplyPlace();
+    void LayoutPage();
+    void NavigateBar();
+    int BarHeight() const;
+    static LRESULT CALLBACK HostProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
+    static LRESULT CALLBACK EditProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam, UINT_PTR id, DWORD_PTR self);
 
     HWND window_;
+    HWND host_ = nullptr;  // owned popup, over the column; the WebView is its child
+    HWND edit_ = nullptr;  // the address, at the top of host_
+    HFONT font_ = nullptr;
+    HBRUSH field_ = nullptr;
+    HBRUSH ground_ = nullptr;
+    RECT bounds_{};  // client coordinates of window_, the last place asked for
+    bool placeVisible_ = false;
+    bool focusBar_ = false;
     UINT message_;
     std::function<void()> show_;
     std::function<void()> hide_;

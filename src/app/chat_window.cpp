@@ -3063,6 +3063,9 @@ void ChatWindow::OnClick(float x, float y) {
                 browserView_->Want(true);
             }
             ShowBrowserTab();
+            if (browserView_) {
+                browserView_->FocusAddress();
+            }
         }
         keepFocus = true;
         break;
@@ -3936,8 +3939,8 @@ void ChatWindow::EnsureTarget() {
     D2D1_RENDER_TARGET_PROPERTIES properties = D2D1::RenderTargetProperties();
     properties.dpiX = properties.dpiY = Dpi();
     const D2D1_SIZE_U pixels = D2D1::SizeU(static_cast<UINT32>(client.right), static_cast<UINT32>(client.bottom));
-    // Blit now and keep the buffer. The default present flips over the browser's child window, so a
-    // repaint (an answer streaming in) blanks the page until it is put back.
+    // Blit now and keep the buffer. The present still covers a child of this window, so the browser
+    // page is not a child: it lives in its own popup (BrowserView).
     const D2D1_HWND_RENDER_TARGET_PROPERTIES window = D2D1::HwndRenderTargetProperties(
         hwnd_, pixels, D2D1_PRESENT_OPTIONS_IMMEDIATELY | D2D1_PRESENT_OPTIONS_RETAIN_CONTENTS);
     if (FAILED(d2d_->CreateHwndRenderTarget(properties, window, target_.put()))) {
@@ -9803,8 +9806,7 @@ void ChatWindow::ShowBrowserTab() {
     selAnchor_.reset();
     selEnd_.reset();
     SetTerminalOpen(true);
-    termFocus_ = false;  // typing stays in the chat
-    SetFocus(input_);
+    termFocus_ = false;  // the page takes the keys; the button then puts them in the address
     PlaceBrowser();
     Refresh();
 }
