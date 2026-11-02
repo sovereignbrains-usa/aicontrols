@@ -30,7 +30,8 @@ namespace aic {
 // Our five tools reach Grok as an MCP server over HTTP on the loopback (LoopbackServer), and each request
 // of it goes out as Claude's control_request mcp_message, so ToolHost serves both CLIs alike.
 // Grok's own tools are cut down by an agent profile to the two that reach MCP, the web and Imagine; those
-// are asked about as grok__<name> (GrokOwnTool).
+// are asked about as grok__<name> (GrokOwnTool). spawn_subagent is on that list too, but only for the helper
+// written beside the profile (plugin aicontrols, agent hand): starting it is allowed here, and its calls ask.
 // ClaudeOptions is reused: exe (grok.exe), cwd, proxy, model, effort, resume, appendSystemPrompt (the rules).
 class GrokProcess : public AgentProcess {
 public:

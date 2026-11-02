@@ -746,6 +746,16 @@ ToolSummary SummarizeHere(const std::string& name, const Json& input) {
     }
     // Grok's own: the web and Imagine.
     const std::wstring prompt = ToWide(StringArg(input, "prompt"));
+    if (name == "spawn_subagent") {
+        std::string label = StringArg(input, "description");
+        if (label.empty()) {
+            label = StringArg(input, "prompt");
+        }
+        return {L"Субагент", ToWide(Truncated(label, 160))};
+    }
+    if (name == "kill_command_or_subagent") {
+        return {L"Остановить субагента", ToWide(StringArg(input, "task_id"))};
+    }
     if (name == "web_search") {
         return {L"Поиск в интернете", ToWide(StringArg(input, "query"))};
     }
@@ -802,6 +812,9 @@ std::string Tools::SystemPrompt() {
            "browser drives a page in a tab of the user's own window (its own profile, not the user's): open an http or https "
            "address, read the page (text), picture it (screenshot), click (selector or the visible text of a link "
            "or button) or type into a field (selector, text, key Enter). Each action asks the user first. "
+           "You may hand a self-contained task to one helper with spawn_subagent. The only type is aicontrols:hand. "
+           "It has the same MCP tools, the web and Imagine, and no shell of its own; its calls ask the user the same "
+           "way. It cannot message the user or spawn its own helper. Wait for it and use its result. "
            "Reply in the language the user writes in.";
 }
 

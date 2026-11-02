@@ -35,24 +35,65 @@ std::string RandomToken() {
 // What Grok may use of its own: the two tools that reach MCP servers (ours), the web and Imagine (28.10.2026, his:
 // "надо включить поиск в интернете и Imagine"). Everything else it can do, it does through the five tools, where
 // the user is asked and the secrets are kept. web_search runs on xAI's side and asks nobody; the rest ask.
+// A helper (02.11.2026, his: "субагента себе сделай") is the only type spawn_subagent can name. Checked on grok
+// 1.0.70: the enum is just aicontrols:hand, an omitted type becomes that hand, and general-purpose is not offered.
+// The hand has the same list without spawn, so it cannot start another one and it has no shell of its own.
 constexpr const char* kProfile =
     "---\n"
     "name: aic\n"
     "description: AIControls chat\n"
-    "tools: search_tool, use_tool, web_search, web_fetch, image_gen, image_edit, image_to_video, reference_to_video\n"
+    "tools: search_tool, use_tool, web_search, web_fetch, image_gen, image_edit, image_to_video, reference_to_video, "
+    "spawn_subagent, get_command_or_subagent_output, wait_commands_or_subagents, kill_command_or_subagent, "
+    "Agent(aicontrols:hand)\n"
     "---\n";
 
-std::wstring WriteProfile() {
+constexpr const char* kHand =
+    "---\n"
+    "name: hand\n"
+    "description: Helper for this AIControls chat. Files and commands go through search_tool and use_tool.\n"
+    "tools: search_tool, use_tool, web_search, web_fetch, image_gen, image_edit, image_to_video, reference_to_video\n"
+    "mcpInheritance: all\n"
+    "---\n"
+    "\n"
+    "You are a helper inside an AIControls chat. You have no filesystem tools and no shell of your own.\n"
+    "Files, commands and servers go through search_tool and use_tool only. Those calls wait for the user.\n"
+    "Report a short result to the parent. Do not spawn agents.\n";
+
+constexpr const char* kPluginJson = "{\"name\":\"aicontrols\"}\n";
+
+struct GrokLaunchFiles {
+    std::wstring profile;
+    std::wstring plugin;
+};
+
+void WriteText(const fs::path& file, const char* text) {
+    std::ofstream out(file, std::ios::binary | std::ios::trunc);
+    out << text;
+    if (!out) {
+        throw std::runtime_error("could not write " + ToUtf8(file.wstring()));
+    }
+}
+
+GrokLaunchFiles WriteGrokFiles() {
     std::array<wchar_t, 2048> buffer{};
     const DWORD length = GetEnvironmentVariableW(L"APPDATA", buffer.data(), static_cast<DWORD>(buffer.size()));
     fs::path dir = length > 0 && length < buffer.size() ? fs::path(std::wstring(buffer.data(), length)) : fs::temp_directory_path();
     dir /= L"AIControls";
+    const fs::path plugin = dir / L"aicontrols";
     std::error_code error;
-    fs::create_directories(dir, error);
-    const fs::path file = dir / L"grok-agent.md";
-    std::ofstream out(file, std::ios::binary | std::ios::trunc);
-    out << kProfile;
-    return file.wstring();
+    fs::create_directories(plugin / L"agents", error);
+    if (error) {
+        throw std::runtime_error("could not create the Grok plugin folder");
+    }
+    WriteText(dir / L"grok-agent.md", kProfile);
+    WriteText(plugin / L"plugin.json", kPluginJson);
+    WriteText(plugin / L"agents" / L"hand.md", kHand);
+    return {(dir / L"grok-agent.md").wstring(), plugin.wstring()};
+}
+
+bool SpawnTool(const std::string& name) {
+    return name == "spawn_subagent" || name == "get_command_or_subagent_output" ||
+           name == "wait_commands_or_subagents" || name == "kill_command_or_subagent";
 }
 
 Json RpcError(const Json& id, int code, const char* message) {
@@ -124,10 +165,12 @@ void GrokProcess::Start(const ClaudeOptions& options, MessageHandler onMessage, 
         throw std::runtime_error("grok.exe not found");
     }
     token_ = RandomToken();
+    const GrokLaunchFiles files = WriteGrokFiles();
+    profilePath_ = files.profile;
     serverPort_ = server_.Start(token_, [this](const std::string& body) { return HandleMcpRequest(body); });
-    profilePath_ = WriteProfile();
 
-    std::wstring cmd = QuoteArg(exe) + L" agent --no-leader --agent-profile " + QuoteArg(profilePath_);
+    std::wstring cmd = QuoteArg(exe) + L" agent --no-leader --agent-profile " + QuoteArg(profilePath_) +
+                       L" --plugin-dir " + QuoteArg(files.plugin);
     if (!options.model.empty()) {
         cmd += L" --model " + QuoteArg(ToWide(options.model));
     }
@@ -494,6 +537,25 @@ void GrokProcess::OnRequest(const Json& id, const std::string& method, const Jso
     std::string name;
     Json input;
     std::string ours;  // our MCP server's name of the tool, when it is one of ours
+    const std::string own = JsonStr(JsonAt(JsonAt(call, "_meta"), "x.ai/tool"), "name");
+    if (SpawnTool(own)) {
+        // The helper's own tools still arrive as their own requests. This one only starts, watches or stops it.
+        std::string optionId;
+        for (const Json& option : JsonAt(params, "options")) {
+            if (JsonStr(option, "kind") == "allow_once") {
+                optionId = JsonStr(option, "optionId");
+            }
+        }
+        if (optionId.empty()) {
+            Reply(id, Json{{"outcome", {{"outcome", "cancelled"}}}});
+        } else {
+            Reply(id, Json{{"outcome", {{"outcome", "selected"}, {"optionId", optionId}}}});
+        }
+        if (own == "spawn_subagent" || own == "kill_command_or_subagent") {
+            Emit(Json{{"type", "aic_tool"}, {"name", own}, {"input", raw}});
+        }
+        return;
+    }
     if (JsonStr(raw, "variant") == "UseTool") {
         const std::string tool = JsonStr(raw, "tool_name");
         name = "mcp__" + tool;  // aic__run_command -> mcp__aic__run_command
@@ -501,7 +563,7 @@ void GrokProcess::OnRequest(const Json& id, const std::string& method, const Jso
         if (const std::string prefix = std::string(kToolServer) + "__"; tool.starts_with(prefix)) {
             ours = tool.substr(prefix.size());
         }
-    } else if (const std::string own = JsonStr(JsonAt(JsonAt(call, "_meta"), "x.ai/tool"), "name"); GrokOwnTool(own)) {
+    } else if (GrokOwnTool(own)) {
         name = kGrokToolPrefix + own;  // a picture, a video, a page: the window asks as for ours
         input = raw;
     } else {
