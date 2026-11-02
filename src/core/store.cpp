@@ -1636,6 +1636,32 @@ std::vector<ProjectPlace> OrderProjects(std::vector<ProjectPlace> projects, cons
     return ordered;
 }
 
+void OrderChats(std::vector<SessionInfo>& chats, const std::vector<std::string>& ids) {
+    if (ids.empty() || chats.size() < 2) {
+        return;
+    }
+    std::map<std::string, size_t> place;
+    for (size_t i = 0; i < ids.size(); ++i) {
+        place.emplace(ids[i], i);  // the first time an id is named
+    }
+    std::vector<SessionInfo> fresh;  // not dragged yet: they stay in front, in the order they were given
+    std::vector<SessionInfo> kept;
+    fresh.reserve(chats.size());
+    for (SessionInfo& chat : chats) {
+        const std::string id = ChatOrderId(chat);
+        if (!id.empty() && place.find(id) != place.end()) {
+            kept.push_back(std::move(chat));
+        } else {
+            fresh.push_back(std::move(chat));
+        }
+    }
+    std::ranges::sort(kept, [&](const SessionInfo& a, const SessionInfo& b) {
+        return place.find(ChatOrderId(a))->second < place.find(ChatOrderId(b))->second;
+    });
+    fresh.insert(fresh.end(), std::make_move_iterator(kept.begin()), std::make_move_iterator(kept.end()));
+    chats = std::move(fresh);
+}
+
 ProjectOrder ParseProjectOrder(const std::string& text) {
     if (text == "added") {
         return ProjectOrder::Added;
@@ -1708,6 +1734,25 @@ Settings LoadSettings() {
     }
     settings.closedProjects = folders("closedProjects");
     settings.projectOrder = ParseProjectOrder(JsonStr(data, "projectOrder"));
+    if (const Json& orders = JsonAt(data, "chatOrder"); orders.is_array()) {
+        for (const Json& item : orders) {
+            if (!item.is_object()) {
+                continue;
+            }
+            ChatOrder order;
+            order.folder = ToWide(JsonStr(item, "folder"));
+            if (const Json& ids = JsonAt(item, "ids"); ids.is_array()) {
+                for (const Json& id : ids) {
+                    if (id.is_string() && !id.get<std::string>().empty()) {
+                        order.ids.push_back(id.get<std::string>());
+                    }
+                }
+            }
+            if (!order.folder.empty() && !order.ids.empty()) {
+                settings.chatOrder.push_back(std::move(order));
+            }
+        }
+    }
     return settings;
 }
 
@@ -1723,6 +1768,18 @@ void SaveSettings(const Settings& settings) {
     std::error_code error;
     fs::create_directories(file.parent_path(), error);
     std::ofstream out(file, std::ios::binary | std::ios::trunc);
+    Json chatOrder = Json::array();
+    for (const ChatOrder& order : settings.chatOrder) {
+        Json ids = Json::array();
+        for (const std::string& id : order.ids) {
+            if (!id.empty()) {
+                ids.push_back(id);
+            }
+        }
+        if (!order.folder.empty() && !ids.empty()) {
+            chatOrder.push_back(Json{{"folder", ToUtf8(order.folder)}, {"ids", std::move(ids)}});
+        }
+    }
     const auto folders = [](const std::vector<std::wstring>& list) {
         Json array = Json::array();
         for (const std::wstring& folder : list) {
@@ -1749,6 +1806,7 @@ void SaveSettings(const Settings& settings) {
                 {"projects", folders(settings.projects)},
                 {"closedProjects", folders(settings.closedProjects)},
                 {"projectOrder", ProjectOrderId(settings.projectOrder)},
+                {"chatOrder", std::move(chatOrder)},
                 {"reopen", settings.reopen}}
                .dump(2)
         << "\n";

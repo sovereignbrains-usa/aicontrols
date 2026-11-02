@@ -180,6 +180,9 @@ constexpr std::chrono::milliseconds kMeasureSpell{5};
 // the list's scroll bar beside it, it lit and went out like a second bar (29.10.2026, his: 'какк будто 2 скрола').
 constexpr UINT_PTR kEdgeTimer = 16;
 constexpr UINT kEdgeDelay = 300;       // ms
+// A dragged project or chat: while the pointer rests at the list's edge, the list steps.
+constexpr UINT_PTR kDragTimer = 19;
+constexpr UINT kDragTick = 80;         // ms, one row
 // The connect screen: a row per account, the one at work turning its arc.
 constexpr UINT_PTR kConnectTimer = 17;
 constexpr UINT kConnectFrame = 33;     // ms
@@ -1188,7 +1191,7 @@ private:
     struct Project {
         std::wstring folder;
         std::wstring name;
-        std::vector<SessionInfo> sessions;  // newest first
+        std::vector<SessionInfo> sessions;  // newest first, unless this folder was dragged
     };
     static constexpr size_t kHead = SIZE_MAX;
     static constexpr size_t kDraft = SIZE_MAX - 1;
@@ -1376,6 +1379,22 @@ private:
     void SetProjectOrder(ProjectOrder order);
     void MoveProject(const std::wstring& folder, int delta);
     const wchar_t* ProjectOrderWord() const;
+    // A project head or a chat, taken and moved. A short press is still a click. The search is not dragged: it
+    // shows a subset. A folded project shows only the open chat, so that one is not dragged either.
+    bool CanDragRow(size_t row) const;
+    void ArmListGrab(size_t row, float y);
+    void MoveListGrab(float y);
+    void FinishListGrab();
+    std::vector<size_t> ProjectPeers() const;  // the project heads, not the archive
+    std::vector<size_t> ChatPeers(size_t project) const;  // that project's chats, not a deleted one
+    size_t SlotFromY(float y, const std::vector<size_t>& peers, size_t skip) const;
+    size_t ProjectSlotFromY(float y, size_t self) const;  // a project's whole block, head and chats
+    std::optional<float> DropMarkY(const Geometry& g) const;
+    const std::vector<std::string>* SavedChatOrder(const std::wstring& folder) const;
+    void SetChatOrder(const std::wstring& folder, std::vector<std::string> ids);
+    void ReorderProjects(size_t self, size_t slot);
+    void ReorderChats(size_t project, size_t self, size_t slot);
+    void MoveChatByDrag(std::wstring from, SessionInfo session, std::wstring to, size_t slot);
 
     void IndexModels();
     const Json* CurrentModel() const;
@@ -1646,6 +1665,16 @@ wil::com_ptr<ID2D1PathGeometry> githubMark_;  // the projects' mark, made when f
     int menusOpen_ = 0;          // a right-click menu is up (the pointer is on it, not on the list)
     bool listStale_ = false;     // the list changed while it was held still
     std::map<std::wstring, float> rowFrom_;  // a row sliding to its place: how far off it it started (DIPs)
+    struct ListGrab {  // a project or a chat taken with the mouse
+        size_t row = 0;
+        float pressY = 0;
+        float y = 0;
+        bool on = false;  // moved past a hand's tremor: a drag, not a click
+        size_t slot = 0;  // where it lands, among the rows left once it is taken out
+        std::optional<size_t> into;  // a project's head: the chat moves there
+        std::chrono::steady_clock::time_point scrolled{};
+    };
+    std::optional<ListGrab> listGrab_;
     std::chrono::steady_clock::time_point slideStart_;
     struct Doomed {  // the chat deleted last: its row says so, and "Вернуть" while kUndoTime runs
         std::wstring folder;
@@ -2271,6 +2300,10 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
             SetEffortAt(at.x);
             return 0;
         }
+        if (listGrab_) {
+            MoveListGrab(at.y);
+            return 0;
+        }
         if (dragging_ != Target::None) {  // a splitter: the panel follows the mouse, within limits
             const Geometry g = Layout();
             previewWide_ = false;  // dragged by hand: that is the width now
@@ -2354,6 +2387,10 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
                     link = true;
                 }
             }
+            if (listGrab_ && listGrab_->on) {
+                SetCursor(LoadCursorW(nullptr, IDC_SIZEALL));
+                return TRUE;
+            }
             const bool split = hover_.target == Target::SplitSidebar || hover_.target == Target::SplitTerminal;
             SetCursor(LoadCursorW(nullptr, split ? IDC_SIZEWE
                                                  : (link ? IDC_HAND : (text ? IDC_IBEAM : (clickable ? IDC_HAND : IDC_ARROW)))));
@@ -2421,6 +2458,14 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
             draggingEffort_ = true;
             SetCapture(hwnd_);
             SetEffortAt(at.x);
+            return 0;
+        }
+        if (popup_ == Popup::None && !listGrab_) {
+            const Hit hit = HitTest(at.x, at.y);
+            if ((hit.target == Target::HistoryRow || hit.target == Target::ProjectRow) && CanDragRow(hit.row)) {
+                ArmListGrab(hit.row, at.y);
+                SetCapture(hwnd_);
+            }
         }
         return 0;
     }
@@ -2480,6 +2525,21 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
             draggingEffort_ = false;
             ReleaseCapture();
             return 0;
+        }
+        if (listGrab_) {
+            const bool dragged = listGrab_->on;
+            if (dragged) {
+                FinishListGrab();  // clears the grab before the capture goes, so that does not cancel it
+            } else {
+                listGrab_.reset();
+            }
+            ReleaseCapture();
+            if (dragged) {
+                const D2D1_POINT_2F at = CursorDip(lParam);
+                hover_ = HitTest(at.x, at.y);
+                Refresh();
+                return 0;
+            }
         }
         const D2D1_POINT_2F at = CursorDip(lParam);
         OnClick(at.x, at.y);
@@ -2561,6 +2621,11 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         if (reinterpret_cast<HWND>(lParam) != hwnd_) {
             barDrag_ = Scroller::None;
             StopPan();
+            if (listGrab_) {  // let go elsewhere: the drag is not kept (a click's release clears it first)
+                KillTimer(hwnd_, kDragTimer);
+                listGrab_.reset();
+                Refresh();
+            }
         }
         break;
     case WM_RBUTTONUP:
@@ -2664,6 +2729,15 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         return 0;
     case WM_KEYDOWN:
         HideTip();
+        if (listGrab_) {
+            if (wParam == VK_ESCAPE) {
+                KillTimer(hwnd_, kDragTimer);
+                listGrab_.reset();
+                ReleaseCapture();
+                Refresh();
+            }
+            return 0;
+        }
         if (pan_ != Scroller::None) {  // a key ends the middle button's scrolling, and does nothing else
             StopPan();
             return 0;
@@ -2753,6 +2827,12 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
             KillTimer(hwnd_, kEdgeTimer);
             edgeLit_ = true;
             Refresh();
+        } else if (wParam == kDragTimer) {
+            if (listGrab_ && listGrab_->on) {
+                MoveListGrab(listGrab_->y);
+            } else {
+                KillTimer(hwnd_, kDragTimer);
+            }
         } else if (wParam == kSlideTimer) {
             if (std::chrono::steady_clock::now() - slideStart_ >= std::chrono::milliseconds(static_cast<int>(kSlideTime))) {
                 KillTimer(hwnd_, kSlideTimer);
@@ -3647,8 +3727,11 @@ Hit ChatWindow::HitTest(float x, float y) const {
                 if (IsArchive(projects_[rows_[row].project].folder)) {
                     return {Target::ProjectRow, row};
                 }
-                return Inside(ProjectNewRect(SideRowRect(g, row)), x, y) ? Hit{Target::ProjectNew, row}
-                                                                          : Hit{Target::ProjectRow, row};
+                // "+" only while the folder is open. A search shows every match unfolded, so the "+" is there too.
+                const bool open =
+                    !searchText_.empty() || !ProjectFolded(projects_[rows_[row].project].folder);
+                return open && Inside(ProjectNewRect(SideRowRect(g, row)), x, y) ? Hit{Target::ProjectNew, row}
+                                                                                  : Hit{Target::ProjectRow, row};
             }
         }
         return {};
@@ -7727,7 +7810,7 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
     }
     firstRow_ = ClampFirst(firstRow_, rows_.size(), SidebarRows(g));
     const size_t last = std::min(rows_.size(), firstRow_ + SidebarRows(g));
-    const bool sliding = !rowFrom_.empty();
+    const bool sliding = !rowFrom_.empty() || (listGrab_ && listGrab_->on);
     if (sliding) {  // a row on its way stays within the list
         target_->PushAxisAlignedClip(D2D1::RectF(g.sidebar.left, g.listTop, g.sidebar.right, g.listBottom),
                                      D2D1_ANTIALIAS_MODE_ALIASED);
@@ -7742,6 +7825,8 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
         // The lit rows keep a gap between them, so the open chat and a hovered head do not run into one.
         const auto lit = [](const D2D1_RECT_F& rect) { return D2D1::RectF(rect.left, rect.top + 2.f, rect.right, rect.bottom - 2.f); };
         const Project& project = projects_[rows_[row].project];
+        const bool held = listGrab_ && listGrab_->on && listGrab_->row == row;
+        const bool dropOn = listGrab_ && listGrab_->on && listGrab_->into && *listGrab_->into == row;
         const bool hovered = (hover_.target == Target::HistoryRow || hover_.target == Target::ProjectRow ||
                               hover_.target == Target::ProjectNew || hover_.target == Target::ChatMore) &&
                              hover_.row == row;
@@ -7762,11 +7847,11 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
             AgentIcon({chat.left + kFrontX, y}, 4.6f, grok);
         };
         if (rows_[row].session == kHead) {
-            // A project's head: a fold mark and its name (brighter for the open chat's project); "+" for a new
-            // chat in it under the pointer, else how many chats it has. The keyboard's row lights up too.
+            // A project's head: a fold mark and its name (brighter for the open chat's project). "+" for a new
+            // chat only while the folder is open. The keyboard's row lights up too, and so does one being dragged.
             // The archive is the same row, quieter, with no "+": it is not a project.
             const bool archive = IsArchive(project.folder);
-            if (hovered || (searchFocus_ && row == selected_)) {
+            if (hovered || held || dropOn || (searchFocus_ && row == selected_)) {
                 Fill(lit(r), 8.f, kRaised);
             }
             const D2D1_POINT_2F c{r.left + 14.f, (r.top + r.bottom) / 2};
@@ -7778,6 +7863,7 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
                 Line({c.x - 2.f, c.y - 4.f}, {c.x + 2.f, c.y}, kSecondary, 1.4f);
                 Line({c.x + 2.f, c.y}, {c.x - 2.f, c.y + 4.f}, kSecondary, 1.4f);
             }
+            const bool showPlus = !archive && unfolded;
             const D2D1_RECT_F plus = ProjectNewRect(r);
             const uint32_t nameColor = archive ? kSecondary : (project.folder == workspace_ ? kPrimary : kSecondary);
             if (archive) {
@@ -7785,7 +7871,7 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
             } else {
                 ProjectIcon({r.left + 32.f, c.y}, false, nameColor, 1.05f, unfolded);
             }
-            float titleRight = archive ? r.right - 10.f : plus.left - 4.f;
+            float titleRight = showPlus ? plus.left - 4.f : r.right - 10.f;
             size_t count = project.sessions.size();
             if (archive) {
                 count = 0;
@@ -7807,13 +7893,13 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
             if (archive || count > 0) {
                 const std::wstring countText = std::to_wstring(count);
                 const float countWidth = std::max(14.f, TextWidth(countText, uiRight_.get()));
-                const float countRight = archive ? r.right - 10.f : plus.left - 6.f;
+                const float countRight = showPlus ? plus.left - 6.f : r.right - 10.f;
                 const D2D1_RECT_F countRect = D2D1::RectF(countRight - countWidth, r.top, countRight, r.bottom);
                 Text(countText, uiRight_.get(), countRect, kSecondary);
                 titleRight = countRect.left - 4.f;
             }
             Text(project.name, uiBold_.get(), D2D1::RectF(r.left + 46, r.top, titleRight, r.bottom), nameColor);
-            if (!archive) {
+            if (showPlus) {
                 const bool on = hovered && hover_.target == Target::ProjectNew;
                 if (on) {
                     Fill(plus, 6.f, kLine);
@@ -7856,7 +7942,7 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
         const bool current = archive ? (readingArchive_ && *readingArchive_ == session.id) : IsOpenChat(project.folder, session);
         // The open chat stands out: a lit ground and a bar of the accent, its title the brightest; the others are
         // quieter, so the eye finds it at once (and brighten under the pointer). An archived chat stays quiet.
-        const bool raised = current || hovered || (searchFocus_ && row == selected_);
+        const bool raised = current || hovered || held || (searchFocus_ && row == selected_);
         if (raised && !archive) {
             Fill(lit(chat), 8.f, kRaised);
         } else if (archive && (hovered || current)) {
@@ -7918,6 +8004,11 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
                                              : (current || raised ? kPrimary : Mix(kSecondary, kPrimary, 0.3f));
         Text(session.title.empty() ? L"Без названия" : session.title, ui_.get(),
              D2D1::RectF(chat.left + 24, chat.top, titleRight, chat.bottom), titleColor);
+    }
+    if (listGrab_ && listGrab_->on) {
+        if (const std::optional<float> mark = DropMarkY(g)) {
+            Line({g.sidebar.left + 18.f, *mark}, {g.sidebar.right - 14.f, *mark}, kAccent, 2.f);
+        }
     }
     if (sliding) {
         target_->PopAxisAlignedClip();
@@ -8498,7 +8589,7 @@ void ChatWindow::ListChanged() {
 
 bool ChatWindow::ListHeld() const {
     if (menusOpen_ > 0 || searchFocus_ || renaming_ == Rename::Chat || barDrag_ == Scroller::Sidebar ||
-        pan_ == Scroller::Sidebar) {
+        pan_ == Scroller::Sidebar || listGrab_) {
         return true;
     }
     return Inside(Layout().sidebar, mouse_.x, mouse_.y);
@@ -8581,6 +8672,11 @@ void ChatWindow::RefreshSessions() {
             return FileTicks(other.modified) < chat->lastSent;
         });
         project->sessions.insert(place, std::move(session));
+    }
+    for (Project& project : built) {  // a folder the user has dragged keeps that order; a new chat stays in front
+        if (const std::vector<std::string>* ids = SavedChatOrder(project.folder)) {
+            OrderChats(project.sessions, *ids);
+        }
     }
     // By the user's last message (29.10.2026): an answer, a chat opened, Grok rewriting its files move nothing.
     std::vector<ProjectPlace> places;
@@ -10377,7 +10473,7 @@ std::wstring ChatWindow::TooltipText() {
 void ChatWindow::UpdateTip() {
     std::wstring text;
     if (popup_ == Popup::None && dragging_ == Target::None && !feedSelecting_ && !selecting_ &&
-        renaming_ == Rename::None) {
+        renaming_ == Rename::None && !listGrab_) {
         text = TooltipText();
     }
     if (text == tipText_) {
@@ -11267,7 +11363,7 @@ void ChatWindow::ShowProjectOrderMenu() {
     AppendMenuW(menu.get(), MF_STRING | mark(ProjectOrder::Recent), kRecent, L"Сначала недавние	по последнему сообщению");
     AppendMenuW(menu.get(), MF_STRING | mark(ProjectOrder::Name), kName, L"По имени");
     AppendMenuW(menu.get(), MF_STRING | mark(ProjectOrder::Added), kAdded,
-                L"Как добавлены	правый клик — выше и ниже");
+                L"Как добавлены	перетаскиванием");
     const Geometry g = Layout();
     POINT screen{ToPx(g.sideTabs[1].left), ToPx(g.sideTabs[1].bottom + 2.f)};
     ClientToScreen(hwnd_, &screen);
@@ -11300,6 +11396,370 @@ void ChatWindow::MoveProject(const std::wstring& folder, int delta) {
     SaveSettings(settings_);
     RefreshSessions();
     Refresh();
+}
+
+bool ChatWindow::CanDragRow(size_t row) const {
+    if (!searchText_.empty() || row >= rows_.size() || rows_[row].session == kDraft) {
+        return false;  // a search shows a subset; the new chat is the one already open
+    }
+    const Project& project = projects_[rows_[row].project];
+    if (IsArchive(project.folder)) {
+        return false;
+    }
+    if (rows_[row].session == kHead) {
+        return true;
+    }
+    const SessionInfo* session = RowSession(row);
+    if (session == nullptr || IsDoomed(project.folder, *session)) {
+        return false;
+    }
+    // Folded, only the open chat is shown: dragging it would reorder a list that is not on screen.
+    return project.folder == DefaultWorkspace() || !ProjectFolded(project.folder);
+}
+
+void ChatWindow::ArmListGrab(size_t row, float y) {
+    ListGrab grab;
+    grab.row = row;
+    grab.pressY = y;
+    grab.y = y;
+    listGrab_ = grab;
+}
+
+std::vector<size_t> ChatWindow::ProjectPeers() const {
+    std::vector<size_t> peers;
+    for (size_t row = 0; row < rows_.size(); ++row) {
+        if (rows_[row].session == kHead && !IsArchive(projects_[rows_[row].project].folder)) {
+            peers.push_back(row);
+        }
+    }
+    return peers;
+}
+
+std::vector<size_t> ChatWindow::ChatPeers(size_t project) const {
+    std::vector<size_t> peers;
+    if (project >= projects_.size()) {
+        return peers;
+    }
+    for (size_t row = 0; row < rows_.size(); ++row) {
+        if (rows_[row].project != project) {
+            continue;
+        }
+        const SessionInfo* session = RowSession(row);
+        if (session != nullptr && !IsDoomed(projects_[project].folder, *session)) {
+            peers.push_back(row);
+        }
+    }
+    return peers;
+}
+
+// `skip` is the row being dragged: its own place is a hole, and the slot counts the others. A skip that is not
+// among them counts every peer.
+size_t ChatWindow::SlotFromY(float y, const std::vector<size_t>& peers, size_t skip) const {
+    const Geometry g = Layout();
+    size_t slot = 0;
+    for (const size_t peer : peers) {
+        if (peer == skip) {
+            continue;
+        }
+        const float mid = g.listTop + (static_cast<float>(peer) - static_cast<float>(firstRow_) + 0.5f) * kHistoryRow;
+        if (y < mid) {
+            return slot;
+        }
+        ++slot;
+    }
+    return slot;
+}
+
+// The line between projects is the head, but the place it crosses is the middle of the whole block: an open
+// folder is the head plus its chats, and the hand is usually on those.
+size_t ChatWindow::ProjectSlotFromY(float y, size_t self) const {
+    const Geometry g = Layout();
+    size_t slot = 0;
+    for (const size_t peer : ProjectPeers()) {
+        if (peer == self) {
+            continue;
+        }
+        size_t end = peer + 1;
+        while (end < rows_.size() && rows_[end].session != kHead) {
+            ++end;
+        }
+        const float top = g.listTop + (static_cast<float>(peer) - static_cast<float>(firstRow_)) * kHistoryRow;
+        const float bottom = g.listTop + (static_cast<float>(end) - static_cast<float>(firstRow_)) * kHistoryRow;
+        if (y < (top + bottom) / 2.f) {
+            return slot;
+        }
+        ++slot;
+    }
+    return slot;
+}
+
+std::optional<float> ChatWindow::DropMarkY(const Geometry& g) const {
+    if (!listGrab_ || !listGrab_->on || listGrab_->row >= rows_.size()) {
+        return std::nullopt;
+    }
+    const size_t self = listGrab_->row;
+    std::vector<size_t> peers;
+    const bool moving = rows_[self].session != kHead && listGrab_->into && *listGrab_->into < rows_.size();
+    if (rows_[self].session == kHead) {
+        peers = ProjectPeers();
+        std::erase(peers, self);
+        if (peers.empty()) {
+            return std::nullopt;
+        }
+        const size_t slot = std::min(listGrab_->slot, peers.size());
+        if (slot == peers.size()) {  // after the last project: under its last chat, not under its head
+            size_t end = peers.back() + 1;
+            const size_t project = rows_[peers.back()].project;
+            while (end < rows_.size() && rows_[end].project == project) {
+                ++end;
+            }
+            return g.listTop + (static_cast<float>(end) - static_cast<float>(firstRow_)) * kHistoryRow;
+        }
+        return g.listTop + (static_cast<float>(peers[slot]) - static_cast<float>(firstRow_)) * kHistoryRow;
+    } else if (moving) {
+        peers = ChatPeers(rows_[*listGrab_->into].project);
+        if (peers.empty()) {  // a folded project: the line sits under its head
+            return g.listTop + (static_cast<float>(*listGrab_->into) - static_cast<float>(firstRow_) + 1.f) * kHistoryRow;
+        }
+    } else {
+        peers = ChatPeers(rows_[self].project);
+        std::erase(peers, self);
+    }
+    if (peers.empty()) {
+        return std::nullopt;
+    }
+    const size_t slot = std::min(listGrab_->slot, peers.size());
+    const size_t at = slot == peers.size() ? peers.back() : peers[slot];
+    float y = g.listTop + (static_cast<float>(at) - static_cast<float>(firstRow_)) * kHistoryRow;
+    if (slot == peers.size()) {
+        y += kHistoryRow;
+    }
+    return y;
+}
+
+const std::vector<std::string>* ChatWindow::SavedChatOrder(const std::wstring& folder) const {
+    const auto found = std::ranges::find(settings_.chatOrder, folder, &ChatOrder::folder);
+    return found == settings_.chatOrder.end() ? nullptr : &found->ids;
+}
+
+void ChatWindow::SetChatOrder(const std::wstring& folder, std::vector<std::string> ids) {
+    const auto found = std::ranges::find(settings_.chatOrder, folder, &ChatOrder::folder);
+    if (ids.empty()) {
+        if (found != settings_.chatOrder.end()) {
+            settings_.chatOrder.erase(found);
+        }
+        return;
+    }
+    if (found == settings_.chatOrder.end()) {
+        settings_.chatOrder.push_back({folder, std::move(ids)});
+    } else {
+        found->ids = std::move(ids);
+    }
+}
+
+void ChatWindow::MoveListGrab(float y) {
+    if (!listGrab_ || listGrab_->row >= rows_.size()) {
+        return;
+    }
+    listGrab_->y = y;
+    if (!listGrab_->on) {
+        if (std::abs(y - listGrab_->pressY) < 4.f) {
+            return;
+        }
+        listGrab_->on = true;
+        HideTip();
+    }
+    const Geometry g = Layout();
+    const size_t fit = std::max<size_t>(1, SidebarRows(g));
+    const bool atEdge = (y < g.listTop + 18.f && firstRow_ > 0) ||
+                        (y > g.listBottom - 18.f && firstRow_ + fit < rows_.size());
+    if (atEdge) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - listGrab_->scrolled >= std::chrono::milliseconds(kDragTick)) {
+            if (y < g.listTop + 18.f && firstRow_ > 0) {
+                --firstRow_;
+            } else if (y > g.listBottom - 18.f && firstRow_ + fit < rows_.size()) {
+                ++firstRow_;
+            }
+            listGrab_->scrolled = now;
+        }
+        SetTimer(hwnd_, kDragTimer, kDragTick, nullptr);
+    } else {
+        KillTimer(hwnd_, kDragTimer);
+    }
+    const size_t self = listGrab_->row;
+    listGrab_->into.reset();
+    if (rows_[self].session != kHead && y >= g.listTop && y < g.listBottom) {
+        const size_t raw = firstRow_ + static_cast<size_t>((y - g.listTop) / kHistoryRow);
+        if (raw < rows_.size() && raw != self) {
+            const size_t project = rows_[raw].project;
+            const std::wstring& folder = projects_[project].folder;
+            if (project != rows_[self].project && !IsArchive(folder) && folder != DefaultWorkspace()) {
+                for (size_t i = 0; i < rows_.size(); ++i) {
+                    if (rows_[i].project == project && rows_[i].session == kHead) {
+                        listGrab_->into = i;
+                        listGrab_->slot =
+                            ProjectFolded(folder) ? 0 : SlotFromY(y, ChatPeers(project), static_cast<size_t>(-1));
+                        Refresh();
+                        return;
+                    }
+                }
+            }
+        }
+    }
+    listGrab_->slot = rows_[self].session == kHead ? ProjectSlotFromY(y, self)
+                                                   : SlotFromY(y, ChatPeers(rows_[self].project), self);
+    Refresh();
+}
+
+void ChatWindow::ReorderProjects(size_t self, size_t slot) {
+    std::vector<size_t> peers = ProjectPeers();
+    std::vector<std::wstring> before;
+    for (const size_t row : peers) {
+        before.push_back(projects_[rows_[row].project].folder);
+    }
+    std::erase(peers, self);
+    if (slot > peers.size()) {
+        slot = peers.size();
+    }
+    peers.insert(peers.begin() + static_cast<std::ptrdiff_t>(slot), self);
+    std::vector<std::wstring> folders;
+    for (const size_t row : peers) {
+        folders.push_back(projects_[rows_[row].project].folder);
+    }
+    if (folders == before) {
+        Refresh();
+        return;
+    }
+    for (const std::wstring& folder : settings_.projects) {  // one whose directory is gone stays on the list
+        if (std::ranges::find(folders, folder) == folders.end()) {
+            folders.push_back(folder);
+        }
+    }
+    const bool switched = settings_.projectOrder != ProjectOrder::Added;
+    settings_.projects = std::move(folders);
+    settings_.projectOrder = ProjectOrder::Added;
+    SaveSettings(settings_);
+    RefreshSessions();
+    if (switched) {
+        Flash(L"Порядок проектов: как добавлены", 2500);
+    }
+    hover_ = HitTest(mouse_.x, mouse_.y);
+    Refresh();
+}
+
+void ChatWindow::ReorderChats(size_t project, size_t self, size_t slot) {
+    std::vector<size_t> peers = ChatPeers(project);
+    const auto at = std::ranges::find(peers, self);
+    if (at == peers.end()) {
+        Refresh();
+        return;
+    }
+    const size_t from = static_cast<size_t>(at - peers.begin());
+    std::erase(peers, self);
+    if (slot > peers.size()) {
+        slot = peers.size();
+    }
+    if (slot == from) {
+        Refresh();
+        return;
+    }
+    peers.insert(peers.begin() + static_cast<std::ptrdiff_t>(slot), self);
+    std::vector<std::string> ids;
+    std::vector<std::string> seen;
+    for (const size_t row : peers) {
+        const std::string id = ChatOrderId(*RowSession(row));
+        if (!id.empty()) {
+            ids.push_back(id);
+            seen.push_back(id);
+        }
+    }
+    for (const SessionInfo& session : projects_[project].sessions) {  // a deleted row, kept where the list had it
+        const std::string id = ChatOrderId(session);
+        if (!id.empty() && std::ranges::find(seen, id) == seen.end()) {
+            ids.push_back(id);
+        }
+    }
+    SetChatOrder(projects_[project].folder, std::move(ids));
+    SaveSettings(settings_);
+    RefreshSessions();
+    hover_ = HitTest(mouse_.x, mouse_.y);
+    Refresh();
+}
+
+void ChatWindow::MoveChatByDrag(std::wstring from, SessionInfo session, std::wstring to, size_t slot) {
+    if (session.grok || std::ranges::any_of(session.parts, &SessionPart::grok)) {
+        Flash(L"У Grok перенос между проектами пока нет", 3000);
+        Refresh();
+        return;
+    }
+    const std::string id = ChatOrderId(session);
+    MoveChat(from, session, to);
+    const auto dest = std::ranges::find(projects_, to, &Project::folder);
+    if (id.empty() || dest == projects_.end() ||
+        !std::ranges::any_of(dest->sessions, [&](const SessionInfo& chat) { return ChatOrderId(chat) == id; })) {
+        return;  // it stayed; MoveChat said why
+    }
+    std::vector<std::string> ids;
+    std::vector<std::string> rest;
+    for (const SessionInfo& chat : dest->sessions) {
+        const std::string one = ChatOrderId(chat);
+        if (one.empty() || one == id) {
+            continue;
+        }
+        (IsDoomed(to, chat) ? rest : ids).push_back(one);
+    }
+    if (slot > ids.size()) {
+        slot = ids.size();
+    }
+    ids.insert(ids.begin() + static_cast<std::ptrdiff_t>(slot), id);
+    ids.insert(ids.end(), rest.begin(), rest.end());
+    SetChatOrder(to, std::move(ids));
+    if (const std::vector<std::string>* saved = SavedChatOrder(from)) {
+        std::vector<std::string> left;
+        for (const std::string& one : *saved) {
+            if (one != id) {
+                left.push_back(one);
+            }
+        }
+        SetChatOrder(from, std::move(left));
+    }
+    SaveSettings(settings_);
+    RefreshSessions();
+    hover_ = HitTest(mouse_.x, mouse_.y);
+    Refresh();
+}
+
+void ChatWindow::FinishListGrab() {
+    if (!listGrab_) {
+        return;
+    }
+    KillTimer(hwnd_, kDragTimer);
+    const ListGrab grab = *listGrab_;
+    listGrab_.reset();
+    if (!grab.on || grab.row >= rows_.size()) {
+        Refresh();
+        return;
+    }
+    const size_t self = grab.row;
+    if (rows_[self].session == kHead) {
+        ReorderProjects(self, grab.slot);
+        return;
+    }
+    const SessionInfo* session = RowSession(self);
+    if (session == nullptr) {
+        Refresh();
+        return;
+    }
+    if (grab.into && *grab.into < rows_.size()) {
+        const std::wstring to = projects_[rows_[*grab.into].project].folder;
+        const std::wstring from = projects_[rows_[self].project].folder;
+        if (to != from && !IsArchive(to)) {
+            MoveChatByDrag(from, *session, to, grab.slot);
+            return;
+        }
+    }
+    ReorderChats(rows_[self].project, self, grab.slot);
 }
 
 // One part of a transcript, into the feed: the same cards a live chat paints while it is resumed.

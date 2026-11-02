@@ -329,6 +329,35 @@ This session is being continued
                std::string(aic::ProjectOrderId(aic::ProjectOrder::Name)) == "name",
            "the order is stored by those names");
 
+    // A dragged chat list: unnamed stay in front (a new chat), named follow the saved order. A chat that went on
+    // in another session is named by its first part.
+    const auto idsOf = [](const std::vector<aic::SessionInfo>& list) {
+        std::vector<std::string> ids;
+        for (const aic::SessionInfo& chat : list) {
+            ids.push_back(chat.id);
+        }
+        return ids;
+    };
+    aic::SessionInfo ended;
+    ended.id = "part-2";
+    ended.linked = {"part-1", "part-2"};
+    std::vector<aic::SessionInfo> dragged;
+    for (const char* id : {"c", "b", "a"}) {
+        aic::SessionInfo chat;
+        chat.id = id;
+        chat.linked = {id};
+        dragged.push_back(std::move(chat));
+    }
+    dragged.push_back(ended);
+    aic::OrderChats(dragged, {});
+    Expect(idsOf(dragged) == std::vector<std::string>{"c", "b", "a", "part-2"}, "no saved order leaves the list");
+    aic::OrderChats(dragged, {"a", "part-1"});
+    Expect(idsOf(dragged) == std::vector<std::string>{"c", "b", "a", "part-2"},
+           "unnamed stay in front, then the saved order; a chat in parts by its first id");
+    aic::OrderChats(dragged, {"part-1", "missing", "b", "a", "c"});
+    Expect(idsOf(dragged) == std::vector<std::string>{"part-2", "b", "a", "c"},
+           "a full order, and an id that is gone is skipped");
+
     fs::remove_all(historyA, error);
     fs::remove_all(historyB, error);
 

@@ -35,6 +35,11 @@ inline bool SameChat(const SessionInfo& chat, const std::string& id) {
     return !id.empty() && (chat.id == id || std::ranges::find(chat.linked, id) != chat.linked.end());
 }
 
+// The id that stays when a chat goes on in another session: its first part.
+inline std::string ChatOrderId(const SessionInfo& chat) {
+    return chat.linked.empty() ? chat.id : chat.linked.front();
+}
+
 // Compacted: the CLI summed up what came before (its summary in text, if it was found).
 enum class EntryKind { User, Assistant, Tool, Compacted };
 
@@ -70,8 +75,17 @@ struct ProjectPlace {
 // was "lost" in it). Name is the user's language, ignoring case.
 std::vector<ProjectPlace> OrderProjects(std::vector<ProjectPlace> projects, const std::wstring& general,
                                         ProjectOrder order);
+// `ids` is the order the user dragged the chats into, each by ChatOrderId. Chats not named keep the order they
+// already have and stay in front: a new chat, until it is dragged. Empty: the list is left as it was given.
+void OrderChats(std::vector<SessionInfo>& chats, const std::vector<std::string>& ids);
 ProjectOrder ParseProjectOrder(const std::string& text);  // unknown, and empty: Recent
 const char* ProjectOrderId(ProjectOrder order);
+
+// One folder's chats, once the user has dragged them. Absent: newest first.
+struct ChatOrder {
+    std::wstring folder;
+    std::vector<std::string> ids;
+};
 
 struct Settings {
     std::string model;   // a value from the CLI's model list; empty: its default
@@ -107,6 +121,8 @@ struct Settings {
     std::vector<std::wstring> closedProjects;
     // Which of those orders the sidebar shows. The list above stays the added order, so "added" can come back.
     ProjectOrder projectOrder = ProjectOrder::Recent;
+    // A folder whose chats the user has dragged. Missing: that folder stays newest first.
+    std::vector<ChatOrder> chatOrder;
     // The Claude model before the last move to Grok: a Claude chat opened from the history goes on in it.
     // Empty: the CLI's default.
     std::string claudeModel;
