@@ -4996,24 +4996,48 @@ void ChatWindow::PaintHeader(const Geometry& g) {
         }
         const D2D1_POINT_2F c{(r.left + r.right) / 2, (r.top + r.bottom) / 2};
         const uint32_t color = active ? kPrimary : kSecondary;
-        if (button == Target::SidebarToggle) {  // a window with its left column: filled while the sidebar is shown
-            if (sidebarOpen_ && !terminalOpen_) {
-                Fill(D2D1::RectF(c.x - 7.3f, c.y - 5.8f, c.x - 3.f, c.y + 5.8f), 1.5f, color, 0.55f);
-            }
+        if (button == Target::SidebarToggle) {  // a window with its left column, filled while that column is shown
+            const D2D1_RECT_F frame = D2D1::RectF(c.x - 7.5f, c.y - 5.6f, c.x + 7.5f, c.y + 5.6f);
+            const float col = c.x - 2.5f;
             brush_->SetColor(Color(color));
-            target_->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(c.x - 8.f, c.y - 6.5f, c.x + 8.f, c.y + 6.5f), 2.5f, 2.5f),
-                                          brush_.get(), 1.4f);
-            Line({c.x - 3.f, c.y - 6.5f}, {c.x - 3.f, c.y + 6.5f}, color, 1.4f);
+            target_->DrawRoundedRectangle(D2D1::RoundedRect(frame, 2.2f, 2.2f), brush_.get(), 1.35f, round_.get());
+            // The column stops short of the frame: a round cap on the stroke itself read as a broken corner.
+            Line({col, frame.top + 2.35f}, {col, frame.bottom - 2.35f}, color, 1.35f);
+            if (sidebarOpen_ && !terminalOpen_) {
+                wil::com_ptr<ID2D1PathGeometry> pane;
+                wil::com_ptr<ID2D1GeometrySink> sink;
+                if (SUCCEEDED(d2d_->CreatePathGeometry(pane.put())) && SUCCEEDED(pane->Open(sink.put()))) {
+                    const float left = frame.left + 1.5f;
+                    const float top = frame.top + 1.5f;
+                    const float bottom = frame.bottom - 1.5f;
+                    const float right = col - 1.05f;
+                    const float rad = 1.3f;
+                    sink->BeginFigure({right, top}, D2D1_FIGURE_BEGIN_FILLED);
+                    sink->AddLine({left + rad, top});
+                    sink->AddArc(D2D1::ArcSegment({left, top + rad}, {rad, rad}, 0.f,
+                                                  D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE, D2D1_ARC_SIZE_SMALL));
+                    sink->AddLine({left, bottom - rad});
+                    sink->AddArc(D2D1::ArcSegment({left + rad, bottom}, {rad, rad}, 0.f,
+                                                  D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE, D2D1_ARC_SIZE_SMALL));
+                    sink->AddLine({right, bottom});
+                    sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+                    if (SUCCEEDED(sink->Close())) {
+                        brush_->SetColor(Color(color, 0.5f));
+                        target_->FillGeometry(pane.get(), brush_.get());
+                    }
+                }
+            }
         } else if (button == Target::TerminalToggle) {  // the terminal: a prompt, > and a cursor
             Line({c.x - 6.f, c.y - 4.f}, {c.x - 1.5f, c.y}, color, 1.5f);
             Line({c.x - 1.5f, c.y}, {c.x - 6.f, c.y + 4.f}, color, 1.5f);
             Line({c.x + 1.f, c.y + 5.f}, {c.x + 7.f, c.y + 5.f}, color, 1.5f);
-        } else {  // the browser: a page with its address line
+        } else {  // the browser: a globe. A page with one line read as a second window beside the panel.
+            const float radius = 5.7f;
             brush_->SetColor(Color(color));
-            target_->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(c.x - 7.f, c.y - 6.f, c.x + 7.f, c.y + 6.f), 2.f, 2.f),
-                                          brush_.get(), 1.4f);
-            // Inset: a line on the frame itself read as a broken edge through the icon.
-            Line({c.x - 4.5f, c.y - 2.2f}, {c.x + 4.5f, c.y - 2.2f}, color, 1.4f);
+            target_->DrawEllipse(D2D1::Ellipse(c, radius, radius), brush_.get(), 1.35f, round_.get());
+            // The meridian stops short of the rim. The same radius stacked on the circle and flattened the poles.
+            target_->DrawEllipse(D2D1::Ellipse(c, 2.45f, radius - 1.15f), brush_.get(), 1.2f, round_.get());
+            Line({c.x - (radius - 1.85f), c.y}, {c.x + (radius - 1.85f), c.y}, color, 1.2f);
         }
     };
     headerButton(Target::SidebarToggle, g.sideToggle, false);
