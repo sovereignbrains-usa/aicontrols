@@ -1860,7 +1860,8 @@ wil::com_ptr<IDWriteTextFormat> ChatWindow::MakeFormat(const wchar_t* family, fl
         format->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
         wil::com_ptr<IDWriteInlineObject> ellipsis;
         if (SUCCEEDED(dwrite_->CreateEllipsisTrimmingSign(format.get(), ellipsis.put()))) {
-            const DWRITE_TRIMMING trimming{DWRITE_TRIMMING_GRANULARITY_CHARACTER, 0, 0};
+            // A word, not a character: a title already cut in the data was then cut again mid-word.
+            const DWRITE_TRIMMING trimming{DWRITE_TRIMMING_GRANULARITY_WORD, 0, 0};
             format->SetTrimming(&trimming, ellipsis.get());
         }
     }
@@ -2157,6 +2158,11 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         SetForegroundWindow(hwnd_);
         return 0;
     }
+    case WM_MOVE:
+        if (browserView_) {
+            browserView_->ParentMoved();
+        }
+        return 0;
     case WM_SIZE:
         if (target_) {
             target_->Resize(D2D1::SizeU(LOWORD(lParam), HIWORD(lParam)));
@@ -3769,8 +3775,11 @@ void ChatWindow::EnsureTarget() {
     D2D1_RENDER_TARGET_PROPERTIES properties = D2D1::RenderTargetProperties();
     properties.dpiX = properties.dpiY = Dpi();
     const D2D1_SIZE_U pixels = D2D1::SizeU(static_cast<UINT32>(client.right), static_cast<UINT32>(client.bottom));
-    if (FAILED(d2d_->CreateHwndRenderTarget(properties, D2D1::HwndRenderTargetProperties(hwnd_, pixels),
-                                            target_.put()))) {
+    // Blit now and keep the buffer. The default present flips over the browser's child window, so a
+    // repaint (an answer streaming in) blanks the page until it is put back.
+    const D2D1_HWND_RENDER_TARGET_PROPERTIES window = D2D1::HwndRenderTargetProperties(
+        hwnd_, pixels, D2D1_PRESENT_OPTIONS_IMMEDIATELY | D2D1_PRESENT_OPTIONS_RETAIN_CONTENTS);
+    if (FAILED(d2d_->CreateHwndRenderTarget(properties, window, target_.put()))) {
         return;
     }
     ++targetGeneration_;
@@ -4362,9 +4371,12 @@ void ChatWindow::Paint() {
     case Popup::None:
         break;
     }
-    if (target_->EndDraw() == D2DERR_RECREATE_TARGET) {
+    const HRESULT drawn = target_->EndDraw();
+    if (drawn == D2DERR_RECREATE_TARGET) {
         target_.reset();
         brush_.reset();
+    } else if (SUCCEEDED(drawn) && BrowserShown() && browserView_) {
+        browserView_->ParentMoved();
     }
 }
 
@@ -5849,6 +5861,23 @@ void ChatWindow::PaintTerminal(const Geometry& g) {
         }
     }
     if (!Screen()) {
+        if (BrowserShown() && browserView_) {
+            const BrowserView::Status status = browserView_->State();
+            std::wstring note;
+            uint32_t color = kSecondary;
+            if (!status.failure.empty()) {
+                note = ToWide(status.failure);
+                color = kDanger;
+            } else if (!status.ready) {
+                note = L"Запускаю браузер…";
+            }
+            if (!note.empty()) {
+                Text(note, notice_.get(),
+                     D2D1::RectF(g.term.left + 28.f, g.termScreen.top + 28.f, g.term.right - 28.f,
+                                 g.termScreen.top + 160.f),
+                     color);
+            }
+        }
         return;
     }
 
@@ -7202,7 +7231,9 @@ bool ChatWindow::AllowedUnasked(const std::string& tool, const Json& input) cons
     if (mode == "auto") {
         return AutoAllows(tool, input);
     }
-    return mode == "edits" && (tool == "write_file" || tool == "edit_file") && JsonStr(input, "on").empty();
+    return mode == "edits" &&
+           (tool == "write_file" || tool == "edit_file" || tool == "search_replace" || tool == "write") &&
+           JsonStr(input, "on").empty();
 }
 
 void ChatWindow::ShowPermissionMenu() {
@@ -7282,11 +7313,8 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
             constexpr float kIconBox = 22.f;  // room for the mark: about 20 DIPs across at kTabIcon
             const float left = (r.left + r.right - (kIconBox + 6.f + nameWidth)) / 2;
             const float middle = (r.top + r.bottom) / 2;
-            if (projects) {  // the projects come from GitHub as well as from folders
-                GithubIcon({left + kIconBox / 2, middle}, color, 17.f);
-            } else {
-                ProjectIcon({left + kIconBox / 2, middle}, true, color, kTabIcon);
-            }
+            // A folder for the projects: they are folders on this computer. GitHub's mark stays on the connect screen.
+            ProjectIcon({left + kIconBox / 2, middle}, !projects, color, kTabIcon);
             Text(name, uiBold_.get(), D2D1::RectF(left + kIconBox + 6.f, r.top, r.right, r.bottom), color);
             if (!shown && ParkedIn(projects)) {
                 brush_->SetColor(Color(kAccent));
@@ -7305,7 +7333,7 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
         Line({c.x, c.y - 5.f}, {c.x, c.y + 5.f}, color, 1.5f);
     }
 
-    // Search: drawn here, so there is no blinking caret.
+    // Search is drawn here. The caret is the bar after the typed text (append and backspace only).
     Fill(g.search, 8.f, kRaised);
     if (searchFocus_ || !searchText_.empty()) {  // typed into, or filtering the list: then chats are hidden
         brush_->SetColor(Color(kAccent, searchFocus_ ? 0.75f : 0.45f));
@@ -7330,10 +7358,27 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
     const D2D1_RECT_F field = D2D1::RectF(g.search.left + 34, g.search.top,
                                           searchText_.empty() ? g.search.right - 10 : SearchClearRect(g).left - 4,
                                           g.search.bottom);
+    std::wstring shown;
     if (searchText_.empty()) {
-        Text(L"Поиск", ui_.get(), field, kSecondary);
+        if (!searchFocus_) {
+            Text(L"Поиск", ui_.get(), field, kSecondary);
+        }
     } else {
-        Text(searchText_, ui_.get(), field, kPrimary);
+        const float room = std::max(0.f, field.right - field.left - 2.f);
+        size_t start = 0;
+        while (start < searchText_.size() && TextWidth(searchText_.substr(start), ui_.get()) > room) {
+            const bool pair = start + 1 < searchText_.size() && IS_HIGH_SURROGATE(searchText_[start]) &&
+                              IS_LOW_SURROGATE(searchText_[start + 1]);
+            start += pair ? 2 : 1;
+        }
+        shown = start >= searchText_.size() ? std::wstring() : searchText_.substr(start);
+        Text(shown, ui_.get(), field, kPrimary);
+    }
+    if (searchFocus_) {
+        const float width = shown.empty() ? 0.f : TextWidth(shown, ui_.get());
+        const float x = std::min(field.left + width, field.right - 1.f);
+        const float mid = (field.top + field.bottom) / 2.f;
+        Line({x, mid - 7.f}, {x, mid + 7.f}, kPrimary, 1.5f);
     }
 
     if (update_) {  // the client's update, over the secrets
@@ -7434,14 +7479,17 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
         // gone on with the other one has both, the one answering now in front, ringed in the row's colour.
         const auto agent = [&](const D2D1_RECT_F& chat, bool grok, std::optional<bool> before, uint32_t ground) {
             const float y = (chat.top + chat.bottom) / 2;
-            float x = chat.left + 13.f;
-            if (before) {
-                AgentIcon({chat.left + 10.f, y}, 4.5f, *before);
-                brush_->SetColor(Color(ground));
-                x = chat.left + 15.f;
-                target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(x, y), 6.f, 6.f), brush_.get());
+            if (!before) {
+                AgentIcon({chat.left + 13.f, y}, 5.f, grok);
+                return;
             }
-            AgentIcon({x, y}, 5.f, grok);
+            // The disc that rings the front mark used to sit 5px from the rear one and cover it whole.
+            constexpr float kRearX = 10.f;
+            constexpr float kFrontX = 19.f;
+            AgentIcon({chat.left + kRearX, y}, 4.2f, *before);
+            brush_->SetColor(Color(ground));
+            target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(chat.left + kFrontX, y), 6.f, 6.f), brush_.get());
+            AgentIcon({chat.left + kFrontX, y}, 4.6f, grok);
         };
         if (rows_[row].session == kHead) {
             // A project's head: a fold mark and its name (brighter for the open chat's project); "+" for a new
@@ -7460,19 +7508,24 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
             const D2D1_RECT_F plus = ProjectNewRect(r);
             const uint32_t nameColor = project.folder == workspace_ ? kPrimary : kSecondary;
             ProjectIcon({r.left + 32.f, c.y}, false, nameColor, 1.2f);
-            Text(project.name, uiBold_.get(),
-                 D2D1::RectF(r.left + 46, r.top, plus.left - 4, r.bottom), nameColor);
-            if (hovered) {
-                const bool on = hover_.target == Target::ProjectNew;
-                if (on) {
-                    Fill(plus, 6.f, kLine);
-                }
-                const D2D1_POINT_2F p{(plus.left + plus.right) / 2, (plus.top + plus.bottom) / 2};
-                Line({p.x - 5.f, p.y}, {p.x + 5.f, p.y}, on ? kPrimary : kSecondary, 1.5f);
-                Line({p.x, p.y - 5.f}, {p.x, p.y + 5.f}, on ? kPrimary : kSecondary, 1.5f);
-            } else if (!project.sessions.empty()) {
-                Text(std::to_wstring(project.sessions.size()), uiRight_.get(), plus, kSecondary);
+            float titleRight = plus.left - 4.f;
+            if (!project.sessions.empty()) {
+                const std::wstring count = std::to_wstring(project.sessions.size());
+                const float countWidth = std::max(14.f, TextWidth(count, uiRight_.get()));
+                const D2D1_RECT_F countRect =
+                    D2D1::RectF(plus.left - 6.f - countWidth, r.top, plus.left - 6.f, r.bottom);
+                Text(count, uiRight_.get(), countRect, kSecondary);
+                titleRight = countRect.left - 4.f;
             }
+            Text(project.name, uiBold_.get(), D2D1::RectF(r.left + 46, r.top, titleRight, r.bottom), nameColor);
+            const bool on = hovered && hover_.target == Target::ProjectNew;
+            if (on) {
+                Fill(plus, 6.f, kLine);
+            }
+            const D2D1_POINT_2F p{(plus.left + plus.right) / 2, (plus.top + plus.bottom) / 2};
+            const uint32_t plusColor = on ? kPrimary : kSecondary;
+            Line({p.x - 5.f, p.y}, {p.x + 5.f, p.y}, plusColor, 1.5f);
+            Line({p.x, p.y - 5.f}, {p.x, p.y + 5.f}, plusColor, 1.5f);
             continue;
         }
         // A project's chats stand in under its head; the general ones are a section of their own.

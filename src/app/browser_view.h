@@ -37,6 +37,15 @@ public:
     // UI thread, before the window goes: the WebView's processes end.
     void Shutdown();
 
+    // What the column paints while the page is not up yet.
+    struct Status {
+        bool ready = false;
+        std::string failure;
+    };
+    Status State();
+    // The window moved: tell WebView2 so it does not leave a stale surface.
+    void ParentMoved();
+
     // BrowserPage, worker threads.
     bool Ready(bool& fresh, std::string& error, const std::atomic<bool>& cancel) override;
     bool Call(const std::string& method, const Json& params, Json& result, std::string& error,
@@ -48,7 +57,7 @@ public:
 private:
     bool Post(std::function<void()> task);
     void Create();  // UI thread
-    void Fail(const std::string& why);
+    void Fail(const std::string& why, HRESULT code = S_OK);
 
     HWND window_;
     UINT message_;

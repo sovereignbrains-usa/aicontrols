@@ -576,21 +576,26 @@ bool GrokOwnTool(const std::string& name) {
            name == "image_to_video" || name == "reference_to_video";
 }
 
+bool GrokNativeRead(const std::string& name) {
+    return name == "read_file" || name == "grep";
+}
+
+bool GrokClientTool(const std::string& name) {
+    return GrokOwnTool(name) || GrokNativeRead(name) || name == "search_replace" || name == "write" ||
+           name == "run_terminal_command" || name == "list_dir" || name == "todo_write";
+}
+
 std::string GrokToolName(const std::string& fullName) {
     if (!fullName.starts_with(kGrokToolPrefix)) {
         return {};
     }
     std::string name = fullName.substr(std::string_view(kGrokToolPrefix).size());
-    return GrokOwnTool(name) ? name : std::string();
-}
-
-bool GrokNativeRead(const std::string& name) {
-    return name == "read_file" || name == "grep";
+    return GrokClientTool(name) ? name : std::string();
 }
 
 bool ReadOnlyTool(const std::string& name) {
-    return name == "read_file" || name == "list_directory" || name == "list_chats" || name == "read_chat" ||
-           name == "drive_search" || name == "drive_read";
+    return name == "read_file" || name == "grep" || name == "list_directory" || name == "list_dir" ||
+           name == "list_chats" || name == "read_chat" || name == "drive_search" || name == "drive_read";
 }
 
 bool ToolNeedsApproval(const std::string& name, const Json& input) {
@@ -644,8 +649,13 @@ bool AutoAllows(const std::string& name, const Json& input) {
     if (!StringArg(input, "on").empty()) {
         return false;
     }
-    if (name == "write_file" || name == "edit_file" || name == "image_gen" || name == "image_edit") {
+    if (name == "write_file" || name == "edit_file" || name == "search_replace" || name == "write" ||
+        name == "image_gen" || name == "image_edit") {
         return true;
+    }
+    if (name == "run_terminal_command") {
+        const std::string command = StringArg(input, "command");
+        return command.find("{{") == std::string::npos && !RiskyCommand(command);
     }
     if (name != "run_command") {
         return false;

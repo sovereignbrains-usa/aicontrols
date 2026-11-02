@@ -94,9 +94,20 @@ std::wstring PromptTitle(const std::wstring& prompt) {
         at = end + 1;
     }
     std::wstring title = titled.empty() ? attached : titled;
-    constexpr size_t kLongest = 70;
+    // The header and the row trim this once, on a word. Cutting it here too (it used to stop at 70 and add an
+    // ellipsis) put a second ellipsis in the middle of a word: the list is narrower than those 70 characters,
+    // and the tip had nothing but the stub.
+    constexpr size_t kLongest = 400;
     if (title.size() > kLongest) {
-        title = title.substr(0, kLongest) + L"…";
+        size_t cut = title.find_last_of(L" \t", kLongest);
+        if (cut == std::wstring::npos || cut < 40) {
+            cut = kLongest;
+        }
+        title.resize(cut);
+        while (!title.empty() && (title.back() == L' ' || title.back() == L'\t')) {
+            title.pop_back();
+        }
+        title.push_back(L'\u2026');
     }
     return title;
 }

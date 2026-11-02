@@ -35,8 +35,11 @@ std::string OwnToolName(const std::string& fullName);
 // image_edit, image_to_video, reference_to_video). GrokProcess hands them on as grok__<name>.
 inline constexpr const char* kGrokToolPrefix = "grok__";
 bool GrokOwnTool(const std::string& name);
-// grok__image_gen → image_gen; empty for anything else.
+// grok__image_gen → image_gen. Also Grok's own file and shell tools (search_replace, write,
+// run_terminal_command). Empty for anything else. A permission for one of those used to be refused at once
+// as "not an AIControls tool", and that refusal is reject_once, which cancels every other call of the step.
 std::string GrokToolName(const std::string& fullName);
+bool GrokClientTool(const std::string& name);
 // read_file and grep run inside grok.exe and ask nobody. The feed shows a line. Not GrokOwnTool: that path is
 // the web and Imagine, which become cards.
 bool GrokNativeRead(const std::string& name);

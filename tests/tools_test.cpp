@@ -238,9 +238,10 @@ int main() {
            "Auto lets harmless things through and asks about risky ones");
     Expect(aic::SummarizeTool("run_command", {{"command", "ls"}, {"on", "root@h"}}).detail.starts_with(L"→ root@h\n"),
            "the card names the server");
-    Expect(aic::GrokToolName("grok__image_gen") == "image_gen" && aic::GrokToolName("grok__bash").empty() &&
+    Expect(aic::GrokToolName("grok__image_gen") == "image_gen" &&
+               aic::GrokToolName("grok__search_replace") == "search_replace" && aic::GrokToolName("grok__bash").empty() &&
                aic::GrokToolName("image_gen").empty() && aic::OwnToolName("grok__image_gen").empty(),
-           "GrokToolName: only the web and Imagine");
+           "GrokToolName: the web, Imagine and Grok's own file edits; not a shell");
     Expect(aic::GrokNativeRead("read_file") && aic::GrokNativeRead("grep") && !aic::GrokNativeRead("image_gen") &&
                !aic::GrokNativeRead("bash") && !aic::GrokNativeRead("search_replace"),
            "native reads: a line, not a card");

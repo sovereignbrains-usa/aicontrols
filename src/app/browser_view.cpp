@@ -49,13 +49,19 @@ void BrowserView::RunTask(LPARAM param) {
     }
 }
 
-void BrowserView::Fail(const std::string& why) {
+void BrowserView::Fail(const std::string& why, HRESULT code) {
     {
         std::lock_guard lock(mutex_);
         failure_ = why;
+        if (FAILED(code)) {
+            failure_ += std::format(" (0x{:08X})", static_cast<unsigned>(code));
+        }
     }
     creating_ = false;
     changed_.notify_all();
+    if (window_ != nullptr) {
+        InvalidateRect(window_, nullptr, FALSE);
+    }
 }
 
 void BrowserView::Create() {
@@ -64,28 +70,46 @@ void BrowserView::Create() {
     }
     creating_ = true;
     wchar_t local[MAX_PATH]{};
-    GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH);
-    const std::wstring data = (std::filesystem::path(local) / L"AIControls" / L"browser-view").wstring();
+    const DWORD got = GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH);
+    if (got == 0 || got >= MAX_PATH) {
+        if (GetTempPathW(MAX_PATH, local) == 0) {
+            Fail("Нет папки для данных браузера", E_FAIL);
+            return;
+        }
+    }
+    const std::filesystem::path folder = std::filesystem::path(local) / L"AIControls" / L"browser-view";
+    std::error_code error;
+    std::filesystem::create_directories(folder, error);
+    if (error) {
+        Fail("Не удалось создать папку браузера",
+             HRESULT_FROM_WIN32(static_cast<unsigned long>(error.value())));
+        return;
+    }
+    {
+        std::lock_guard lock(mutex_);
+        failure_.clear();
+    }
+    const std::wstring data = folder.wstring();
     const HRESULT started = CreateCoreWebView2EnvironmentWithOptions(
         nullptr, data.c_str(), nullptr,
         Microsoft::WRL::Callback<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler>(
             [this](HRESULT result, ICoreWebView2Environment* environment) -> HRESULT {
                 if (FAILED(result) || environment == nullptr) {
-                    Fail("Нужен WebView2 (Microsoft Edge): среда не создалась");
+                    Fail("Нужен WebView2 (Microsoft Edge): среда не создалась", FAILED(result) ? result : E_FAIL);
                     return S_OK;
                 }
                 const HRESULT creating = environment->CreateCoreWebView2Controller(
                     window_, Microsoft::WRL::Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
                                  [this](HRESULT created, ICoreWebView2Controller* controller) -> HRESULT {
                                      if (FAILED(created) || controller == nullptr) {
-                                         Fail("Окно браузера не создалось");
+                                         Fail("Окно браузера не создалось", FAILED(created) ? created : E_FAIL);
                                          return S_OK;
                                      }
                                      controller_ = controller;
                                      controller_->get_CoreWebView2(view_.put());
                                      if (!view_) {
                                          controller_.reset();
-                                         Fail("Окно браузера не создалось");
+                                         Fail("Окно браузера не создалось", E_FAIL);
                                          return S_OK;
                                      }
                                      controller_->put_IsVisible(FALSE);
@@ -163,13 +187,13 @@ void BrowserView::Create() {
                                  })
                                  .Get());
                 if (FAILED(creating)) {
-                    Fail("Окно браузера не создалось");
+                    Fail("Окно браузера не создалось", creating);
                 }
                 return S_OK;
             })
             .Get());
     if (FAILED(started)) {
-        Fail("Нужен WebView2 (Microsoft Edge)");
+        Fail("Нужен WebView2 (Microsoft Edge)", started);
     }
 }
 
@@ -186,6 +210,7 @@ void BrowserView::Place(const RECT& bounds, bool visible) {
     }
     if (visible) {
         controller_->put_Bounds(bounds);
+        controller_->NotifyParentWindowPositionChanged();
     }
     controller_->put_IsVisible(visible ? TRUE : FALSE);
 }
@@ -343,6 +368,17 @@ bool BrowserView::Close() {
         }
     });
     return was;
+}
+
+BrowserView::Status BrowserView::State() {
+    std::lock_guard lock(mutex_);
+    return {ready_, failure_};
+}
+
+void BrowserView::ParentMoved() {
+    if (controller_) {
+        controller_->NotifyParentWindowPositionChanged();
+    }
 }
 
 }  // namespace aic

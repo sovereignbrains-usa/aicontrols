@@ -601,12 +601,17 @@ void GrokProcess::OnRequest(const Json& id, const std::string& method, const Jso
         if (const std::string prefix = std::string(kToolServer) + "__"; tool.starts_with(prefix)) {
             ours = tool.substr(prefix.size());
         }
-    } else if (GrokOwnTool(own)) {
-        name = kGrokToolPrefix + own;  // a picture, a video, a page: the window asks as for ours
+    } else if (!own.empty()) {
+        // Its own file edits and shell too, not only the web and Imagine. Refusing them as "not ours" was
+        // reject_once, and that cancels every other call of the step (28.10.2026, his: "оборвалось").
+        name = std::string(kGrokToolPrefix) + own;
         input = raw;
     } else {
-        name = JsonStr(call, "title");  // neither: the window refuses it
+        name = JsonStr(call, "title");
         input = raw;
+        if (GrokClientTool(name)) {
+            name = std::string(kGrokToolPrefix) + name;
+        }
     }
     std::string requestId;
     {

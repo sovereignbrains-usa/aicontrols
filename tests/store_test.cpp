@@ -49,6 +49,20 @@ int main() {
     Expect(fs::exists(historyB / L"chat-1" / L"result.txt") && !fs::exists(historyA / L"chat-1"),
            "its folder went with it");
     Expect(aic::ListSessions(b)[0].title == L"hello", "its title as before");
+    {
+        std::string sentence = "word0";
+        for (int i = 1; i < 16; ++i) {
+            sentence += " word" + std::to_string(i);
+        }
+        std::ofstream(historyA / L"chat-long.jsonl")
+            << "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"" << sentence << "\"}}\n";
+        const std::wstring whole(sentence.begin(), sentence.end());
+        const auto listed = aic::ListSessions(a);
+        const auto found = std::ranges::find_if(listed, [](const aic::SessionInfo& s) { return s.id == "chat-long"; });
+        Expect(found != listed.end() && found->title == whole && whole.size() > 70 &&
+                   found->title.find(L"\u2026") == std::wstring::npos,
+               "a long first line stays whole, so the row's own ellipsis is the only cut");
+    }
     Expect(!aic::MoveSession(a, b, "chat-1"), "a chat that is not there is not moved");
     Expect(!aic::MoveSession(b, b, "chat-1"), "nor to its own project");
     Expect(!aic::MoveSession(b, a, "..\\chat-1"), "nor by a path");
