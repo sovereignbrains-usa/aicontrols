@@ -1377,7 +1377,7 @@ private:
     void MoveProject(const std::wstring& folder, int delta);
     const wchar_t* ProjectOrderWord() const;
     // A project head or a chat, taken and moved. A short press is still a click. The search is not dragged: it
-    // shows a subset. A folded project shows only the open chat, so that one is not dragged either.
+    // shows a subset. A folded project shows no chats, so there is nothing of it to drag but the head.
     bool CanDragRow(size_t row) const;
     void ArmListGrab(size_t row, float y);
     void MoveListGrab(float y);
@@ -7392,7 +7392,7 @@ void ChatWindow::LoadRepos() {
 }
 
 // The chat's folder is `folder`: a project in the sidebar from now on (added at the end), unfolded.
-// A folded project stays folded: its open chat shows under the fold (FilterSessions).
+// A folded project stays folded, and a fold shows the head only (FilterSessions).
 void ChatWindow::SetWorkspace(const std::wstring& path) {
     // The project as the list spells it: a folder picked again in other letters' case is not a second one.
     const auto known = std::ranges::find_if(settings_.projects, [&](const std::wstring& project) {
@@ -7914,6 +7914,38 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
                 const D2D1_RECT_F countRect = D2D1::RectF(countRight - countWidth, r.top, countRight, r.bottom);
                 Text(countText, uiRight_.get(), countRect, kSecondary);
                 titleRight = countRect.left - 4.f;
+            }
+            // Folded, the chats are gone. A chat that answers aside, or waits for a word, keeps its dot here.
+            if (!archive && !unfolded) {
+                bool waiting = false;
+                bool busy = false;
+                for (const SessionInfo& session : project.sessions) {
+                    const Parked* parked = ParkedChat(project.folder, session);
+                    if (parked == nullptr) {
+                        continue;
+                    }
+                    if (std::ranges::any_of(parked->feed, [](const FeedItem& item) {
+                            return item.kind == Kind::Approval && item.verdict == Verdict::Pending;
+                        })) {
+                        waiting = true;
+                    } else if (parked->busy) {
+                        busy = true;
+                    }
+                }
+                if (waiting || busy) {
+                    float alpha = 1.f;
+                    if (busy && !waiting) {
+                        const auto ticks = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                               std::chrono::steady_clock::now().time_since_epoch())
+                                               .count();
+                        alpha = 0.35f + 0.65f * (0.5f + 0.5f * std::sin(static_cast<float>(ticks % 1200) / 1200.f *
+                                                                         2.f * std::numbers::pi_v<float>));
+                    }
+                    const float dotX = titleRight - 10.f;
+                    brush_->SetColor(Color(waiting ? kWaiting : kAccent, alpha));
+                    target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(dotX, c.y), 3.5f, 3.5f), brush_.get());
+                    titleRight = dotX - 8.f;
+                }
             }
             Text(project.name, uiBold_.get(), D2D1::RectF(r.left + 46, r.top, titleRight, r.bottom), nameColor);
             if (showPlus) {
@@ -11151,12 +11183,11 @@ void ChatWindow::FilterSessions(bool pickFirst) {
             std::ranges::none_of(project.sessions, [&](const SessionInfo& session) { return SameChat(session, OpenId()); })) {
             rows_.push_back({p, kDraft});
         }
+        if (folded) {  // the head only: a collapse closes every chat under it
+            continue;
+        }
         for (const size_t i : chats) {
-            // Folded, a project still shows what must not go out of sight: the open chat, one answering aside.
-            const SessionInfo& session = project.sessions[i];
-            if (!folded || IsOpenChat(project.folder, session) || ParkedChat(project.folder, session) != nullptr) {
-                rows_.push_back({p, i});
-            }
+            rows_.push_back({p, i});
         }
     }
     if (pickFirst) {
@@ -11279,7 +11310,7 @@ void ChatWindow::OpenSession(size_t row) {
     }
 }
 
-// The open chat's row in sight (a folded project shows it too): the search off, the list scrolled to it.
+// The open chat's row in sight: the search off, the list scrolled to it. A folded project has no chat row.
 void ChatWindow::RevealOpened() {
     if (!searchText_.empty()) {
         searchText_.clear();
@@ -11430,7 +11461,7 @@ bool ChatWindow::CanDragRow(size_t row) const {
     if (session == nullptr || IsDoomed(project.folder, *session)) {
         return false;
     }
-    // Folded, only the open chat is shown: dragging it would reorder a list that is not on screen.
+    // A fold shows no chats. One that somehow is would reorder a list that is not on screen.
     return project.folder == DefaultWorkspace() || !ProjectFolded(project.folder);
 }
 
