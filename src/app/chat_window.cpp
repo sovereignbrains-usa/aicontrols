@@ -932,6 +932,11 @@ private:
     float Dpi() const { return static_cast<float>(GetDpiForWindow(hwnd_)); }
     float ToDip(int px) const { return static_cast<float>(px) * 96.f / Dpi(); }
     int ToPx(float dip) const { return static_cast<int>(std::lround(dip * Dpi() / 96.f)); }
+    float SnapDip(float dip) const {  // onto a device pixel, so a panel edge is not drawn between two
+        const float scale = Dpi() / 96.f;
+        return std::round(dip * scale) / scale;
+    }
+    float Pixel() const { return 96.f / Dpi(); }
     D2D1_POINT_2F CursorDip(LPARAM lParam) const {
         return {ToDip(GET_X_LPARAM(lParam)), ToDip(GET_Y_LPARAM(lParam))};
     }
@@ -954,6 +959,8 @@ private:
     void PaintWindowButtons(const Geometry& g);
     LRESULT HitTestFrame(LPARAM lParam);
     bool FreeSpace(float x, float y) const;
+    bool OnFeedContent(const Geometry& g, float x, float y) const;  // text, a bubble, a card, a picture: not the gaps
+    void SelectFeedWord(const Geometry& g, float x, float y);
     bool BelowHeader(LPARAM screen, LPARAM* client) const;
     void PaintInput(const Geometry& g);
     void PaintPanel(const D2D1_RECT_F& rect);
@@ -1264,6 +1271,8 @@ private:
     void Ring(D2D1_POINT_2F center, float radius, float fraction, uint32_t color);
     void Text(const std::wstring& text, IDWriteTextFormat* format, const D2D1_RECT_F& rect, uint32_t color);
     void Fill(const D2D1_RECT_F& rect, float radius, uint32_t color, float alpha = 1.f);
+    void Solid(const D2D1_RECT_F& rect, uint32_t color);  // a pixel-aligned fill, no antialiased seam
+    void Separator(float x, float top, float bottom);    // one device pixel on the panel's right edge
     void Line(D2D1_POINT_2F a, D2D1_POINT_2F b, uint32_t color, float width = 1.6f);
     void Check(D2D1_POINT_2F center, uint32_t color);
     void AgentIcon(D2D1_POINT_2F center, float radius, bool grok, float scale = 1.f, float angle = 0.f, float alpha = 1.f);
@@ -1766,7 +1775,9 @@ int ChatWindow::Run(int show) {
 
     WNDCLASSEXW windowClass{};
     windowClass.cbSize = sizeof(windowClass);
-    windowClass.style = CS_HREDRAW | CS_VREDRAW;  // a resize repaints, it does not shift the old picture about
+    // CS_DBLCLKS: a double click on the title bar (and on the top edge, handled below) maximizes. Without it
+    // Windows never sends WM_NCLBUTTONDBLCLK, so the click did nothing almost everywhere (02.11.2026).
+    windowClass.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;
     windowClass.lpfnWndProc = &ChatWindow::Proc;
     windowClass.hInstance = instance_;
     windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
@@ -1910,8 +1921,21 @@ LRESULT CALLBACK ChatWindow::InputProc(HWND hwnd, UINT message, WPARAM wParam, L
         reinterpret_cast<ChatWindow*>(self)->PasteClipboard();  // files and pictures too, not only text
         return 0;
     }
-    if (message == WM_MOUSEWHEEL && reinterpret_cast<ChatWindow*>(self)->WheelInput(GET_WHEEL_DELTA_WPARAM(wParam))) {
-        return 0;  // RichEdit without a scrollbar of its own hands the wheel to the feed
+    if (message == WM_MOUSEWHEEL) {
+        // Focus stays in the input, so the wheel arrives here even when the pointer is over the feed. RichEdit
+        // then scrolled its own text and the messages stayed put (02.11.2026, his: scrolling up moves the chat
+        // off the messages). Over the input, and only when the input has more than it shows, the input scrolls;
+        // everywhere else the window scrolls whatever is under the pointer.
+        auto* window = reinterpret_cast<ChatWindow*>(self);
+        POINT at{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        ScreenToClient(hwnd, &at);
+        RECT box{};
+        GetClientRect(hwnd, &box);
+        const bool overInput = at.x >= 0 && at.y >= 0 && at.x < box.right && at.y < box.bottom;
+        if (!overInput || !window->WheelInput(GET_WHEEL_DELTA_WPARAM(wParam))) {
+            window->Handle(WM_MOUSEWHEEL, wParam, lParam);
+        }
+        return 0;
     }
     const LRESULT result = DefSubclassProc(hwnd, message, wParam, lParam);
     switch (message) {  // what may have scrolled it: the bar beside it follows
@@ -2038,6 +2062,15 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
             if (renaming_ != Rename::None) {
                 CommitRename();
             }
+        }
+        break;
+    case WM_NCLBUTTONDBLCLK:
+        // The top resize edge is not the title bar, so Windows would not maximize it. A double click there does
+        // (02.11.2026, his: a double click almost nowhere maximizes or restores). The title bar itself is the
+        // default, now that the class has CS_DBLCLKS.
+        if (wParam == HTTOP || wParam == HTTOPLEFT || wParam == HTTOPRIGHT) {
+            ShowWindow(hwnd_, IsZoomed(hwnd_) ? SW_RESTORE : SW_MAXIMIZE);
+            return 0;
         }
         break;
     case WM_NCRBUTTONDOWN:
@@ -2223,12 +2256,14 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         if (dragging_ != Target::None) {  // a splitter: the panel follows the mouse, within limits
             const Geometry g = Layout();
             previewWide_ = false;  // dragged by hand: that is the width now
+            // Whole pixels: a fractional edge antialiased a seam just left of the boundary, and the text jumped
+            // on its own grid (02.11.2026, his: holes left of the edge, the picture steps as it moves left).
             if (dragging_ == Target::SplitSidebar) {
                 const float most = std::max(kMinSidebar, g.width - MinChat());
-                sidebarWidth_ = std::clamp(at.x, kMinSidebar, std::min(kMaxSidebar, most));
+                sidebarWidth_ = SnapDip(std::clamp(at.x, kMinSidebar, std::min(kMaxSidebar, most)));
             } else {
                 const float most = std::max(kMinTerminal, g.width - MinChat());
-                terminalWidth_ = std::clamp(at.x, kMinTerminal, most);
+                terminalWidth_ = SnapDip(std::clamp(at.x, kMinTerminal, most));
             }
             PlaceChildren();
             Refresh();
@@ -2430,6 +2465,16 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         }
         const D2D1_POINT_2F at = CursorDip(lParam);
         OnClick(at.x, at.y);
+        return 0;
+    }
+    case WM_LBUTTONDBLCLK: {
+        // A double click in the feed selects the word under it, as it does in the input (02.11.2026).
+        const D2D1_POINT_2F at = CursorDip(lParam);
+        const Geometry g = Layout();
+        if (popup_ == Popup::None && HitTest(at.x, at.y).target == Target::None && OnFeedContent(g, at.x, at.y)) {
+            SelectFeedWord(g, at.x, at.y);
+            Refresh();
+        }
         return 0;
     }
     case WM_MOUSEWHEEL: {
@@ -3250,9 +3295,11 @@ Geometry ChatWindow::Layout() const {
     g.height = ToDip(client.bottom);
     // The sidebar docks at the left and the chat takes what is left, as in Claude's app.
     // The terminal takes the sidebar's place (the same left column, the same toggle); the chats come back when it closes.
-    const float termWidth = terminalOpen_ ? std::min(terminalWidth_, std::max(0.f, g.width - MinChat())) : 0.f;
-    const float sidebarWidth =
-        sidebarOpen_ && !terminalOpen_ ? std::min(sidebarWidth_, std::max(0.f, g.width - MinChat())) : 0.f;
+    const float termWidth =
+        terminalOpen_ ? SnapDip(std::min(terminalWidth_, std::max(0.f, g.width - MinChat()))) : 0.f;
+    const float sidebarWidth = sidebarOpen_ && !terminalOpen_
+                                   ? SnapDip(std::min(sidebarWidth_, std::max(0.f, g.width - MinChat())))
+                                   : 0.f;
     g.areaLeft = std::max(sidebarWidth, termWidth);
     if (sidebarWidth > 0) {
         g.splitSidebar = D2D1::RectF(sidebarWidth - 3, kHeader, sidebarWidth + 4, g.height);
@@ -3794,7 +3841,26 @@ void ChatWindow::Text(const std::wstring& text, IDWriteTextFormat* format, const
 
 void ChatWindow::Fill(const D2D1_RECT_F& rect, float radius, uint32_t color, float alpha) {
     brush_->SetColor(Color(color, alpha));
+    if (radius <= 0.f) {
+        // A rounded rectangle of radius 0 is tessellated short of the edge: a hairline of the window showed through.
+        target_->FillRectangle(rect, brush_.get());
+        return;
+    }
     target_->FillRoundedRectangle(D2D1::RoundedRect(rect, radius, radius), brush_.get());
+}
+
+void ChatWindow::Solid(const D2D1_RECT_F& rect, uint32_t color) {
+    brush_->SetColor(Color(color));
+    const auto was = target_->GetAntialiasMode();
+    target_->SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
+    target_->FillRectangle(rect, brush_.get());
+    target_->SetAntialiasMode(was);
+}
+
+// The pixel just inside `x` (a panel's right edge, already on a pixel boundary).
+void ChatWindow::Separator(float x, float top, float bottom) {
+    const float pixel = Pixel();
+    Solid(D2D1::RectF(x - pixel, top, x, bottom), kLine);
 }
 
 void ChatWindow::Line(D2D1_POINT_2F a, D2D1_POINT_2F b, uint32_t color, float width) {
@@ -4267,11 +4333,17 @@ float ChatWindow::LayoutImages(FeedItem& item, D2D1_RECT_F box, bool fromRight) 
 }
 
 float ChatWindow::FeedHeight() const {
-    float total = 2 * kGap;
+    // The same places PaintFeed draws: one gap above the first item, one after each, and one under the status.
+    // An extra gap here pinned the stuck feed a strip below the messages, so the first wheel notch only opened
+    // empty space (02.11.2026, his: scrolling up moves the chat off the messages).
+    float total = kGap;
     for (const FeedItem& item : feed_) {
         total += item.height + kGap;
     }
-    return total + (StatusLine().empty() ? 0.f : kStatusRow + kGap);
+    if (!StatusLine().empty()) {
+        total += kStatusRow + kGap;
+    }
+    return total;
 }
 
 // What Claude is doing, under the last message: waiting for the user's word, running a tool, answering; else a
@@ -4344,9 +4416,10 @@ void ChatWindow::Paint() {
     PaintTerminal(g);
     for (const Target split : {Target::SplitSidebar, Target::SplitTerminal}) {  // the edge lights up to be dragged
         if ((hover_.target == split && edgeLit_) || dragging_ == split) {
-            const float x = g.areaLeft;  // both are the left column's right edge
-            // All of it: a stretch round the pointer looked like a scroll bar's thumb next to the list's own.
-            Fill(D2D1::RectF(x - 1.f, kHeader, x + 1.f, g.height), 0.f, kAccent);
+            const float x = g.areaLeft;  // both are the left column's right edge, on a pixel
+            const float pixel = Pixel();
+            // Two device pixels, aliased: a DIP-wide antialiased stroke left a bright seam beside the panel.
+            Solid(D2D1::RectF(x - pixel, kHeader, x + pixel, g.height), kAccent);
         }
     }
     if (pan_ != Scroller::None) {  // where the middle button went down: the farther from it, the faster
@@ -4744,7 +4817,8 @@ void ChatWindow::PaintHeader(const Geometry& g) {
             brush_->SetColor(Color(color));
             target_->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(c.x - 7.f, c.y - 6.f, c.x + 7.f, c.y + 6.f), 2.f, 2.f),
                                           brush_.get(), 1.4f);
-            Line({c.x - 7.f, c.y - 2.2f}, {c.x + 7.f, c.y - 2.2f}, color, 1.4f);
+            // Inset: a line on the frame itself read as a broken edge through the icon.
+            Line({c.x - 4.5f, c.y - 2.2f}, {c.x + 4.5f, c.y - 2.2f}, color, 1.4f);
         }
     };
     headerButton(Target::SidebarToggle, g.sideToggle, false);
@@ -4752,8 +4826,9 @@ void ChatWindow::PaintHeader(const Geometry& g) {
     headerButton(Target::BrowserToggle, g.browserBtn, BrowserShown());
 }
 
-// The window's edges and its title bar, which is the header: the top border resizes, the header's free
-// space drags the window (a double click maximizes, a right click opens the system menu), its buttons are ours.
+// The window's edges and its title bar, which is the header: the top border resizes (a double click there
+// maximizes), the header's free space and the feed's empty places drag the window (a double click maximizes,
+// a right click opens the system menu), its buttons are ours.
 LRESULT ChatWindow::HitTestFrame(LPARAM lParam) {
     const LRESULT standard = DefWindowProcW(hwnd_, WM_NCHITTEST, 0, lParam);
     if (standard != HTCLIENT) {
@@ -4783,8 +4858,8 @@ LRESULT ChatWindow::HitTestFrame(LPARAM lParam) {
 }
 
 // Below the header too, where a press has nothing of its own to do, it takes the window along: the sidebar's empty
-// part, the chat's sides past its column, the strip round the input card, the terminal's row of tabs. The feed's text
-// keeps a margin beside it, as a selection may start just left of a line.
+// part, the gaps of the feed (not its text, bubbles, cards or pictures), the strip round the input card, the
+// terminal's row of tabs. A line keeps a little slack beside its glyphs, so a selection can still start there.
 bool ChatWindow::FreeSpace(float x, float y) const {
     if (popup_ != Popup::None) {
         return false;  // a press beside an open panel closes it
@@ -4797,9 +4872,92 @@ bool ChatWindow::FreeSpace(float x, float y) const {
         return y < g.termScreen.top;
     }
     if (Inside(g.feed, x, y)) {
-        return x < g.left - kSide || x > g.left + g.column + kSide || !FeedPointAt(g, x, y);
+        return !OnFeedContent(g, x, y);
     }
     return x >= g.areaLeft && x < g.area && y >= g.feed.bottom && !Inside(g.box, x, y);
+}
+
+// True when the point is on something the feed owns: a picture, a card, a user bubble, a code panel, or the glyphs
+// of a line (plus a little slack). The rest of the column drags the window and a double click maximizes.
+bool ChatWindow::OnFeedContent(const Geometry& g, float x, float y) const {
+    if (!Inside(g.feed, x, y)) {
+        return false;
+    }
+    for (const FeedItem& item : feed_) {
+        if (!item.layout || y < item.top || y >= item.top + item.height) {
+            continue;
+        }
+        if (item.kind == Kind::Notice && !HasConversation()) {
+            continue;
+        }
+        for (size_t k = 0; k < item.images.size(); ++k) {
+            if (Inside(ImageRect(g, item, k), x, y)) {
+                return true;
+            }
+        }
+        if (item.kind == Kind::Approval) {
+            return x >= g.left && x <= g.left + g.column;
+        }
+        if (item.kind == Kind::User) {
+            if (item.text.empty()) {
+                return false;
+            }
+            const float width = item.textWidth + 2 * kBubblePad;
+            const float left = g.left + g.column - width;
+            return x >= left && x <= left + width && y >= item.top + item.bubbleTop;
+        }
+        const D2D1_POINT_2F origin = ItemOrigin(g, item);
+        if (item.whoHeight > 0.f && y < origin.y) {
+            return x >= g.left && x <= g.left + 16.f + TextWidth(item.who, small_.get());
+        }
+        if (item.kind == Kind::Assistant) {
+            if (const MdSpan* code = MarkdownSpanAt(g, x, y, kMdCode, nullptr); code != nullptr && code->block) {
+                return x >= g.left - 8.f && x <= g.left + g.column + 8.f;
+            }
+        }
+        BOOL trailing = FALSE;
+        BOOL inside = FALSE;
+        DWRITE_HIT_TEST_METRICS metrics{};
+        if (FAILED(item.layout->HitTestPoint(x - origin.x, y - origin.y, &trailing, &inside, &metrics))) {
+            return false;
+        }
+        constexpr float kSlack = 18.f;  // a selection may start just beside the line
+        const float lineLeft = origin.x + metrics.left;
+        const float lineRight = lineLeft + std::max(metrics.width, 4.f);
+        return x >= lineLeft - kSlack && x <= lineRight + kSlack;
+    }
+    return false;
+}
+
+// The word under a double click, as the input does it. Letters (Cyrillic included) and digits stay together.
+void ChatWindow::SelectFeedWord(const Geometry& g, float x, float y) {
+    const std::optional<FeedPoint> point = FeedPointAt(g, x, y);
+    if (!point || point->item >= feed_.size()) {
+        return;
+    }
+    const std::wstring& text = feed_[point->item].shown;
+    if (text.empty()) {
+        return;
+    }
+    const auto word = [](wchar_t c) { return c == L'_' || std::iswalnum(c) != 0 || c >= 0x00C0; };
+    size_t at = std::min(static_cast<size_t>(point->pos), text.size());
+    if (at == text.size() || !word(text[at])) {
+        if (at == 0 || !word(text[at - 1])) {
+            return;
+        }
+        --at;
+    }
+    size_t from = at;
+    size_t to = at + 1;
+    while (from > 0 && word(text[from - 1])) {
+        --from;
+    }
+    while (to < text.size() && word(text[to])) {
+        ++to;
+    }
+    feedAnchor_ = FeedPoint{point->item, static_cast<UINT32>(from)};
+    feedFocus_ = FeedPoint{point->item, static_cast<UINT32>(to)};
+    feedSelecting_ = false;
 }
 
 // A press on such space under the header: the point in the client's coordinates, for the client's own handling.
@@ -5809,8 +5967,8 @@ void ChatWindow::PaintTerminal(const Geometry& g) {
     if (g.term.right <= g.term.left) {
         return;
     }
-    Fill(g.term, 0.f, kPanel);
-    Line({g.term.right, g.term.top}, {g.term.right, g.term.bottom}, kLine, 1.f);
+    Solid(g.term, kPanel);
+    Separator(g.term.right, g.term.top, g.term.bottom);
     for (size_t i = 0; i < tabs_.size() && i < g.termTabs.size(); ++i) {  // the tabs, as in Claude's app
         const D2D1_RECT_F& r = g.termTabs[i];
         const bool active = i == activeTab_;
@@ -7286,8 +7444,8 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
     if (g.sidebar.right <= g.sidebar.left) {
         return;
     }
-    Fill(g.sidebar, 0.f, kPanel);
-    Line({g.sidebar.right, g.sidebar.top}, {g.sidebar.right, g.sidebar.bottom}, kLine, 1.f);
+    Solid(g.sidebar, kPanel);
+    Separator(g.sidebar.right, g.sidebar.top, g.sidebar.bottom);
     if (secretsOpen_) {
         PaintSecrets(g);
         return;
@@ -8509,8 +8667,21 @@ void ChatWindow::GlideBy(float delta) {
         glideStep_ = std::chrono::steady_clock::now();
         SetTimer(hwnd_, kGlideTimer, kGlideFrame, nullptr);
     }
-    const float goal = std::clamp(std::min(glide_.value_or(scroll_), maxScroll_) + delta, 0.f, maxScroll_);
-    glide_ = goal >= maxScroll_ - 1.f ? std::numeric_limits<float>::infinity() : goal;
+    // "The end" stays infinity so a growing answer is followed. A wheel upward has to leave that end on the first
+    // fraction and keep adding: each notch used to be measured from maxScroll_ again, so a touchpad's small
+    // deltas were thrown away and the feed stayed glued under the gesture.
+    const bool glued = glide_ && !std::isfinite(*glide_);
+    const float base = glued ? maxScroll_ : glide_.value_or(scroll_);
+    const float goal = std::clamp(base + delta, 0.f, maxScroll_);
+    if (delta < 0.f) {
+        glide_ = goal;
+        stick_ = false;
+    } else if (goal >= maxScroll_ - 1.f) {
+        glide_ = std::numeric_limits<float>::infinity();
+    } else {
+        glide_ = goal;
+        stick_ = false;
+    }
 }
 
 void ChatWindow::GlideStep() {
@@ -8994,9 +9165,6 @@ void ChatWindow::ShowCopyMenu(POINT screen, D2D1_POINT_2F at) {
             AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
         }
     };
-    if (HasFeedSelection()) {
-        AppendMenuW(menu.get(), MF_STRING, kSelection, L"Копировать выделенное\tCtrl+C");
-    }
     const bool path = link != nullptr && IsLocalPath(link->url);
     if (path) {  // a file on this computer
         separate();
@@ -9011,14 +9179,18 @@ void ChatWindow::ShowCopyMenu(POINT screen, D2D1_POINT_2F at) {
         AppendMenuW(menu.get(), MF_STRING, kOpenLink, L"Открыть ссылку");
         AppendMenuW(menu.get(), MF_STRING, kCopyLink, L"Копировать ссылку");
     }
-    if (code != nullptr && codeOwner != nullptr) {
+    // One copy. Selection, the code block and the whole message used to sit together, three labels for one gesture
+    // (02.11.2026, his: the menu has two actions of the same kind).
+    if (HasFeedSelection() || (code != nullptr && codeOwner != nullptr) || onMessage) {
         separate();
-        AppendMenuW(menu.get(), MF_STRING, kCopyCode,
-                    (code->flags & kMdTable) != 0 ? L"Копировать таблицу" : L"Копировать код");
-    }
-    if (onMessage) {
-        separate();
-        AppendMenuW(menu.get(), MF_STRING, kCopyMessage, L"Копировать сообщение");
+        if (HasFeedSelection()) {
+            AppendMenuW(menu.get(), MF_STRING, kSelection, L"Копировать выделенное\tCtrl+C");
+        } else if (code != nullptr && codeOwner != nullptr) {
+            AppendMenuW(menu.get(), MF_STRING, kCopyCode,
+                        (code->flags & kMdTable) != 0 ? L"Копировать таблицу" : L"Копировать код");
+        } else {
+            AppendMenuW(menu.get(), MF_STRING, kCopyMessage, L"Копировать сообщение");
+        }
     }
     if (GetMenuItemCount(menu.get()) == 0) {
         return;

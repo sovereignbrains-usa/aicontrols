@@ -59,6 +59,12 @@ int main() {
 
     Expect(aic::Highlight(L"int x = 42;", L"").empty(), "no language, no tokens");
     Expect(aic::Highlight(L"int x = 42;", L"brainfuck").empty(), "unknown language, no tokens");
+    Expect(Has(L"n = 42; // note", L"plain", TokenKind::Number, L"42"), "plain number");
+    Expect(Has(L"n = 42; // note", L"plain", TokenKind::Comment, L"// note"), "plain comment");
+    Expect(aic::GuessLanguage(L"int x = nullptr;") == L"cpp", "guess cpp");
+    Expect(aic::GuessLanguage(L"def f():\n  pass") == L"python", "guess python");
+    Expect(aic::GuessLanguage(L"echo hello") == L"plain", "guess plain");
+    Expect(Has(L"<div class=\"a\">", L"html", TokenKind::String, L"\"a\""), "html string");
     Expect(Has(L"int x = 1;", L"CPP title=\"a\"", TokenKind::Keyword, L"int"), "language is the first word, any case");
 
     size_t end = 0;  // tokens are ordered and apart

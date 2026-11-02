@@ -373,7 +373,15 @@ MdText ParseMarkdown(std::wstring_view source, size_t tableWidth) {
         }
         if (end > codeStart) {
             out.spans.push_back(MdSpan{codeStart, end - codeStart, kMdCode, 1.f, true});
-            for (const Token& token : Highlight(std::wstring_view(out.text).substr(codeStart, end - codeStart), language)) {
+            // A fence with no language used to stay one color. Guess, and otherwise still color strings and comments.
+            const std::wstring_view body = std::wstring_view(out.text).substr(codeStart, end - codeStart);
+            std::wstring guessed;
+            std::wstring_view lang = language;
+            if (Trim(language).empty()) {
+                guessed = GuessLanguage(body);
+                lang = guessed;
+            }
+            for (const Token& token : Highlight(body, lang)) {
                 MdSpan span{codeStart + token.start, token.length, kMdToken, 1.f, false};
                 span.token = token.kind;
                 out.spans.push_back(std::move(span));

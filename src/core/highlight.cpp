@@ -91,6 +91,7 @@ const Syntax kShell{&ShellWords(), L"#", false, false, false, true, false, false
 const Syntax kPowerShell{&PowerShellWords(), L"#", false, true, true, true, false, false, false, true, L'`', false};
 const Syntax kSql{&SqlWords(), L"--", true, false, true, false, false, false, false, false, 0, false};
 const Syntax kDiff{nullptr, {}, false, false, false, false, false, false, false, false, 0, true};
+const Syntax kPlain{nullptr, L"//", true, false, false, false, false, false, false, false, L'\\', false};
 
 const Syntax* Lookup(std::wstring_view language) {
     size_t end = 0;
@@ -114,7 +115,11 @@ const Syntax* Lookup(std::wstring_view language) {
         {L"ruby", &kHash},       {L"dockerfile", &kHash},  {L"ini", &kHash},    {L"sh", &kShell},
         {L"bash", &kShell},      {L"shell", &kShell},      {L"zsh", &kShell},   {L"powershell", &kPowerShell},
         {L"ps1", &kPowerShell},  {L"pwsh", &kPowerShell},  {L"ps", &kPowerShell}, {L"sql", &kSql},
-        {L"diff", &kDiff},       {L"patch", &kDiff}};
+        {L"diff", &kDiff},       {L"patch", &kDiff},       {L"html", &kPlain},  {L"htm", &kPlain},
+        {L"xml", &kPlain},       {L"svg", &kPlain},        {L"vue", &kPlain},   {L"css", &kPlain},
+        {L"scss", &kPlain},      {L"less", &kPlain},       {L"md", &kPlain},    {L"markdown", &kPlain},
+        {L"text", &kPlain},      {L"plain", &kPlain},      {L"txt", &kPlain},   {L"cmake", &kPlain},
+        {L"make", &kPlain},      {L"makefile", &kPlain},   {L"lua", &kPlain}};
     for (const auto& [key, syntax] : table) {
         if (key == name) {
             return syntax;
@@ -284,6 +289,32 @@ std::vector<Token> Highlight(std::wstring_view code, std::wstring_view language)
         ++i;
     }
     return out;
+}
+
+std::wstring GuessLanguage(std::wstring_view code) {
+    const auto has = [&](std::wstring_view needle) { return code.find(needle) != std::wstring_view::npos; };
+    if (has(L"#include") || has(L"std::") || has(L"template<") || has(L"nullptr")) {
+        return L"cpp";
+    }
+    if (has(L"fn ") || has(L"impl ") || has(L"let mut") || has(L"println!")) {
+        return L"rust";
+    }
+    if (has(L"def ") || has(L"elif ") || has(L"lambda ")) {
+        return L"python";
+    }
+    if (has(L"param(") || has(L"Write-") || has(L"$PS")) {
+        return L"powershell";
+    }
+    if (has(L"SELECT ") || has(L"select ") || has(L"FROM ")) {
+        return L"sql";
+    }
+    if (has(L"function ") || has(L"const ") || has(L"let ") || has(L"=>")) {
+        return L"js";
+    }
+    if (has(L"<html") || has(L"<div") || has(L"</")) {
+        return L"html";
+    }
+    return L"plain";
 }
 
 }  // namespace aic
