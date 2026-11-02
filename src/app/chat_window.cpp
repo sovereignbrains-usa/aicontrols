@@ -316,7 +316,6 @@ constexpr uint32_t kUserBubble = 0x1d2738;
 constexpr uint32_t kLine = 0x2c2c31;
 constexpr uint32_t kPrimary = 0xf2f4f8;
 constexpr uint32_t kSecondary = 0x9c9ea4;
-constexpr uint32_t kTitle = 0xc4c6cc;  // the chat's title in the header: quieter than the messages
 constexpr uint32_t kAccent = 0x4c92ff;
 constexpr uint32_t kDanger = 0xf06060;
 constexpr uint32_t kWaiting = 0xe8b04c;  // a chat in the background waits for the user's word
@@ -568,7 +567,7 @@ enum class Target {
     None,
     ScrollBar,  // row: a Scroller: its strip (the thumb, or beside it)
     SidebarToggle,
-    SaveMemoryBtn,  // the header's "save the memory" (to its GitHub repository)
+    SaveMemoryBtn,  // the header's right: "save the memory" (to its GitHub repository)
     Update,  // the header's "update to ..." (only while there is one)
     SidebarSearch,
     SplitSidebar,   // the edge between the sidebar and the chat: drag to resize
@@ -654,9 +653,7 @@ struct Geometry {
     D2D1_RECT_F terminalBtn{};  // the header, beside the panel's button: show or hide the terminal
     D2D1_RECT_F browserBtn{};   // ... and the browser tab, beside that
     D2D1_RECT_F update{};       // ... and left of it, "update to ..." while a newer build is there
-    float titleLeft = 0;        // the chat's title, "project / chat"
-    float titleRight = 0;
-    D2D1_RECT_F memory{};       // save the memory: right after the title
+    D2D1_RECT_F memory{};       // save the memory: the header's right, before the window buttons
     D2D1_RECT_F winMin{};       // minimize, maximize, close: the header is the window's title bar
     D2D1_RECT_F winMax{};
     D2D1_RECT_F winClose{};
@@ -1604,7 +1601,6 @@ wil::com_ptr<ID2D1PathGeometry> githubMark_;  // the projects' mark, made when f
     wil::com_ptr<IDWriteTextFormat> body_;
     wil::com_ptr<IDWriteTextFormat> notice_;
     wil::com_ptr<IDWriteTextFormat> noticeLeading_;
-    wil::com_ptr<IDWriteTextFormat> header_;
     wil::com_ptr<IDWriteTextFormat> ui_;
     wil::com_ptr<IDWriteTextFormat> uiBold_;
     wil::com_ptr<IDWriteTextFormat> uiRight_;
@@ -1804,7 +1800,6 @@ int ChatWindow::Run(int show) {
     body_ = MakeFormat(kTextFont, 15.f, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_LEADING, false);
     notice_ = MakeFormat(kTextFont, 12.5f, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_CENTER, false);
     noticeLeading_ = MakeFormat(kTextFont, 12.5f, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_LEADING, false);
-    header_ = MakeFormat(kTextFont, 12.5f, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_LEADING, true);
     ui_ = MakeFormat(kTextFont, 13.f, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_LEADING, true);
     uiBold_ = MakeFormat(kTextFont, 13.f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_LEADING, true);
     uiRight_ = MakeFormat(kTextFont, 12.f, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_TRAILING, true);
@@ -3435,18 +3430,18 @@ Geometry ChatWindow::Layout() const {
     g.terminalBtn = D2D1::RectF(g.sideToggle.right + 4, buttonTop, g.sideToggle.right + 4 + kButton, buttonTop + kButton);
     g.browserBtn = D2D1::RectF(g.terminalBtn.right + 4, buttonTop, g.terminalBtn.right + 4 + kButton, buttonTop + kButton);
     // The update is the client's: it sits over the secrets in the sidebar, and in the header only while that is hidden.
+    // The chat's name is under the input. "Save the memory" is about this chat, so it keeps a header button, at the
+    // right: the left cluster is the panels. It gives way when the window is too narrow to separate it from them.
     const bool updateInHeader = update_ && sidebarWidth <= 0;
     if (updateInHeader) {
         const float width = TextWidth(UpdateLabel(), button_.get()) + 22.f;  // measured as it is drawn
         g.update = D2D1::RectF(g.winMin.left - 10 - width, buttonTop, g.winMin.left - 10, buttonTop + kButton);
     }
-    // The title, "project / chat", starts where the chat does (as in Claude's app), or after the buttons when the
-    // sidebar is hidden; "save the memory" right after it, as it is about this chat and its project.
-    g.titleLeft = std::max(g.areaLeft + 16.f, g.browserBtn.right + 12.f);
-    const float titleMost = (updateInHeader ? g.update.left : g.winMin.left) - 12 - kButton - 6;
-    const float titleWidth = TextWidth(title_.empty() ? L"Новый чат" : title_, header_.get()) + 2.f;
-    g.titleRight = std::max(g.titleLeft, std::min(g.titleLeft + titleWidth, titleMost));
-    g.memory = D2D1::RectF(g.titleRight + 6, buttonTop, g.titleRight + 6 + kButton, buttonTop + kButton);
+    const float memoryRight = (updateInHeader ? g.update.left : g.winMin.left) - 8.f;
+    const float memoryLeft = memoryRight - kButton;
+    if (memoryLeft >= g.browserBtn.right + 8.f) {
+        g.memory = D2D1::RectF(memoryLeft, buttonTop, memoryRight, buttonTop + kButton);
+    }
 
     // As in Claude's own app: the box holds "+", the text and send; the model, its effort and the
     // usage ring sit in a row under it, at the right.
@@ -4965,17 +4960,12 @@ void ChatWindow::PaintHeader(const Geometry& g) {
         Line({edge, 0}, {edge, kHeader}, kLine, 1.f);
     }
 
-    const float titleLeft = g.titleLeft;
-    const std::wstring title = title_.empty() ? L"Новый чат" : title_;
-    const float titleRight = g.titleRight;
     if (update_ && g.sidebar.right <= g.sidebar.left) {  // the header's, only while the sidebar is hidden
         Fill(g.update, 6.f, kAccent, hover_.target == Target::Update ? 0.85f : 1.f);
         Text(UpdateLabel(), button_.get(), g.update, kPrimary);
     }
-    Text(title, header_.get(), D2D1::RectF(titleLeft, 0, titleRight, kHeader), kTitle);  // and again, under the box
 
-
-    {  // save the memory: an arrow up out of a tray (into the cloud); dimmed while it works
+    if (g.memory.right > g.memory.left) {  // save the memory: an arrow up out of a tray (into the cloud)
         const bool active = hover_.target == Target::SaveMemoryBtn;
         if (active || savingMemory_) {
             Fill(g.memory, 6.f, kRaised);
@@ -11155,9 +11145,9 @@ void ChatWindow::FilterSessions(bool pickFirst) {
             rows_.push_back({p, kHead});
         }
         const bool folded = query.empty() && !general && ProjectFolded(project.folder);
-        // The open chat, new: first under its project (a new chat unfolds it), it says where the chat is; the
-        // general head is lit for it instead.
-        if (query.empty() && !general && project.folder == workspace_ && !readingArchive_ &&
+        // The open chat, new: first under its project while the folder is open. Folded, the head stays lit and
+        // the "Новый чат" row goes with the rest, so a collapse actually closes.
+        if (!folded && query.empty() && !general && project.folder == workspace_ && !readingArchive_ &&
             std::ranges::none_of(project.sessions, [&](const SessionInfo& session) { return SameChat(session, OpenId()); })) {
             rows_.push_back({p, kDraft});
         }
@@ -12774,7 +12764,7 @@ void ChatWindow::NewChat() {
     LeaveChat();
     StartClaude();
     TakeDraft("*" + ToUtf8(workspace_));
-    RebuildRows();  // the new chat shows under its project, folded or not
+    RebuildRows();  // the new chat shows under its project while that folder is open
 }
 
 void ChatWindow::Submit() {
