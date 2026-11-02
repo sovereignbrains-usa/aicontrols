@@ -173,6 +173,13 @@ void BrowserView::Create() {
     }
 }
 
+void BrowserView::Want(bool on) {
+    shown_ = on;
+    if (on) {
+        Post([this] { Create(); });
+    }
+}
+
 void BrowserView::Place(const RECT& bounds, bool visible) {
     if (!controller_) {
         return;

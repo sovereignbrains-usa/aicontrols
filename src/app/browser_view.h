@@ -28,6 +28,9 @@ public:
     // The window's handler for `message`: runs the posted task.
     static void RunTask(LPARAM param);
 
+    // UI thread: the user's button wants the page (starts it) or has put it away. The tool's own open and close
+    // go through Ready and Close.
+    void Want(bool on);
     // UI thread: where the page sits (and whether it shows); a page taken away goes blank.
     void Place(const RECT& bounds, bool visible);
     void Blank();

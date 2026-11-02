@@ -579,6 +579,7 @@ enum class Target {
     ConnectLater,   // "Позже" under it, or "Закрыть" when nothing is missing
     Account,  // the sidebar's account row
     TerminalToggle,
+    BrowserToggle,  // the header's button, beside the panel's: the browser tab in the left column
     TermTab,       // row: the tab
     TermTabClose,  // row: the same
     TermAdd,
@@ -646,7 +647,8 @@ struct Geometry {
     D2D1_RECT_F termScreen{};
     std::vector<D2D1_RECT_F> termTabs;  // one per shell, in the panel's top row
     D2D1_RECT_F termAdd{};               // "+": another shell
-    D2D1_RECT_F terminalBtn{};  // the header's button that shows or hides the terminal
+    D2D1_RECT_F terminalBtn{};  // the header, beside the panel's button: show or hide the terminal
+    D2D1_RECT_F browserBtn{};   // ... and the browser tab, beside that
     D2D1_RECT_F update{};       // ... and left of it, "update to ..." while a newer build is there
     float titleLeft = 0;        // the chat's title, "project / chat"
     float titleRight = 0;
@@ -1134,7 +1136,11 @@ private:
     bool PreviewOwnsControls() const { return PreviewShown() && previewControls_; }
     // The browser tab: the agent's page (the browser tool), in the same column.
     bool BrowserShown() const { return terminalOpen_ && Tab() != nullptr && Tab()->browser; }
+    bool ShellShown() const {
+        return terminalOpen_ && Tab() != nullptr && !Tab()->browser && Tab()->preview.empty();
+    }
     void ShowBrowserTab();
+    void ShowShellTab();
     void PlaceBrowser();
     TermTab* PreviewTab() const;
     void OpenPreview(const std::wstring& path);
@@ -2556,7 +2562,12 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
             default:
                 return 0;  // a button: its left click is what it does
             }
-            if (at.y < kHeader && at.x > g.areaLeft && at.x < g.terminalBtn.left) {
+            const float titleMenuLeft = std::max(g.areaLeft, g.browserBtn.right);
+            float titleMenuRight = g.winMin.left;
+            if (g.update.right > g.update.left && g.update.bottom <= kHeader + 1.f) {
+                titleMenuRight = g.update.left;
+            }
+            if (at.y < kHeader && at.x > titleMenuLeft && at.x < titleMenuRight) {
                 ShowTitleMenu(screen);  // the chat's title
             } else if (!secretsOpen_ && Inside(g.sidebar, at.x, at.y)) {
                 ShowTitleMenu(screen);  // the empty part of the chats' list: the same "new chat"
@@ -2875,7 +2886,25 @@ void ChatWindow::OnClick(float x, float y) {
         }
         break;
     case Target::TerminalToggle:
-        SetTerminalOpen(!terminalOpen_);
+        if (ShellShown()) {
+            SetTerminalOpen(false);
+        } else {
+            ShowShellTab();
+        }
+        keepFocus = true;
+        break;
+    case Target::BrowserToggle:
+        if (BrowserShown()) {
+            if (browserView_) {
+                browserView_->Want(false);  // a page still starting does not open the column again
+            }
+            SetTerminalOpen(false);
+        } else {
+            if (browserView_) {
+                browserView_->Want(true);
+            }
+            ShowBrowserTab();
+        }
         keepFocus = true;
         break;
     case Target::PreviewWide:
@@ -3235,19 +3264,20 @@ Geometry ChatWindow::Layout() const {
     g.winClose = D2D1::RectF(g.width - kWinButton, 0, g.width, kHeader);
     g.winMax = D2D1::RectF(g.winClose.left - kWinButton, 0, g.winClose.left, kHeader);
     g.winMin = D2D1::RectF(g.winMax.left - kWinButton, 0, g.winMax.left, kHeader);
-    g.terminalBtn = D2D1::RectF(g.winMin.left - 10 - kButton, buttonTop, g.winMin.left - 10, buttonTop + kButton);
+    // The panel, the terminal and the browser: one row at the left, where the panel's button is.
     g.sideToggle = D2D1::RectF(10, buttonTop, 10 + kButton, buttonTop + kButton);
-    // The update is the client's, not the terminal's: it sits over the secrets in the sidebar, and in the header only
-    // while the sidebar is hidden.
+    g.terminalBtn = D2D1::RectF(g.sideToggle.right + 4, buttonTop, g.sideToggle.right + 4 + kButton, buttonTop + kButton);
+    g.browserBtn = D2D1::RectF(g.terminalBtn.right + 4, buttonTop, g.terminalBtn.right + 4 + kButton, buttonTop + kButton);
+    // The update is the client's: it sits over the secrets in the sidebar, and in the header only while that is hidden.
     const bool updateInHeader = update_ && sidebarWidth <= 0;
     if (updateInHeader) {
         const float width = TextWidth(UpdateLabel(), button_.get()) + 22.f;  // measured as it is drawn
-        g.update = D2D1::RectF(g.terminalBtn.left - 8 - width, buttonTop, g.terminalBtn.left - 8, buttonTop + kButton);
+        g.update = D2D1::RectF(g.winMin.left - 10 - width, buttonTop, g.winMin.left - 10, buttonTop + kButton);
     }
-    // The title, "project / chat", starts where the chat does (as in Claude's app), or after the toggle when the
+    // The title, "project / chat", starts where the chat does (as in Claude's app), or after the buttons when the
     // sidebar is hidden; "save the memory" right after it, as it is about this chat and its project.
-    g.titleLeft = std::max(g.areaLeft + 16.f, g.sideToggle.right + 12.f);
-    const float titleMost = (updateInHeader ? g.update.left : g.terminalBtn.left) - 12 - kButton - 6;
+    g.titleLeft = std::max(g.areaLeft + 16.f, g.browserBtn.right + 12.f);
+    const float titleMost = (updateInHeader ? g.update.left : g.winMin.left) - 12 - kButton - 6;
     const float titleWidth = TextWidth(title_.empty() ? L"Новый чат" : title_, header_.get()) + 2.f;
     g.titleRight = std::max(g.titleLeft, std::min(g.titleLeft + titleWidth, titleMost));
     g.memory = D2D1::RectF(g.titleRight + 6, buttonTop, g.titleRight + 6 + kButton, buttonTop + kButton);
@@ -3565,6 +3595,9 @@ Hit ChatWindow::HitTest(float x, float y) const {
     }
     if (Inside(g.terminalBtn, x, y)) {
         return {Target::TerminalToggle};
+    }
+    if (Inside(g.browserBtn, x, y)) {
+        return {Target::BrowserToggle};
     }
     if (Inside(g.memory, x, y)) {
         return {Target::SaveMemoryBtn};
@@ -4674,9 +4707,8 @@ void ChatWindow::PaintHeader(const Geometry& g) {
         Line({c.x - 6.f, c.y + 5.5f}, {c.x + 6.f, c.y + 5.5f}, color, 1.5f);
         Line({c.x + 6.f, c.y + 5.5f}, {c.x + 6.f, c.y + 1.f}, color, 1.5f);
     }
-    for (const Target button : {Target::SidebarToggle, Target::TerminalToggle}) {
-        const D2D1_RECT_F& r = button == Target::SidebarToggle ? g.sideToggle : g.terminalBtn;
-        const bool active = hover_.target == button || (button == Target::TerminalToggle && terminalOpen_);
+    const auto headerButton = [&](Target button, const D2D1_RECT_F& r, bool on) {
+        const bool active = hover_.target == button || on;
         if (active) {
             Fill(r, 6.f, kRaised);
         }
@@ -4690,12 +4722,20 @@ void ChatWindow::PaintHeader(const Geometry& g) {
             target_->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(c.x - 8.f, c.y - 6.5f, c.x + 8.f, c.y + 6.5f), 2.5f, 2.5f),
                                           brush_.get(), 1.4f);
             Line({c.x - 3.f, c.y - 6.5f}, {c.x - 3.f, c.y + 6.5f}, color, 1.4f);
-        } else {  // the terminal: a prompt, > and a cursor
+        } else if (button == Target::TerminalToggle) {  // the terminal: a prompt, > and a cursor
             Line({c.x - 6.f, c.y - 4.f}, {c.x - 1.5f, c.y}, color, 1.5f);
             Line({c.x - 1.5f, c.y}, {c.x - 6.f, c.y + 4.f}, color, 1.5f);
             Line({c.x + 1.f, c.y + 5.f}, {c.x + 7.f, c.y + 5.f}, color, 1.5f);
+        } else {  // the browser: a page with its address line
+            brush_->SetColor(Color(color));
+            target_->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(c.x - 7.f, c.y - 6.f, c.x + 7.f, c.y + 6.f), 2.f, 2.f),
+                                          brush_.get(), 1.4f);
+            Line({c.x - 7.f, c.y - 2.2f}, {c.x + 7.f, c.y - 2.2f}, color, 1.4f);
         }
-    }
+    };
+    headerButton(Target::SidebarToggle, g.sideToggle, false);
+    headerButton(Target::TerminalToggle, g.terminalBtn, ShellShown());
+    headerButton(Target::BrowserToggle, g.browserBtn, BrowserShown());
 }
 
 // The window's edges and its title bar, which is the header: the top border resizes, the header's free
@@ -9117,6 +9157,29 @@ void ChatWindow::PlacePreview() {
     webController_->put_IsVisible(shown ? TRUE : FALSE);
 }
 
+// A shell in the left column. A browser or a preview that is up stays as its own tab; this one comes forward.
+void ChatWindow::ShowShellTab() {
+    size_t at = tabs_.size();
+    for (size_t i = 0; i < tabs_.size(); ++i) {
+        if (!tabs_[i]->browser && tabs_[i]->preview.empty()) {
+            at = i;
+            break;
+        }
+    }
+    if (at == tabs_.size()) {
+        AddTerminalTab();
+    } else if (at != activeTab_) {
+        activeTab_ = at;
+        selAnchor_.reset();
+        selEnd_.reset();
+    }
+    if (!terminalOpen_) {
+        SetTerminalOpen(true);
+    } else {
+        SelectTerminalTab(activeTab_);
+    }
+}
+
 // The browser tool opens its tab (and the column) by itself; the page stays where the user left the tab.
 void ChatWindow::ShowBrowserTab() {
     size_t at = tabs_.size();
@@ -9129,6 +9192,7 @@ void ChatWindow::ShowBrowserTab() {
         auto created = std::make_unique<TermTab>();
         created->id = ++nextTabId_;
         created->browser = true;
+        created->number = 0;  // shell numbers start at 1; this tab is labelled by its name
         tabs_.push_back(std::move(created));
     }
     activeTab_ = at;
@@ -9721,7 +9785,9 @@ std::wstring ChatWindow::TooltipText() {
         }
         return sidebarOpen_ ? L"Скрыть боковую панель (Ctrl+B)" : L"Показать боковую панель (Ctrl+B)";
     case Target::TerminalToggle:
-        return terminalOpen_ ? L"Скрыть терминал" : L"Показать терминал";
+        return ShellShown() ? L"Скрыть терминал" : L"Показать терминал";
+    case Target::BrowserToggle:
+        return BrowserShown() ? L"Скрыть браузер" : L"Показать браузер";
     case Target::WinMin:
         return L"Свернуть";
     case Target::WinMax:
@@ -10013,6 +10079,8 @@ D2D1_RECT_F ChatWindow::TipAnchor(const Geometry& g) const {
         return g.sideToggle;
     case Target::TerminalToggle:
         return g.terminalBtn;
+    case Target::BrowserToggle:
+        return g.browserBtn;
     case Target::Update:
         return g.update;
     case Target::SaveMemoryBtn:
