@@ -627,7 +627,7 @@ struct Hit {
     Target target = Target::None;
     size_t row = 0;
     size_t sub = 0;
-    bool card = false;  // None on a card with file buttons (row: it): they show while the pointer is there
+    bool card = false;  // None on a file card's body (row: it)
     bool operator==(const Hit&) const = default;
 };
 
@@ -4582,7 +4582,8 @@ float ChatWindow::ApprovalHeight(const FeedItem& item) {
     }
     DWRITE_TEXT_METRICS metrics{};
     item.layout->GetMetrics(&metrics);
-    const float buttons = item.verdict == Verdict::Pending ? kCardPad + kCardButton : 0.f;
+    const float buttons =
+        item.verdict == Verdict::Pending || HasFileActions(item) ? kCardPad + kCardButton : 0.f;
     float body = kCardPad + kCardTitle + 4.f + metrics.height;
     for (const FeedImage& image : item.images) {  // laid out under the text
         body = std::max(body, image.at.bottom);
@@ -4597,16 +4598,23 @@ void ChatWindow::ApprovalButtons(const Geometry& g, const FeedItem& item, D2D1_R
     deny = D2D1::RectF(allow.right + 8.f, allow.top, allow.right + 8.f + kCardButtonWidth, bottom);
 }
 
-// Small, in the title row's right end where "done" is; drawn only while the pointer is on the card.
+// The bottom row, where "allow" sits while a call is waiting. The title row keeps "done".
 void ChatWindow::ApprovalFileButtons(const Geometry& g, const FeedItem& item, D2D1_RECT_F& preview, D2D1_RECT_F& open,
                                      D2D1_RECT_F& reveal) {
-    const float top = item.top + kCardPad;
-    const float right = g.left + g.column - kCardPad + 4.f;
-    reveal = D2D1::RectF(right - kCardSmallButton, top, right, top + kCardTitle);
-    open = D2D1::RectF(reveal.left - 4.f - kCardSmallButton, top, reveal.left - 4.f, top + kCardTitle);
-    preview = IsPreviewable(item.made.empty() ? ToWide(JsonStr(item.input, "path")) : item.made)
-                  ? D2D1::RectF(open.left - 4.f - kCardSmallButton, top, open.left - 4.f, top + kCardTitle)
-                  : D2D1_RECT_F{};
+    const float bottom = item.top + item.height - kCardPad;
+    const float top = bottom - kCardButton;
+    float x = g.left + kCardPad;
+    const auto place = [&](D2D1_RECT_F& rect) {
+        rect = D2D1::RectF(x, top, x + kCardSmallButton, bottom);
+        x = rect.right + 8.f;
+    };
+    if (IsPreviewable(item.made.empty() ? ToWide(JsonStr(item.input, "path")) : item.made)) {
+        place(preview);
+    } else {
+        preview = {};
+    }
+    place(open);
+    place(reveal);
 }
 
 void ChatWindow::PaintApproval(const Geometry& g, const FeedItem& item, float left) {
@@ -4619,17 +4627,9 @@ void ChatWindow::PaintApproval(const Geometry& g, const FeedItem& item, float le
     const float inner = left + kCardPad;
     const float top = item.top + kCardPad;
     const bool onItem = hover_.row < feed_.size() && &feed_[hover_.row] == &item;
-    const bool fileButtons = onItem && HasFileActions(item) &&
-                             (hover_.card || hover_.target == Target::CardPreview || hover_.target == Target::CardOpen ||
-                              hover_.target == Target::CardReveal);
-    D2D1_RECT_F preview{}, open{}, reveal{};
-    if (fileButtons) {
-        ApprovalFileButtons(g, item, preview, open, reveal);
-    }
-    const float titleRight = fileButtons ? (preview.right > preview.left ? preview.left : open.left) - 8.f
-                                         : card.right - kCardPad - 110.f;
+    const float titleRight = card.right - kCardPad - 110.f;
     Text(item.title, uiBold_.get(), D2D1::RectF(inner, top, titleRight, top + kCardTitle), kPrimary);
-    if (!pending && !fileButtons) {
+    if (!pending) {
         std::wstring label;
         uint32_t labelColor = kDanger;
         if (item.verdict == Verdict::Allowed) {
@@ -4657,10 +4657,12 @@ void ChatWindow::PaintApproval(const Geometry& g, const FeedItem& item, float le
         Text(L"Разрешить", button_.get(), allow, kPrimary);
         Fill(deny, 7.f, onItem && hover_.target == Target::ApprovalDeny ? kLine : kRaised);
         Text(L"Отклонить", button_.get(), deny, kPrimary);
-    } else if (fileButtons) {
+    } else if (HasFileActions(item)) {
+        D2D1_RECT_F preview{}, open{}, reveal{};
+        ApprovalFileButtons(g, item, preview, open, reveal);
         const auto chip = [&](const D2D1_RECT_F& rect, const wchar_t* label, Target target) {
-            const bool hot = hover_.target == target;
-            Fill(rect, 6.f, hot ? kLine : kRaised);
+            const bool hot = onItem && hover_.target == target;
+            Fill(rect, 7.f, hot ? kLine : kRaised);
             Text(label, cardButton_.get(), rect, hot ? kPrimary : kSecondary);
         };
         if (preview.right > preview.left) {
