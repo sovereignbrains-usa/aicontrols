@@ -690,7 +690,7 @@ struct Geometry {
     D2D1_RECT_F model{};
     D2D1_RECT_F effort{};  // empty when the model has no effort levels
     D2D1_RECT_F permission{};
-    D2D1_RECT_F project{};  // the chat's project, at the left of the chips' row under the box
+    D2D1_RECT_F project{};  // the chat's title, at the left of the chips' row under the box
     D2D1_RECT_F send{};
     D2D1_RECT_F popup{};   // the open panel
     // History.
@@ -4972,7 +4972,7 @@ void ChatWindow::PaintHeader(const Geometry& g) {
         Fill(g.update, 6.f, kAccent, hover_.target == Target::Update ? 0.85f : 1.f);
         Text(UpdateLabel(), button_.get(), g.update, kPrimary);
     }
-    Text(title, header_.get(), D2D1::RectF(titleLeft, 0, titleRight, kHeader), kTitle);  // its project is under the box
+    Text(title, header_.get(), D2D1::RectF(titleLeft, 0, titleRight, kHeader), kTitle);  // and again, under the box
 
 
     {  // save the memory: an arrow up out of a tray (into the cloud); dimmed while it works
@@ -5209,11 +5209,9 @@ void ChatWindow::PaintInput(const Geometry& g) {
         Line({c.x, c.y - 6.f}, {c.x, c.y + 6.f}, color, 1.6f);
     }
 
-    if (g.project.right - g.project.left > 60.f) {  // the project the chat is in, where the row had room
-        ProjectIcon({g.project.left + 7.f, (g.project.top + g.project.bottom) / 2}, workspace_ == DefaultWorkspace(),
-                    kSecondary);
-        Text(folderName_, ui_.get(), D2D1::RectF(g.project.left + 20, g.project.top, g.project.right, g.project.bottom),
-             kSecondary);
+    if (g.project.right - g.project.left > 24.f) {  // the chat's name, where the project's used to be
+        const std::wstring title = title_.empty() ? L"Новый чат" : title_;
+        Text(title, ui_.get(), g.project, kPrimary);
     }
 
     // The model, then its effort in a box of its own, as in Claude's app.
@@ -7847,12 +7845,17 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
             AgentIcon({chat.left + kFrontX, y}, 4.6f, grok);
         };
         if (rows_[row].session == kHead) {
-            // A project's head: a fold mark and its name (brighter for the open chat's project). "+" for a new
-            // chat only while the folder is open. The keyboard's row lights up too, and so does one being dragged.
-            // The archive is the same row, quieter, with no "+": it is not a project.
+            // A project's head: a fold mark and its name. The open chat's project is lit like that chat, with the
+            // same accent bar, so it stays obvious when the folder is closed. "+" for a new chat only while the
+            // folder is open. The keyboard's row lights up too, and so does one being dragged. The archive is the
+            // same row, quieter, with no "+": it is not a project.
             const bool archive = IsArchive(project.folder);
-            if (hovered || held || dropOn || (searchFocus_ && row == selected_)) {
+            const bool currentProject = !archive && project.folder == workspace_;
+            if (hovered || held || dropOn || currentProject || (searchFocus_ && row == selected_)) {
                 Fill(lit(r), 8.f, kRaised);
+            }
+            if (currentProject) {  // the same bar as the open chat, so its project is obvious even folded
+                Fill(D2D1::RectF(r.left + 2.f, r.top + 9.f, r.left + 5.f, r.bottom - 9.f), 1.5f, kAccent);
             }
             const D2D1_POINT_2F c{r.left + 14.f, (r.top + r.bottom) / 2};
             const bool unfolded = archive ? (!searchText_.empty() || archiveOpen_) : (!searchText_.empty() || !ProjectFolded(project.folder));
@@ -7865,7 +7868,7 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
             }
             const bool showPlus = !archive && unfolded;
             const D2D1_RECT_F plus = ProjectNewRect(r);
-            const uint32_t nameColor = archive ? kSecondary : (project.folder == workspace_ ? kPrimary : kSecondary);
+            const uint32_t nameColor = archive ? kSecondary : (currentProject ? kPrimary : kSecondary);
             if (archive) {
                 ArchiveIcon({r.left + 32.f, c.y}, kSecondary, 1.05f);
             } else {
