@@ -649,7 +649,7 @@ struct Geometry {
     D2D1_RECT_F termWide{};   // beside a preview: widen it over the window, or back
     D2D1_RECT_F termScreen{};
     std::vector<D2D1_RECT_F> termTabs;  // one per shell, in the panel's top row
-    D2D1_RECT_F termAdd{};               // "+": another shell
+    D2D1_RECT_F termAdd{};               // "+": another browser, or another shell
     D2D1_RECT_F terminalBtn{};  // the header, beside the panel's button: show or hide the terminal
     D2D1_RECT_F browserBtn{};   // ... and the browser tab, beside that
     D2D1_RECT_F update{};       // ... and left of it, "update to ..." while a newer build is there
@@ -1110,13 +1110,15 @@ private:
         bool exited = false;
         size_t scroll = 0;         // lines scrolled back from the bottom
         std::wstring preview;      // the preview tab (one at most, no shell): the HTML file it shows
-        bool browser = false;      // the browser tab (one at most, no shell): the page the agent drives
+        bool browser = false;      // a browser tab (no shell). Page 0 is the one the tool drives
+        int browserPage = 0;       // which page of the browser this tab shows; the "+" opens 1, 2, ...
     };
     TermTab* Tab() const { return activeTab_ < tabs_.size() ? tabs_[activeTab_].get() : nullptr; }
     VtScreen* Screen() const { return Tab() != nullptr ? Tab()->screen.get() : nullptr; }
     TermTab* TabById(WPARAM id) const;
     void TerminalGrid(int& cols, int& rows) const;
     void AddTerminalTab();
+    void AddBrowserTab();  // another page, beside the one the tool drives
     void StartShell(TermTab& tab);
     void CloseTerminalTab(size_t index);
     void SelectTerminalTab(size_t index);
@@ -1223,7 +1225,6 @@ private:
     void AppendHistory(bool grok, const std::vector<TranscriptEntry>& entries);
     void RestoreFromArchive(const std::string& id);
     void PurgeFromArchive(const std::string& id, bool force);
-    bool ArchiveOnTab(const ArchivedChat& chat) const;  // this tab's chats: general on "Чаты", the rest on "Проекты"
     void PaintSidebar(const Geometry& g);
     static size_t SidebarRows(const Geometry& g);
     D2D1_RECT_F SideRowRect(const Geometry& g, size_t row) const;  // empty when it is scrolled out of view
@@ -2061,7 +2062,7 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
             hwnd_, kBrowserTask, [this] { ShowBrowserTab(); },
             [this] {
                 for (size_t i = 0; i < tabs_.size(); ++i) {
-                    if (tabs_[i]->browser) {
+                    if (tabs_[i]->browser && tabs_[i]->browserPage == 0) {  // the tool's page, not one the person opened
                         CloseTerminalTab(i);
                         if (terminalOpen_) {
                             SelectTerminalTab(activeTab_);
@@ -3090,9 +3091,13 @@ void ChatWindow::OnClick(float x, float y) {
         }
         break;
     case Target::TermAdd:
-        AddTerminalTab();
-        SyncTerminalSize();
-        SelectTerminalTab(activeTab_);
+        if (Tab() != nullptr && Tab()->browser) {  // beside a browser: another browser, not a shell
+            AddBrowserTab();
+        } else {
+            AddTerminalTab();
+            SyncTerminalSize();
+            SelectTerminalTab(activeTab_);
+        }
         keepFocus = true;
         break;
     case Target::SidebarSearch:
@@ -5757,7 +5762,7 @@ void ChatWindow::TerminalGrid(int& cols, int& rows) const {
 
 std::wstring ChatWindow::TabLabel(const TermTab& tab) const {
     if (tab.browser) {
-        return L"Браузер";
+        return tab.browserPage == 0 ? L"Браузер" : std::format(L"Браузер {}", tab.number);
     }
     if (!tab.preview.empty()) {
         return L"Превью · " + std::filesystem::path(tab.preview).filename().wstring();
@@ -5770,8 +5775,8 @@ std::wstring ChatWindow::TabLabel(const TermTab& tab) const {
 
 void ChatWindow::AddTerminalTab() {
     auto tab = std::make_unique<TermTab>();
-    int number = 1;  // the lowest number not in use
-    while (std::ranges::any_of(tabs_, [&](const auto& other) { return other->number == number; })) {
+    int number = 1;  // the lowest number not in use; a browser's number is its own
+    while (std::ranges::any_of(tabs_, [&](const auto& other) { return !other->browser && other->number == number; })) {
         ++number;
     }
     tab->number = number;
@@ -5822,7 +5827,11 @@ void ChatWindow::CloseTerminalTab(size_t index) {
         return;
     }
     if (tabs_[index]->browser && browserView_) {
-        browserView_->Blank();  // the page goes blank and hides; the tool's next open brings the tab back
+        if (tabs_[index]->browserPage == 0) {
+            browserView_->Blank();  // the tool's page goes blank; its next open brings the tab back
+        } else {
+            browserView_->ClosePage(tabs_[index]->browserPage);
+        }
     }
     tabs_.erase(tabs_.begin() + static_cast<std::ptrdiff_t>(index));  // the shell ends with it
     selAnchor_.reset();
@@ -7900,11 +7909,7 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
                     if (doomed_ && !doomed_->gone && chat.id == doomed_->archiveId) {
                         continue;  // its row still says "Вернуть": the copy is not listed yet
                     }
-                    if (!query.empty()) {
-                        if (Lowercase(chat.title).find(query) == std::wstring::npos) {
-                            continue;
-                        }
-                    } else if (!ArchiveOnTab(chat)) {
+                    if (!query.empty() && Lowercase(chat.title).find(query) == std::wstring::npos) {
                         continue;
                     }
                     ++count;
@@ -8021,6 +8026,23 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
                 target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(c.x + dx, c.y), 1.4f, 1.4f), brush_.get());
             }
             titleRight = more.left - 4.f;
+        } else if (archive) {
+            // One list for both tabs: a project's chat keeps its project's name, a general one keeps its age.
+            std::wstring mark;
+            const auto found = std::ranges::find(archive_, session.id, &ArchivedChat::id);
+            if (found != archive_.end() && found->folder != DefaultWorkspace()) {
+                mark = ProjectName(found->folder);
+            } else if (FileTicks(session.modified) != 0) {
+                mark = Age(session.modified);
+            }
+            if (!mark.empty()) {
+                const float markWidth = TextWidth(mark, uiRight_.get());
+                const float markLeft = titleRight - markWidth;
+                if (markLeft > chat.left + 36.f) {
+                    Text(mark, uiRight_.get(), D2D1::RectF(markLeft, chat.top, titleRight, chat.bottom), kSecondary);
+                    titleRight = markLeft - 8.f;
+                }
+            }
         } else if (FileTicks(session.modified) != 0) {  // how old the chat is, so the newest-first order can be read
             const std::wstring age = Age(session.modified);
             const float ageWidth = TextWidth(age, uiRight_.get());
@@ -8748,6 +8770,7 @@ void ChatWindow::RefreshSessions() {
         }
     }
     // The archive is not a project and is not ordered with them: one head at the bottom, newest first.
+    // The same chats on «Чаты» and on «Проекты»: the general ones and every project's.
     archive_.clear();
     for (ArchivedChat chat : ListArchivedChats()) {
         if (doomed_ && !doomed_->gone && chat.id == doomed_->archiveId) {
@@ -9788,11 +9811,40 @@ void ChatWindow::ShowShellTab() {
 }
 
 // The browser tool opens its tab (and the column) by itself; the page stays where the user left the tab.
+void ChatWindow::AddBrowserTab() {
+    if (!browserView_) {
+        return;
+    }
+    const int page = browserView_->AddPage();
+    auto created = std::make_unique<TermTab>();
+    created->id = ++nextTabId_;
+    created->browser = true;
+    created->browserPage = page;
+    int number = 2;  // "Браузер" is the tool's tab; the person's own start at 2
+    while (std::ranges::any_of(tabs_, [&](const auto& other) { return other->browser && other->number == number; })) {
+        ++number;
+    }
+    created->number = number;
+    tabs_.push_back(std::move(created));
+    activeTab_ = tabs_.size() - 1;
+    selAnchor_.reset();
+    selEnd_.reset();
+    if (!terminalOpen_) {
+        SetTerminalOpen(true);
+    }
+    termFocus_ = false;  // the address takes the keys
+    searchFocus_ = false;
+    browserView_->FocusAddress();
+    PlaceBrowser();
+    Refresh();
+}
+
 void ChatWindow::ShowBrowserTab() {
     size_t at = tabs_.size();
     for (size_t i = 0; i < tabs_.size(); ++i) {
-        if (tabs_[i]->browser) {
+        if (tabs_[i]->browser && tabs_[i]->browserPage == 0) {
             at = i;
+            break;
         }
     }
     if (at == tabs_.size()) {
@@ -9816,6 +9868,9 @@ void ChatWindow::PlaceBrowser() {
         return;
     }
     const bool shown = BrowserShown() && popup_ != Popup::Image;
+    if (const TermTab* tab = Tab(); tab != nullptr && tab->browser) {
+        browserView_->ShowPage(tab->browserPage);
+    }
     RECT bounds{};
     if (shown) {
         const Geometry g = Layout();
@@ -10413,7 +10468,7 @@ std::wstring ChatWindow::TooltipText() {
     case Target::ConnectAll:
         return L"Claude, Grok и GitHub по очереди, в браузере по умолчанию; уже подключённые пропускаются";
     case Target::TermAdd:
-        return L"Новый терминал";
+        return Tab() != nullptr && Tab()->browser ? L"Новый браузер" : L"Новый терминал";
     case Target::TermTabClose:
         return L"Закрыть вкладку";
     case Target::SaveMemoryBtn:
@@ -10928,11 +10983,15 @@ void ChatWindow::ShowTabMenu(size_t index, POINT screen) {
         return;
     }
     if (tabs_[index]->browser) {
-        constexpr UINT kNewShell = 1, kCloseBrowser = 2;
+        constexpr UINT kNewBrowser = 1, kNewShell = 2, kCloseBrowser = 3;
         wil::unique_hmenu menu(CreatePopupMenu());
+        AppendMenuW(menu.get(), MF_STRING, kNewBrowser, L"Новый браузер");
         AppendMenuW(menu.get(), MF_STRING, kNewShell, L"Новый терминал");
         AppendMenuW(menu.get(), MF_STRING, kCloseBrowser, L"Закрыть");
         switch (Menu(menu.get(), screen)) {
+        case kNewBrowser:
+            AddBrowserTab();
+            break;
         case kNewShell:
             AddTerminalTab();
             break;
@@ -11140,11 +11199,7 @@ void ChatWindow::FilterSessions(bool pickFirst) {
             const bool nameHit = !query.empty() && Lowercase(project.name).find(query) != std::wstring::npos;
             std::vector<size_t> shown;
             for (size_t i = 0; i < project.sessions.size() && i < archive_.size(); ++i) {
-                if (!query.empty()) {
-                    if (Lowercase(project.sessions[i].title).find(query) == std::wstring::npos) {
-                        continue;
-                    }
-                } else if (!ArchiveOnTab(archive_[i])) {
+                if (!query.empty() && Lowercase(project.sessions[i].title).find(query) == std::wstring::npos) {
                     continue;
                 }
                 shown.push_back(i);
@@ -11956,11 +12011,6 @@ void ChatWindow::OpenChat(std::wstring folder, SessionInfo session) {
     StartClaude();
     TakeDraft(DraftKey(session));
     RebuildRows();  // no new chat under the project any more
-}
-
-// General chats on «Чаты», every project's on «Проекты». A search shows either, and FilterSessions does that itself.
-bool ChatWindow::ArchiveOnTab(const ArchivedChat& chat) const {
-    return (chat.folder == DefaultWorkspace()) != projectsTab_;
 }
 
 // The feed shows an archived chat and nothing is sent. The project and the CLI stay as they were.

@@ -12,6 +12,7 @@
 #include <map>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #include "core/browser.h"
 
@@ -33,6 +34,11 @@ public:
     void Want(bool on);
     // UI thread: the address field, so a person can type where to go. The tool does not call this.
     void FocusAddress();
+    // UI thread: another page beside the tool's. 0 is the tool's page; the rest are the person's own tabs.
+    // The number stays put after the page is closed, so a tab keeps pointing at it.
+    int AddPage();
+    void ShowPage(int slot);
+    void ClosePage(int slot);
     // UI thread: where the page sits (and whether it shows); a page taken away goes blank.
     void Place(const RECT& bounds, bool visible);
     void Blank();
@@ -64,7 +70,19 @@ private:
     void ApplyPlace();
     void LayoutPage();
     void NavigateBar();
+    void PaintChrome(HDC dc, const RECT& client);
+    void ApplyFont();
+    RECT FieldRect(const RECT& client) const;
+    int Dip(int dip) const;
+    float DipF(float dip) const;
     int BarHeight() const;
+    std::wstring AddressText() const;
+    static std::wstring ResolveAddress(std::wstring text);
+    ICoreWebView2* ActiveView() const;
+    ICoreWebView2Controller* ActiveController() const;
+    void WatchAddress(ICoreWebView2* view);
+    void Arm(ICoreWebView2* view);
+    void CreateExtra(size_t index);
     static LRESULT CALLBACK HostProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
     static LRESULT CALLBACK EditProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam, UINT_PTR id, DWORD_PTR self);
 
@@ -84,9 +102,21 @@ private:
     std::atomic<bool> shutdown_{false};
 
     // UI thread only.
+    wil::com_ptr<ICoreWebView2Environment> environment_;
     wil::com_ptr<ICoreWebView2Controller> controller_;
     wil::com_ptr<ICoreWebView2> view_;
     wil::com_ptr<ICoreWebView2DevToolsProtocolEventReceiver> loadReceiver_;
+    // The person's own pages (the "+" on a browser tab). Slot 0 is the tool's page above; these are 1, 2, ...
+    struct ExtraPage {
+        wil::com_ptr<ICoreWebView2Controller> controller;
+        wil::com_ptr<ICoreWebView2> view;
+        bool opening = false;  // the controller is on its way: do not start a second one
+        bool closed = false;   // the tab went away before the controller arrived
+    };
+    std::vector<ExtraPage> extras_;
+    int page_ = 0;             // which page the column is showing
+    std::wstring pending_;     // typed before that page existed
+    ULONG_PTR gdip_ = 0;
     bool creating_ = false;
 
     std::mutex mutex_;

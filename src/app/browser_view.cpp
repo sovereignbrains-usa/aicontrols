@@ -1,12 +1,21 @@
 #include "app/browser_view.h"
 
 #include <commctrl.h>
+#include <objidl.h>
 #include <uxtheme.h>
 #include <wrl/event.h>
 
+#include <algorithm>
+namespace Gdiplus {
+using std::min;
+using std::max;
+}
+#include <gdiplus.h>
+
+#pragma comment(lib, "gdiplus.lib")
+
 #include <wil/resource.h>
 
-#include <algorithm>
 #include <chrono>
 #include <filesystem>
 #include <format>
@@ -72,10 +81,29 @@ void BrowserView::Fail(const std::string& why, HRESULT code) {
     }
 }
 
-int BrowserView::BarHeight() const {
+int BrowserView::Dip(int dip) const {
     const HWND dpiWindow = host_ != nullptr ? host_ : window_;
     const UINT dpi = dpiWindow != nullptr ? GetDpiForWindow(dpiWindow) : 96;
-    return MulDiv(40, static_cast<int>(dpi), 96);
+    return MulDiv(dip, static_cast<int>(dpi), 96);
+}
+
+float BrowserView::DipF(float dip) const {
+    const HWND dpiWindow = host_ != nullptr ? host_ : window_;
+    const UINT dpi = dpiWindow != nullptr ? GetDpiForWindow(dpiWindow) : 96;
+    return dip * static_cast<float>(dpi) / 96.f;
+}
+
+int BrowserView::BarHeight() const {
+    return Dip(48);
+}
+
+RECT BrowserView::FieldRect(const RECT& client) const {
+    const int bar = BarHeight();
+    const int marginX = Dip(12);
+    const int fieldH = Dip(32);
+    const int top = std::max(0, (bar - fieldH) / 2);
+    const int right = std::max(marginX + Dip(64), static_cast<int>(client.right) - marginX);
+    return RECT{marginX, top, right, top + fieldH};
 }
 
 void BrowserView::EnsureHost() {
@@ -99,19 +127,34 @@ void BrowserView::EnsureHost() {
         return;
     }
     SetWindowLongPtrW(host_, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
-    field_ = CreateSolidBrush(RGB(0x18, 0x18, 0x1a));
+    if (gdip_ == 0) {
+        Gdiplus::GdiplusStartupInput input;
+        Gdiplus::GdiplusStartup(&gdip_, &input, nullptr);
+    }
+    field_ = CreateSolidBrush(RGB(0x23, 0x23, 0x27));
     ground_ = CreateSolidBrush(RGB(0x12, 0x12, 0x13));
-    const UINT dpi = GetDpiForWindow(window_);
-    font_ = CreateFontW(-MulDiv(13, static_cast<int>(dpi), 96), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
-                        OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
     edit_ = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_LEFT, 0, 0, 0, 0, host_,
                             reinterpret_cast<HMENU>(1), GetModuleHandleW(nullptr), nullptr);
     if (edit_ != nullptr) {
         // Themed edits ignore WM_CTLCOLOREDIT and stay white. No theme: the dark field and the cue show.
         SetWindowTheme(edit_, L"", L"");
-        SendMessageW(edit_, WM_SETFONT, reinterpret_cast<WPARAM>(font_), FALSE);
-        SendMessageW(edit_, EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(L"Адрес"));
+        ApplyFont();
+        SendMessageW(edit_, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(Dip(2), Dip(6)));
+        // FALSE: the cue hides once the field has the caret. Drawn together, the two sat on each other.
+        SendMessageW(edit_, EM_SETCUEBANNER, FALSE, reinterpret_cast<LPARAM>(L"Поиск или адрес"));
         SetWindowSubclass(edit_, EditProc, 1, reinterpret_cast<DWORD_PTR>(this));
+    }
+}
+
+void BrowserView::ApplyFont() {
+    if (font_ != nullptr) {
+        DeleteObject(font_);
+        font_ = nullptr;
+    }
+    font_ = CreateFontW(-Dip(13), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                        CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Geist");
+    if (edit_ != nullptr && font_ != nullptr) {
+        SendMessageW(edit_, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
     }
 }
 
@@ -124,16 +167,29 @@ void BrowserView::LayoutPage() {
     const int width = client.right;
     const int height = client.bottom;
     const int bar = BarHeight();
-    const int field = std::max(16, bar - MulDiv(12, bar, 40));
     if (edit_ != nullptr) {
-        SetWindowPos(edit_, nullptr, 8, std::max(0, (bar - field) / 2), std::max(0, width - 16), field,
-                     SWP_NOZORDER | SWP_NOACTIVATE);
+        const RECT field = FieldRect(client);
+        const int left = static_cast<int>(field.left) + Dip(30);
+        const int fieldRight = static_cast<int>(field.right);
+        const int fieldTop = static_cast<int>(field.top);
+        const int fieldBottom = static_cast<int>(field.bottom);
+        const int right = (std::max)(left, fieldRight - Dip(10));
+        const int editH = (std::max)(Dip(16), (fieldBottom - fieldTop) - Dip(8));
+        const int top = fieldTop + (std::max)(0, (fieldBottom - fieldTop - editH) / 2);
+        SetWindowPos(edit_, nullptr, left, top, right - left, editH, SWP_NOZORDER | SWP_NOACTIVATE);
     }
-    if (controller_) {
+    const auto place = [&](ICoreWebView2Controller* controller, bool visible) {
+        if (controller == nullptr) {
+            return;
+        }
         const RECT page{0, bar, width, std::max(bar, height)};
-        controller_->put_Bounds(page);
-        controller_->put_IsVisible(placeVisible_ ? TRUE : FALSE);
-        controller_->NotifyParentWindowPositionChanged();
+        controller->put_Bounds(page);
+        controller->put_IsVisible(visible && placeVisible_ ? TRUE : FALSE);
+        controller->NotifyParentWindowPositionChanged();
+    };
+    place(controller_.get(), page_ == 0);
+    for (size_t i = 0; i < extras_.size(); ++i) {
+        place(extras_[i].controller.get(), page_ == static_cast<int>(i) + 1);
     }
 }
 
@@ -174,19 +230,22 @@ void BrowserView::ApplyPlace() {
     }
 }
 
-void BrowserView::NavigateBar() {
-    if (edit_ == nullptr || !view_) {
-        return;
+std::wstring BrowserView::AddressText() const {
+    if (edit_ == nullptr) {
+        return {};
     }
-    std::wstring text(GetWindowTextLengthW(edit_) + 1, L'\0');
+    std::wstring text(static_cast<size_t>(GetWindowTextLengthW(edit_)) + 1, L'\0');
     GetWindowTextW(edit_, text.data(), static_cast<int>(text.size()));
     text.resize(wcslen(text.c_str()));
     const size_t first = text.find_first_not_of(L" \t");
     const size_t last = text.find_last_not_of(L" \t");
     if (first == std::wstring::npos) {
-        return;
+        return {};
     }
-    text = text.substr(first, last - first + 1);
+    return text.substr(first, last - first + 1);
+}
+
+std::wstring BrowserView::ResolveAddress(std::wstring text) {
     const bool hasScheme = text.find(L"://") != std::wstring::npos;
     const bool likeUrl = hasScheme || (text.find(L' ') == std::wstring::npos && text.find(L'.') != std::wstring::npos);
     if (!likeUrl) {
@@ -199,13 +258,31 @@ void BrowserView::NavigateBar() {
                 query += std::format(L"%{:02X}", byte);
             }
         }
-        text = L"https://yandex.ru/search/?text=" + query;
-    } else if (!hasScheme) {
+        return L"https://yandex.ru/search/?text=" + query;
+    }
+    if (!hasScheme) {
         text = L"https://" + text;
     }
-    view_->Navigate(text.c_str());
-    if (controller_) {  // the page takes the keys, and the bar can follow the address it lands on
-        controller_->MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
+    return text;
+}
+
+void BrowserView::NavigateBar() {
+    if (edit_ == nullptr) {
+        return;
+    }
+    std::wstring text = AddressText();
+    if (text.empty()) {
+        return;
+    }
+    text = ResolveAddress(std::move(text));
+    if (ICoreWebView2* view = ActiveView()) {
+        view->Navigate(text.c_str());
+        pending_.clear();
+        if (ICoreWebView2Controller* controller = ActiveController()) {
+            controller->MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
+        }
+    } else {
+        pending_ = std::move(text);  // the page is still starting: it opens this once it exists
     }
 }
 
@@ -241,6 +318,7 @@ LRESULT CALLBACK BrowserView::HostProc(HWND hwnd, UINT message, WPARAM wParam, L
         if (self->ground_ != nullptr) {
             FillRect(dc, &client, self->ground_);
         }
+        self->PaintChrome(dc, client);
         const Status status = self->State();
         if (!status.ready || !status.failure.empty()) {
             client.top = self->BarHeight() + 16;
@@ -257,6 +335,12 @@ LRESULT CALLBACK BrowserView::HostProc(HWND hwnd, UINT message, WPARAM wParam, L
         EndPaint(hwnd, &paint);
         return 0;
     }
+    if (message == WM_DPICHANGED && self != nullptr) {
+        self->ApplyFont();
+        self->LayoutPage();
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+    }
     return DefWindowProcW(hwnd, message, wParam, lParam);
 }
 
@@ -268,6 +352,12 @@ LRESULT CALLBACK BrowserView::EditProc(HWND hwnd, UINT message, WPARAM wParam, L
     if (message == WM_KEYDOWN && wParam == VK_ESCAPE) {
         SetFocus(reinterpret_cast<BrowserView*>(self)->window_);
         return 0;
+    }
+    if ((message == WM_SETFOCUS || message == WM_KILLFOCUS) && self != 0) {
+        const auto* view = reinterpret_cast<BrowserView*>(self);
+        if (view->host_ != nullptr) {
+            InvalidateRect(view->host_, nullptr, FALSE);
+        }
     }
     return DefSubclassProc(hwnd, message, wParam, lParam);
 }
@@ -320,6 +410,10 @@ void BrowserView::Create() {
                     Fail("Нужен WebView2 (Microsoft Edge): среда не создалась", FAILED(result) ? result : E_FAIL);
                     return S_OK;
                 }
+                environment_ = environment;
+                for (size_t i = 0; i < extras_.size(); ++i) {  // a tab opened while this was still starting
+                    CreateExtra(i);
+                }
                 const HRESULT creating = environment->CreateCoreWebView2Controller(
                     host_, Microsoft::WRL::Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
                                  [this](HRESULT created, ICoreWebView2Controller* controller) -> HRESULT {
@@ -348,42 +442,9 @@ void BrowserView::Create() {
                                      if (SUCCEEDED(view_->get_Settings(settings.put()))) {
                                          settings->put_IsStatusBarEnabled(FALSE);
                                      }
+                                     Arm(view_.get());
+                                     WatchAddress(view_.get());
                                      EventRegistrationToken token{};
-                                     // Third layer of the block on local addresses: nothing the page does lands there.
-                                     view_->add_NavigationStarting(
-                                         Microsoft::WRL::Callback<ICoreWebView2NavigationStartingEventHandler>(
-                                             [](ICoreWebView2*, ICoreWebView2NavigationStartingEventArgs* args) {
-                                                 wil::unique_cotaskmem_string uri;
-                                                 if (FAILED(args->get_Uri(&uri)) || !uri || !MayNavigate(ToUtf8(uri.get()))) {
-                                                     args->put_Cancel(TRUE);
-                                                 }
-                                                 return S_OK;
-                                             })
-                                             .Get(),
-                                         &token);
-                                     // A link that wants a window of its own opens in this page.
-                                     view_->add_NewWindowRequested(
-                                         Microsoft::WRL::Callback<ICoreWebView2NewWindowRequestedEventHandler>(
-                                             [this](ICoreWebView2*, ICoreWebView2NewWindowRequestedEventArgs* args) {
-                                                 args->put_Handled(TRUE);
-                                                 wil::unique_cotaskmem_string uri;
-                                                 if (SUCCEEDED(args->get_Uri(&uri)) && uri && MayNavigate(ToUtf8(uri.get()))) {
-                                                     view_->Navigate(uri.get());
-                                                 }
-                                                 return S_OK;
-                                             })
-                                             .Get(),
-                                         &token);
-                                     if (const auto four = view_.try_query<ICoreWebView2_4>()) {
-                                         four->add_DownloadStarting(  // the agent downloads nothing
-                                             Microsoft::WRL::Callback<ICoreWebView2DownloadStartingEventHandler>(
-                                                 [](ICoreWebView2*, ICoreWebView2DownloadStartingEventArgs* args) {
-                                                     args->put_Cancel(TRUE);
-                                                     return S_OK;
-                                                 })
-                                                 .Get(),
-                                             &token);
-                                     }
                                      if (SUCCEEDED(view_->GetDevToolsProtocolEventReceiver(L"Page.loadEventFired",
                                                                                            loadReceiver_.put()))) {
                                          loadReceiver_->add_DevToolsProtocolEventReceived(
@@ -399,23 +460,12 @@ void BrowserView::Create() {
                                                  .Get(),
                                              &token);
                                      }
-                                     view_->add_SourceChanged(
-                                         Microsoft::WRL::Callback<ICoreWebView2SourceChangedEventHandler>(
-                                             [this](ICoreWebView2* sender, ICoreWebView2SourceChangedEventArgs*) {
-                                                 if (edit_ == nullptr || GetFocus() == edit_ || sender == nullptr) {
-                                                     return S_OK;
-                                                 }
-                                                 wil::unique_cotaskmem_string source;
-                                                 if (FAILED(sender->get_Source(&source)) || source == nullptr ||
-                                                     wcscmp(source.get(), L"about:blank") == 0) {
-                                                     return S_OK;
-                                                 }
-                                                 SetWindowTextW(edit_, source.get());
-                                                 return S_OK;
-                                             })
-                                             .Get(),
-                                         &token);
-                                     view_->Navigate(L"about:blank");
+                                     if (page_ == 0 && !pending_.empty()) {
+                                         view_->Navigate(pending_.c_str());
+                                         pending_.clear();
+                                     } else {
+                                         view_->Navigate(L"about:blank");
+                                     }
                                      creating_ = false;
                                      {
                                          std::lock_guard lock(mutex_);
@@ -473,11 +523,17 @@ void BrowserView::Blank() {
     if (view_) {
         view_->Navigate(L"about:blank");
     }
-    if (edit_ != nullptr) {
+    // The tool's page goes blank. A tab the person opened keeps its address.
+    if (page_ == 0 && edit_ != nullptr) {
         SetWindowTextW(edit_, L"");
     }
     if (controller_) {
         controller_->put_IsVisible(FALSE);
+    }
+    for (ExtraPage& page : extras_) {
+        if (page.controller) {
+            page.controller->put_IsVisible(FALSE);
+        }
     }
     if (host_ != nullptr) {
         ShowWindow(host_, SW_HIDE);
@@ -486,6 +542,13 @@ void BrowserView::Blank() {
 
 void BrowserView::Shutdown() {
     shutdown_ = true;
+    for (ExtraPage& page : extras_) {
+        if (page.controller) {
+            page.controller->Close();
+        }
+        page.controller.reset();
+        page.view.reset();
+    }
     if (controller_) {
         controller_->Close();  // the browser processes go with it; the host goes after
     }
@@ -511,6 +574,10 @@ void BrowserView::Shutdown() {
     if (ground_ != nullptr) {
         DeleteObject(ground_);
         ground_ = nullptr;
+    }
+    if (gdip_ != 0) {
+        Gdiplus::GdiplusShutdown(gdip_);
+        gdip_ = 0;
     }
 }
 
@@ -650,12 +717,260 @@ bool BrowserView::Close() {
 }
 
 BrowserView::Status BrowserView::State() {
+    if (page_ > 0) {
+        const size_t index = static_cast<size_t>(page_ - 1);
+        if (index < extras_.size() && extras_[index].view) {
+            return {true, {}};
+        }
+        std::lock_guard lock(mutex_);
+        if (!environment_ && !failure_.empty()) {  // the tool's page never started: this one cannot either
+            return {false, failure_};
+        }
+        return {false, {}};
+    }
     std::lock_guard lock(mutex_);
     return {ready_, failure_};
 }
 
 void BrowserView::ParentMoved() {
     ApplyPlace();
+}
+
+void BrowserView::PaintChrome(HDC dc, const RECT& client) {
+    if (gdip_ == 0 || client.right <= 0) {
+        return;
+    }
+    const RECT field = FieldRect(client);
+    if (field.right - field.left < Dip(16) || field.bottom <= field.top) {
+        return;
+    }
+    Gdiplus::Graphics canvas(dc);
+    canvas.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+    canvas.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
+    const float radius = DipF(8.f);
+    const float left = static_cast<float>(field.left);
+    const float top = static_cast<float>(field.top);
+    const float right = static_cast<float>(field.right);
+    const float bottom = static_cast<float>(field.bottom);
+    const float diameter = radius * 2.f;
+    Gdiplus::GraphicsPath path;
+    path.AddArc(left, top, diameter, diameter, 180.f, 90.f);
+    path.AddArc(right - diameter, top, diameter, diameter, 270.f, 90.f);
+    path.AddArc(right - diameter, bottom - diameter, diameter, diameter, 0.f, 90.f);
+    path.AddArc(left, bottom - diameter, diameter, diameter, 90.f, 90.f);
+    path.CloseFigure();
+    const Gdiplus::SolidBrush fill(Gdiplus::Color(255, 0x23, 0x23, 0x27));
+    canvas.FillPath(&fill, &path);
+    if (edit_ != nullptr && GetFocus() == edit_) {
+        const Gdiplus::Pen ring(Gdiplus::Color(190, 0x4c, 0x92, 0xff), std::max(1.f, DipF(1.f)));
+        canvas.DrawPath(&ring, &path);
+    }
+    // The same magnifier as the sidebar's search, sitting in the field's left end.
+    const float cx = left + DipF(16.f);
+    const float cy = (top + bottom) / 2.f;
+    const Gdiplus::Pen icon(Gdiplus::Color(255, 0x9c, 0x9e, 0xa4), std::max(1.f, DipF(1.3f)));
+    const float glass = DipF(4.5f);
+    canvas.DrawEllipse(&icon, cx - DipF(1.f) - glass, cy - DipF(1.f) - glass, glass * 2.f, glass * 2.f);
+    canvas.DrawLine(&icon, cx + DipF(2.5f), cy + DipF(2.5f), cx + DipF(5.5f), cy + DipF(5.5f));
+}
+
+ICoreWebView2* BrowserView::ActiveView() const {
+    if (page_ <= 0) {
+        return view_.get();
+    }
+    const size_t index = static_cast<size_t>(page_ - 1);
+    return index < extras_.size() ? extras_[index].view.get() : nullptr;
+}
+
+ICoreWebView2Controller* BrowserView::ActiveController() const {
+    if (page_ <= 0) {
+        return controller_.get();
+    }
+    const size_t index = static_cast<size_t>(page_ - 1);
+    return index < extras_.size() ? extras_[index].controller.get() : nullptr;
+}
+
+void BrowserView::WatchAddress(ICoreWebView2* view) {
+    if (view == nullptr) {
+        return;
+    }
+    EventRegistrationToken token{};
+    view->add_SourceChanged(
+        Microsoft::WRL::Callback<ICoreWebView2SourceChangedEventHandler>(
+            [this](ICoreWebView2* sender, ICoreWebView2SourceChangedEventArgs*) {
+                if (edit_ == nullptr || GetFocus() == edit_ || sender == nullptr || sender != ActiveView()) {
+                    return S_OK;
+                }
+                wil::unique_cotaskmem_string source;
+                if (FAILED(sender->get_Source(&source)) || source == nullptr ||
+                    wcscmp(source.get(), L"about:blank") == 0) {
+                    return S_OK;
+                }
+                SetWindowTextW(edit_, source.get());
+                return S_OK;
+            })
+            .Get(),
+        &token);
+}
+
+void BrowserView::Arm(ICoreWebView2* view) {
+    if (view == nullptr) {
+        return;
+    }
+    EventRegistrationToken token{};
+    // Nothing the page does on its own may land on this computer or the home network.
+    view->add_NavigationStarting(
+        Microsoft::WRL::Callback<ICoreWebView2NavigationStartingEventHandler>(
+            [](ICoreWebView2*, ICoreWebView2NavigationStartingEventArgs* args) {
+                wil::unique_cotaskmem_string uri;
+                if (FAILED(args->get_Uri(&uri)) || !uri || !MayNavigate(ToUtf8(uri.get()))) {
+                    args->put_Cancel(TRUE);
+                }
+                return S_OK;
+            })
+            .Get(),
+        &token);
+    view->add_NewWindowRequested(
+        Microsoft::WRL::Callback<ICoreWebView2NewWindowRequestedEventHandler>(
+            [view](ICoreWebView2*, ICoreWebView2NewWindowRequestedEventArgs* args) {
+                args->put_Handled(TRUE);
+                wil::unique_cotaskmem_string uri;
+                if (SUCCEEDED(args->get_Uri(&uri)) && uri && MayNavigate(ToUtf8(uri.get()))) {
+                    view->Navigate(uri.get());
+                }
+                return S_OK;
+            })
+            .Get(),
+        &token);
+    wil::com_ptr<ICoreWebView2_4> four;
+    if (SUCCEEDED(view->QueryInterface(IID_PPV_ARGS(four.put())))) {
+        four->add_DownloadStarting(  // the agent downloads nothing, and neither does a tab beside it
+            Microsoft::WRL::Callback<ICoreWebView2DownloadStartingEventHandler>(
+                [](ICoreWebView2*, ICoreWebView2DownloadStartingEventArgs* args) {
+                    args->put_Cancel(TRUE);
+                    return S_OK;
+                })
+                .Get(),
+            &token);
+    }
+}
+
+void BrowserView::CreateExtra(size_t index) {
+    if (!environment_ || host_ == nullptr || index >= extras_.size()) {
+        return;
+    }
+    ExtraPage& page = extras_[index];
+    if (page.closed || page.controller || page.opening) {
+        return;
+    }
+    page.opening = true;
+    const int slot = static_cast<int>(index) + 1;
+    const HRESULT creating = environment_->CreateCoreWebView2Controller(
+        host_, Microsoft::WRL::Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
+                   [this, index, slot](HRESULT created, ICoreWebView2Controller* controller) -> HRESULT {
+                       if (index >= extras_.size()) {
+                           if (controller != nullptr) {
+                               controller->Close();
+                           }
+                           return S_OK;
+                       }
+                       ExtraPage& arrived = extras_[index];
+                       arrived.opening = false;
+                       if (shutdown_ || arrived.closed || FAILED(created) || controller == nullptr) {
+                           if (controller != nullptr) {
+                               controller->Close();
+                           }
+                           if (host_ != nullptr) {
+                               InvalidateRect(host_, nullptr, FALSE);
+                           }
+                           return S_OK;
+                       }
+                       arrived.controller = controller;
+                       arrived.controller->get_CoreWebView2(arrived.view.put());
+                       if (!arrived.view) {
+                           arrived.controller->Close();
+                           arrived.controller.reset();
+                           return S_OK;
+                       }
+                       arrived.controller->put_IsVisible(FALSE);
+                       if (const auto colored = arrived.controller.try_query<ICoreWebView2Controller2>()) {
+                           colored->put_DefaultBackgroundColor(COREWEBVIEW2_COLOR{255, 0x12, 0x12, 0x13});
+                       }
+                       wil::com_ptr<ICoreWebView2Settings> settings;
+                       if (SUCCEEDED(arrived.view->get_Settings(settings.put()))) {
+                           settings->put_IsStatusBarEnabled(FALSE);
+                       }
+                       Arm(arrived.view.get());
+                       WatchAddress(arrived.view.get());
+                       if (page_ == slot && !pending_.empty()) {
+                           arrived.view->Navigate(pending_.c_str());
+                           pending_.clear();
+                       } else {
+                           arrived.view->Navigate(L"about:blank");
+                       }
+                       LayoutPage();
+                       if (host_ != nullptr) {
+                           InvalidateRect(host_, nullptr, FALSE);
+                       }
+                       return S_OK;
+                   })
+                   .Get());
+    if (FAILED(creating)) {
+        page.opening = false;
+    }
+}
+
+int BrowserView::AddPage() {
+    EnsureHost();
+    extras_.push_back({});
+    const int slot = static_cast<int>(extras_.size());
+    if (environment_) {
+        CreateExtra(static_cast<size_t>(slot - 1));
+    }
+    ShowPage(slot);
+    return slot;
+}
+
+void BrowserView::ShowPage(int slot) {
+    if (slot < 0) {
+        slot = 0;
+    }
+    const bool changed = slot != page_;
+    page_ = slot;
+    LayoutPage();
+    if (!changed || edit_ == nullptr) {
+        return;
+    }
+    ICoreWebView2* view = ActiveView();
+    if (view == nullptr) {
+        SetWindowTextW(edit_, L"");
+        return;
+    }
+    wil::unique_cotaskmem_string source;
+    if (FAILED(view->get_Source(&source)) || source == nullptr || wcscmp(source.get(), L"about:blank") == 0) {
+        SetWindowTextW(edit_, L"");
+        return;
+    }
+    SetWindowTextW(edit_, source.get());
+}
+
+void BrowserView::ClosePage(int slot) {
+    if (slot <= 0) {
+        return;
+    }
+    const size_t index = static_cast<size_t>(slot - 1);
+    if (index >= extras_.size()) {
+        return;
+    }
+    ExtraPage& page = extras_[index];
+    page.closed = true;
+    if (page.controller) {
+        page.controller->Close();
+    }
+    page.controller.reset();
+    page.view.reset();
+    // Leave page_ on this slot. The next ShowPage sees the change and rewrites the address;
+    // zeroing it here would keep the closed page's URL on the tool's tab.
 }
 
 }  // namespace aic
