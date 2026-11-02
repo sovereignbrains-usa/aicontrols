@@ -133,6 +133,41 @@ std::wstring SessionTitle(const std::wstring& workspace, const std::string& id);
 // Moves a chat to the Recycle Bin: its transcript and the folder the CLI keeps beside it (Grok's: its folder).
 // False if it could not. A chat in parts loses its line in chats.json; each part is deleted by its own id.
 bool DeleteSession(const std::wstring& workspace, const std::string& id);
+
+// A chat kept to be read before it is gone: %APPDATA%\AIControls\archive\<id>\ (tests: SetArchiveRoot).
+// The live files stay until something else removes them. The copy is every file DeleteSession would take
+// (the transcript, the folder beside it, Grok's folder), for every part, plus manifest.json.
+struct ArchivedChat {
+    std::string id;  // the chat's newest session, and the archive folder's name
+    std::wstring title;
+    std::wstring folder;  // the project it was in
+    uint64_t first = 0;   // FILETIME ticks: the earliest file, and the latest
+    uint64_t last = 0;
+    std::vector<SessionPart> parts;
+};
+
+// Tests: their own archive, not the user's. Empty: the real one again.
+void SetArchiveRoot(const std::wstring& folder);
+// Tests: the next ArchiveChat fails once this many parts have been copied. -1: do not fail.
+void SetArchiveFailAfter(int copiedParts);
+std::wstring ArchiveRoot();
+
+// Copies the chat. False: the copy did not finish, nothing was left behind, and the live chat was not touched.
+bool ArchiveChat(const std::wstring& workspace, const SessionInfo& session);
+// The copy of a delete that was taken back: the archive folder goes, the live chat stays.
+bool DiscardArchive(const std::string& id);
+// The files go back into the project's history and the line into chats.json; the archive copy then goes.
+// False: a live file was already there, or the copy could not be read. Nothing is overwritten.
+bool RestoreArchivedChat(const std::string& id);
+// Newest first. A folder that is not a finished copy is left out.
+std::vector<ArchivedChat> ListArchivedChats();
+// The ids in the ```archive fence of archive\digest.md. A missing file, or no fence: none.
+std::vector<std::string> ChatsNamedInDigest();
+// Gone from the archive (to the Recycle Bin). Refuses unless the chat is named in the digest, or `force`.
+bool PurgeArchivedChat(const std::string& id, bool force);
+// One part of an archived chat, as LoadTranscript reads a live one.
+std::vector<TranscriptEntry> LoadArchivedPart(const std::string& archiveId, const std::string& partId, bool grok,
+                                              size_t limit, bool& truncated);
 // Moves a chat to another project: its transcript and its folder go to that workspace's history, where the CLI
 // resumes it (checked 22.10.2026: the whole conversation comes back). False if it could not; nothing is lost then.
 // Grok's chats are not moved (false): grok.exe keeps them by folder, and its resume elsewhere is not checked.

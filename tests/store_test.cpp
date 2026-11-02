@@ -22,6 +22,11 @@ void Expect(bool ok, const char* what) {
     }
 }
 
+std::string ReadAll(const std::filesystem::path& path) {
+    std::ifstream in(path, std::ios::binary);
+    return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+}
+
 }  // namespace
 
 int main() {
@@ -326,6 +331,94 @@ This session is being continued
 
     fs::remove_all(historyA, error);
     fs::remove_all(historyB, error);
+
+    // A chat of two parts is copied whole. A copy that stops halfway leaves the live chat and no archive
+    // folder. Putting it back writes the same files into the history and the line into chats.json.
+    const std::wstring arc = (temp / L"aic_store_archive").wstring();
+    const fs::path historyArc = fs::path(aic::MemoryFolder(arc)).parent_path();
+    const fs::path grokArc = aic::GrokHistoryFolder(arc);
+    const fs::path archiveRoot = temp / L"aic_store_archive_root";
+    const fs::path archiveIndex = temp / L"aic_store_archive_chats.json";
+    fs::remove_all(historyArc, error);
+    fs::remove_all(grokArc, error);
+    fs::remove_all(archiveRoot, error);
+    fs::remove(archiveIndex, error);
+    aic::SetChatIndexFile(archiveIndex.wstring());
+    aic::SetArchiveRoot(archiveRoot.wstring());
+    aic::SetArchiveFailAfter(-1);
+    fs::create_directories(historyArc / L"part-c", error);
+    std::ofstream(historyArc / L"part-c.jsonl") << R"({"type":"user","message":{"role":"user","content":"archive claude"}})"
+                                               << "\n";
+    std::ofstream(historyArc / L"part-c" / L"note.txt") << "side-note";
+    fs::create_directories(grokArc / L"part-g", error);
+    std::ofstream(grokArc / L"part-g" / L"chat_history.jsonl")
+        << R"({"type":"user","content":[{"type":"text","text":"<user_query>\narchive grok\n</user_query>"}],"prompt_index":0})"
+        << "\n";
+    std::ofstream(grokArc / L"part-g" / L"extra.bin") << "grok-extra";
+    aic::LinkChats("part-c", "part-g");
+    aic::RenameSession(arc, "part-g", L"Архивный");
+    const auto arcList = aic::ListSessions(arc);
+    const auto arcChat = std::ranges::find_if(arcList, [](const aic::SessionInfo& s) { return aic::SameChat(s, "part-g"); });
+    Expect(arcChat != arcList.end() && arcChat->parts.size() == 2 && arcChat->id == "part-g",
+           "archive fixture: one chat, two parts");
+    if (arcChat != arcList.end()) {
+        aic::SetArchiveFailAfter(1);
+        Expect(!aic::ArchiveChat(arc, *arcChat), "a copy that stops after one part fails");
+        Expect(fs::exists(historyArc / L"part-c.jsonl") && fs::exists(historyArc / L"part-c" / L"note.txt") &&
+                   fs::exists(grokArc / L"part-g" / L"extra.bin"),
+               "the live chat is untouched when the copy does not finish");
+        Expect(!fs::exists(archiveRoot / L"part-g") && !fs::exists(archiveRoot / L"part-g.partial"),
+               "an unfinished copy is not left behind");
+        aic::SetArchiveFailAfter(-1);
+        Expect(aic::ArchiveChat(arc, *arcChat), "both parts copy");
+        const fs::path copied = archiveRoot / L"part-g";
+        Expect(ReadAll(copied / L"parts" / L"part-c" / L"session.jsonl").find("archive claude") != std::string::npos &&
+                   ReadAll(copied / L"parts" / L"part-c" / L"side" / L"note.txt") == "side-note" &&
+                   ReadAll(copied / L"parts" / L"part-g" / L"grok" / L"extra.bin") == "grok-extra" &&
+                   ReadAll(copied / L"parts" / L"part-g" / L"grok" / L"chat_history.jsonl").find("archive grok") != std::string::npos,
+               "the copy has both parts, whole");
+        Expect(fs::exists(historyArc / L"part-c.jsonl") && fs::exists(grokArc / L"part-g" / L"extra.bin"),
+               "archiving does not remove the live chat");
+        const auto listedCopy = aic::ListArchivedChats();
+        Expect(listedCopy.size() == 1 && listedCopy[0].id == "part-g" && listedCopy[0].title == L"Архивный" &&
+                   listedCopy[0].folder == arc && listedCopy[0].parts.size() == 2 && !listedCopy[0].parts[0].grok &&
+                   listedCopy[0].parts[1].grok && listedCopy[0].first != 0 && listedCopy[0].last != 0,
+               "the manifest: title, project, both parts, times");
+        bool cut = false;
+        const auto readBack = aic::LoadArchivedPart("part-g", "part-c", false, 20, cut);
+        Expect(!readBack.empty() && readBack[0].kind == aic::EntryKind::User && readBack[0].text == L"archive claude",
+               "an archived part reads back");
+        Expect(aic::DeleteSession(arc, "part-c") && aic::DeleteSession(arc, "part-g"), "the live files then go");
+        Expect(aic::ListSessions(arc).empty(), "nothing live remains");
+        Expect(aic::RestoreArchivedChat("part-g"), "returned to the chats");
+        Expect(!fs::exists(copied), "the archive copy goes once it is back");
+        Expect(ReadAll(historyArc / L"part-c.jsonl").find("archive claude") != std::string::npos &&
+                   ReadAll(historyArc / L"part-c" / L"note.txt") == "side-note" &&
+                   ReadAll(grokArc / L"part-g" / L"extra.bin") == "grok-extra",
+               "the same files are in the history again");
+        const auto restored = aic::ListSessions(arc);
+        const auto again =
+            std::ranges::find_if(restored, [](const aic::SessionInfo& s) { return aic::SameChat(s, "part-c"); });
+        Expect(again != restored.end() && again->parts.size() == 2 && again->title == L"Архивный",
+               "chats.json has the chat again");
+        {
+            std::ofstream(archiveRoot / L"digest.md")
+                << "закончен part-g, но это не список\n\n```archive\nno-such\n```\n";
+        }
+        Expect(aic::ChatsNamedInDigest() == std::vector<std::string>{"no-such"}, "the digest names only its fence");
+        if (again != restored.end()) {
+            Expect(aic::ArchiveChat(arc, *again), "copied once more");
+            Expect(!aic::PurgeArchivedChat("part-g", false) && fs::exists(archiveRoot / L"part-g"),
+                   "a chat the digest did not name is not erased");
+        }
+    }
+    aic::SetArchiveFailAfter(-1);
+    aic::SetArchiveRoot({});
+    fs::remove_all(archiveRoot, error);
+    fs::remove_all(historyArc, error);
+    fs::remove_all(grokArc, error);
+    fs::remove(archiveIndex, error);
+
     if (failures == 0) {
         std::cout << "store: all passed\n";
     }

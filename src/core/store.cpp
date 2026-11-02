@@ -984,6 +984,410 @@ bool DeleteSession(const std::wstring& workspace, const std::string& id) {
     return deleted;
 }
 
+namespace {
+
+std::wstring g_archiveRoot;
+int g_archiveFailAfter = -1;  // tests: fail after this many parts; -1 never
+
+bool SafeId(const std::string& id) {
+    return !id.empty() && id.find_first_of("/\\.:") == std::string::npos;
+}
+
+bool SameSize(const fs::path& left, const fs::path& right) {
+    std::error_code a, b;
+    return fs::file_size(left, a) == fs::file_size(right, b) && !a && !b;
+}
+
+// A file, or a folder and everything in it. False if any of it did not arrive the same size.
+bool CopyTree(const fs::path& from, const fs::path& to) {
+    std::error_code error;
+    if (fs::is_regular_file(from, error)) {
+        fs::create_directories(to.parent_path(), error);
+        if (error) {
+            return false;
+        }
+        fs::copy_file(from, to, fs::copy_options::overwrite_existing, error);
+        return !error && SameSize(from, to);
+    }
+    if (!fs::is_directory(from, error)) {
+        return false;
+    }
+    fs::create_directories(to, error);
+    if (error) {
+        return false;
+    }
+    for (const fs::directory_entry& entry : fs::recursive_directory_iterator(from, error)) {
+        if (error) {
+            return false;
+        }
+        const fs::path rel = fs::relative(entry.path(), from, error);
+        if (error) {
+            return false;
+        }
+        const fs::path dest = to / rel;
+        if (entry.is_directory(error)) {
+            fs::create_directories(dest, error);
+        } else if (entry.is_regular_file(error)) {
+            fs::create_directories(dest.parent_path(), error);
+            if (!error) {
+                fs::copy_file(entry.path(), dest, fs::copy_options::overwrite_existing, error);
+            }
+            if (!error && !SameSize(entry.path(), dest)) {
+                return false;
+            }
+        }
+        if (error) {
+            return false;
+        }
+    }
+    return !error;
+}
+
+void NoteTime(const fs::path& path, uint64_t& first, uint64_t& last) {
+    WIN32_FILE_ATTRIBUTE_DATA data{};
+    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &data)) {
+        return;
+    }
+    const uint64_t created = ToTicks(data.ftCreationTime);
+    const uint64_t written = ToTicks(data.ftLastWriteTime);
+    if (created != 0) {
+        first = first == 0 ? created : std::min(first, created);
+    }
+    last = std::max(last, written);
+}
+
+// What DeleteSession would take for one part: the transcript, the folder beside it, Grok's folder. False if
+// none of them is there, or one of them did not copy.
+bool CopyPartFiles(const std::wstring& workspace, const std::string& id, const fs::path& dest) {
+    std::error_code error;
+    bool any = false;
+    bool failed = false;
+    if (const fs::path file = SessionFile(workspace, id); fs::is_regular_file(file, error)) {
+        any = true;
+        failed = !CopyTree(file, dest / L"session.jsonl") || failed;
+    }
+    if (const fs::path side = ProjectDir(workspace) / ToWide(id); fs::is_directory(side, error)) {
+        any = true;
+        failed = !CopyTree(side, dest / L"side") || failed;
+    }
+    if (const fs::path grok = GrokSessionDir(workspace, id); !grok.empty() && fs::is_directory(grok, error)) {
+        any = true;
+        failed = !CopyTree(grok, dest / L"grok") || failed;
+    }
+    return any && !failed;
+}
+
+fs::path ArchiveDir(const std::string& id) {
+    return fs::path(ArchiveRoot()) / ToWide(id);
+}
+
+std::optional<ArchivedChat> ReadManifest(const fs::path& dir) {
+    std::ifstream in(dir / L"manifest.json", std::ios::binary);
+    const Json parsed = Json::parse(in, nullptr, false);
+    if (parsed.is_discarded() || !parsed.is_object()) {
+        return std::nullopt;
+    }
+    ArchivedChat chat;
+    chat.id = ToUtf8(dir.filename().wstring());
+    if (!SafeId(chat.id)) {
+        return std::nullopt;
+    }
+    chat.title = ToWide(JsonStr(parsed, "title"));
+    chat.folder = ToWide(JsonStr(parsed, "folder"));
+    if (const Json& first = JsonAt(parsed, "first"); first.is_number_unsigned()) {
+        chat.first = first.get<uint64_t>();
+    }
+    if (const Json& last = JsonAt(parsed, "last"); last.is_number_unsigned()) {
+        chat.last = last.get<uint64_t>();
+    }
+    for (const Json& part : JsonAt(parsed, "parts")) {
+        const std::string id = JsonStr(part, "id");
+        if (!SafeId(id)) {
+            continue;
+        }
+        chat.parts.push_back({id, IsTrue(JsonAt(part, "grok"))});
+    }
+    if (chat.parts.empty()) {
+        return std::nullopt;
+    }
+    return chat;
+}
+
+}  // namespace
+
+void SetArchiveRoot(const std::wstring& folder) {
+    g_archiveRoot = folder;
+}
+
+void SetArchiveFailAfter(int copiedParts) {
+    g_archiveFailAfter = copiedParts;
+}
+
+std::wstring ArchiveRoot() {
+    if (!g_archiveRoot.empty()) {
+        return g_archiveRoot;
+    }
+    return (fs::path(KnownFolder(FOLDERID_RoamingAppData)) / L"AIControls" / L"archive").wstring();
+}
+
+bool ArchiveChat(const std::wstring& workspace, const SessionInfo& session) {
+    if (session.parts.empty() || !SafeId(session.id)) {
+        return false;
+    }
+    for (const SessionPart& part : session.parts) {
+        if (!SafeId(part.id)) {
+            return false;
+        }
+    }
+    const fs::path finalDir = ArchiveDir(session.id);
+    std::error_code error;
+    if (fs::exists(finalDir, error)) {
+        return false;  // a copy is already there: leave both it and the live chat alone
+    }
+    const fs::path partial = fs::path(ArchiveRoot()) / (ToWide(session.id) + L".partial");
+    fs::remove_all(partial, error);
+    fs::create_directories(partial, error);
+    if (error || !fs::is_directory(partial, error)) {
+        return false;
+    }
+    const auto rollback = [&] {
+        std::error_code gone;
+        fs::remove_all(partial, gone);
+    };
+    uint64_t first = 0;
+    uint64_t last = 0;
+    int copied = 0;
+    for (const SessionPart& part : session.parts) {
+        if (g_archiveFailAfter >= 0 && copied >= g_archiveFailAfter) {
+            rollback();
+            return false;
+        }
+        if (!CopyPartFiles(workspace, part.id, partial / L"parts" / ToWide(part.id))) {
+            rollback();
+            return false;
+        }
+        NoteTime(SessionFile(workspace, part.id), first, last);
+        NoteTime(ProjectDir(workspace) / ToWide(part.id), first, last);
+        if (const fs::path grok = GrokSessionDir(workspace, part.id); !grok.empty()) {
+            NoteTime(grok, first, last);
+        }
+        ++copied;
+    }
+    Json parts = Json::array();
+    for (const SessionPart& part : session.parts) {
+        parts.push_back(Json{{"id", part.id}, {"grok", part.grok}});
+    }
+    {
+        std::ofstream out(partial / L"manifest.json", std::ios::binary | std::ios::trunc);
+        out << Json{{"title", ToUtf8(session.title)},
+                    {"folder", ToUtf8(workspace)},
+                    {"first", first},
+                    {"last", last},
+                    {"parts", std::move(parts)}}
+                   .dump(1, '\t', false, Json::error_handler_t::replace)
+            << "\n";
+        if (!out.good()) {
+            rollback();
+            return false;
+        }
+    }
+    fs::rename(partial, finalDir, error);
+    if (error) {
+        rollback();
+        return false;
+    }
+    return true;
+}
+
+bool DiscardArchive(const std::string& id) {
+    if (!SafeId(id)) {
+        return false;
+    }
+    const fs::path dir = ArchiveDir(id);
+    std::error_code error;
+    if (!fs::is_directory(dir, error)) {
+        return false;
+    }
+    fs::remove_all(dir, error);
+    return !error && !fs::exists(dir, error);
+}
+
+bool RestoreArchivedChat(const std::string& id) {
+    if (!SafeId(id)) {
+        return false;
+    }
+    const fs::path dir = ArchiveDir(id);
+    const std::optional<ArchivedChat> chat = ReadManifest(dir);
+    if (!chat) {
+        return false;
+    }
+    struct Item {
+        fs::path from;
+        fs::path to;
+    };
+    std::vector<Item> items;
+    std::error_code error;
+    for (const SessionPart& part : chat->parts) {
+        if (!SafeId(part.id)) {
+            return false;
+        }
+        const fs::path partDir = dir / L"parts" / ToWide(part.id);
+        if (fs::is_regular_file(partDir / L"session.jsonl", error)) {
+            const fs::path to = SessionFile(chat->folder, part.id);
+            if (fs::exists(to, error)) {
+                return false;
+            }
+            items.push_back({partDir / L"session.jsonl", to});
+        }
+        if (fs::is_directory(partDir / L"side", error)) {
+            const fs::path to = ProjectDir(chat->folder) / ToWide(part.id);
+            if (fs::exists(to, error)) {
+                return false;
+            }
+            items.push_back({partDir / L"side", to});
+        }
+        if (fs::is_directory(partDir / L"grok", error)) {
+            const fs::path to = GrokSessionDir(chat->folder, part.id);
+            if (to.empty() || fs::exists(to, error)) {
+                return false;
+            }
+            items.push_back({partDir / L"grok", to});
+        }
+    }
+    if (items.empty()) {
+        return false;
+    }
+    for (const Item& item : items) {
+        fs::create_directories(item.to.parent_path(), error);
+        if (error || !CopyTree(item.from, item.to)) {
+            return false;  // the archive stays, so a failed return can be tried again
+        }
+    }
+    {
+        const std::lock_guard lock(g_chatsMutex);
+        ChatIndex& index = Chats();
+        std::erase_if(index.records, [&](const ChatRecord& record) {
+            return std::ranges::any_of(chat->parts, [&](const SessionPart& part) {
+                return std::ranges::find(record.sessions, part.id) != record.sessions.end();
+            });
+        });
+        ChatRecord record;
+        for (const SessionPart& part : chat->parts) {
+            record.sessions.push_back(part.id);
+        }
+        record.title = chat->title;
+        record.active = chat->last;
+        index.records.push_back(std::move(record));
+        SaveChats(index);
+    }
+    fs::remove_all(dir, error);
+    return !error && !fs::exists(dir, error);
+}
+
+std::vector<ArchivedChat> ListArchivedChats() {
+    std::vector<ArchivedChat> chats;
+    std::error_code error;
+    for (const fs::directory_entry& item : fs::directory_iterator(fs::path(ArchiveRoot()), error)) {
+        if (error || !item.is_directory(error)) {
+            continue;
+        }
+        if (item.path().filename().wstring().ends_with(L".partial")) {
+            continue;
+        }
+        if (const std::optional<ArchivedChat> chat = ReadManifest(item.path())) {
+            chats.push_back(*chat);
+        }
+    }
+    std::ranges::sort(chats, [](const ArchivedChat& a, const ArchivedChat& b) { return a.last > b.last; });
+    return chats;
+}
+
+std::vector<std::string> ChatsNamedInDigest() {
+    std::ifstream in(fs::path(ArchiveRoot()) / L"digest.md", std::ios::binary);
+    if (!in) {
+        return {};
+    }
+    const std::string text{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+    constexpr std::string_view kOpen = "```archive";
+    const size_t at = text.find(kOpen);
+    if (at == std::string::npos) {
+        return {};
+    }
+    const size_t line = text.find('\n', at);
+    if (line == std::string::npos) {
+        return {};
+    }
+    const size_t end = text.find("```", line + 1);
+    const std::string body = text.substr(line + 1, end == std::string::npos ? std::string::npos : end - (line + 1));
+    std::vector<std::string> ids;
+    size_t start = 0;
+    while (start < body.size()) {
+        size_t stop = body.find('\n', start);
+        if (stop == std::string::npos) {
+            stop = body.size();
+        }
+        std::string id = body.substr(start, stop - start);
+        if (!id.empty() && id.back() == '\r') {
+            id.pop_back();
+        }
+        const size_t first = id.find_first_not_of(" \t");
+        const size_t last = id.find_last_not_of(" \t");
+        id = first == std::string::npos ? std::string() : id.substr(first, last - first + 1);
+        if (SafeId(id)) {
+            ids.push_back(std::move(id));
+        }
+        start = stop + 1;
+    }
+    return ids;
+}
+
+bool PurgeArchivedChat(const std::string& id, bool force) {
+    if (!SafeId(id)) {
+        return false;
+    }
+    const std::optional<ArchivedChat> chat = ReadManifest(ArchiveDir(id));
+    if (!chat) {
+        return false;
+    }
+    if (!force) {
+        const std::vector<std::string> named = ChatsNamedInDigest();
+        const auto namedAs = [&](const std::string& one) { return std::ranges::find(named, one) != named.end(); };
+        const bool allowed = namedAs(chat->id) || std::ranges::any_of(chat->parts, [&](const SessionPart& part) {
+                                  return namedAs(part.id);
+                              });
+        if (!allowed) {
+            return false;
+        }
+    }
+    std::wstring paths = ArchiveDir(id).wstring();
+    paths.push_back(L'\0');
+    paths.push_back(L'\0');
+    SHFILEOPSTRUCTW operation{};
+    operation.wFunc = FO_DELETE;
+    operation.pFrom = paths.c_str();
+    operation.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI;
+    std::error_code error;
+    return SHFileOperationW(&operation) == 0 && !operation.fAnyOperationsAborted && !fs::exists(ArchiveDir(id), error);
+}
+
+std::vector<TranscriptEntry> LoadClaudeFile(const fs::path& file, size_t limit, bool& truncated);
+
+std::vector<TranscriptEntry> LoadArchivedPart(const std::string& archiveId, const std::string& partId, bool grok,
+                                              size_t limit, bool& truncated) {
+    if (!SafeId(archiveId) || !SafeId(partId)) {
+        truncated = false;
+        return {};
+    }
+    const fs::path dir = ArchiveDir(archiveId) / L"parts" / ToWide(partId);
+    std::error_code error;
+    if (grok && fs::is_directory(dir / L"grok", error)) {
+        std::vector<TranscriptEntry> entries = LoadGrokTranscript(dir / L"grok");
+        KeepLatest(entries, limit, truncated);
+        return entries;
+    }
+    return LoadClaudeFile(dir / L"session.jsonl", limit, truncated);
+}
+
 bool MoveSession(const std::wstring& from, const std::wstring& to, const std::string& id) {
     if (id.empty() || id.find_first_of("/\\.:") != std::string::npos || ProjectDir(from) == ProjectDir(to)) {
         return false;
@@ -1057,16 +1461,12 @@ std::wstring GrokHistoryFolder(const std::wstring& workspace) {
     return GrokProjectDir(workspace).wstring();
 }
 
-std::vector<TranscriptEntry> LoadTranscript(const std::wstring& workspace, const std::string& id, size_t limit,
-                                            bool& truncated) {
+// A Claude transcript file, wherever it sits (the live history, or a copy in the archive).
+std::vector<TranscriptEntry> LoadClaudeFile(const fs::path& file, size_t limit, bool& truncated) {
     std::vector<TranscriptEntry> entries;
-    const fs::path file = SessionFile(workspace, id);
     std::error_code error;
     const uint64_t size = fs::file_size(file, error);
     if (error) {
-        if (const fs::path grok = GrokSessionDir(workspace, id); !grok.empty()) {
-            entries = LoadGrokTranscript(grok);
-        }
         KeepLatest(entries, limit, truncated);
         return entries;
     }
@@ -1161,6 +1561,21 @@ std::vector<TranscriptEntry> LoadTranscript(const std::wstring& workspace, const
     });
     KeepLatest(entries, limit, truncated);
     return entries;
+}
+
+std::vector<TranscriptEntry> LoadTranscript(const std::wstring& workspace, const std::string& id, size_t limit,
+                                            bool& truncated) {
+    std::error_code error;
+    const fs::path file = SessionFile(workspace, id);
+    if (!fs::is_regular_file(file, error)) {
+        std::vector<TranscriptEntry> entries;
+        if (const fs::path grok = GrokSessionDir(workspace, id); !grok.empty() && fs::is_directory(grok, error)) {
+            entries = LoadGrokTranscript(grok);
+        }
+        KeepLatest(entries, limit, truncated);
+        return entries;
+    }
+    return LoadClaudeFile(file, limit, truncated);
 }
 
 std::wstring ChatSoFar(const std::vector<std::pair<bool, std::vector<TranscriptEntry>>>& parts, size_t longest) {
