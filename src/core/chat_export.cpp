@@ -102,9 +102,10 @@ std::optional<std::string> ChatMarkdown(const std::wstring& workspace, const std
             case EntryKind::Tool: {
                 const std::string full = ToUtf8(entry.text);
                 const std::string own = OwnToolName(full).empty() ? GrokToolName(full) : OwnToolName(full);
+                const std::string shown = !own.empty() ? own : (GrokNativeRead(full) ? full : std::string());
                 const Json input = Json::parse(entry.toolInput, nullptr, false);
                 const ToolSummary summary =
-                    !own.empty() && input.is_object() ? SummarizeTool(own, input) : ToolSummary{entry.text, {}};
+                    !shown.empty() && input.is_object() ? SummarizeTool(shown, input) : ToolSummary{entry.text, {}};
                 out += "\n<details><summary>🔧 " + ToUtf8(summary.title) + "</summary>\n\n";
                 if (!summary.detail.empty()) {
                     out += Fenced(ToUtf8(summary.detail));

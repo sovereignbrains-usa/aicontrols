@@ -37,6 +37,9 @@ inline constexpr const char* kGrokToolPrefix = "grok__";
 bool GrokOwnTool(const std::string& name);
 // grok__image_gen → image_gen; empty for anything else.
 std::string GrokToolName(const std::string& fullName);
+// read_file and grep run inside grok.exe and ask nobody. The feed shows a line. Not GrokOwnTool: that path is
+// the web and Imagine, which become cards.
+bool GrokNativeRead(const std::string& name);
 // The tools that change nothing: reading and listing files, and this client's chats.
 bool ReadOnlyTool(const std::string& name);
 // Reading and listing run without asking; commands and writes wait for the user.

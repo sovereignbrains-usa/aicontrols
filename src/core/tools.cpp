@@ -584,6 +584,10 @@ std::string GrokToolName(const std::string& fullName) {
     return GrokOwnTool(name) ? name : std::string();
 }
 
+bool GrokNativeRead(const std::string& name) {
+    return name == "read_file" || name == "grep";
+}
+
 bool ReadOnlyTool(const std::string& name) {
     return name == "read_file" || name == "list_directory" || name == "list_chats" || name == "read_chat" ||
            name == "drive_search" || name == "drive_read";
@@ -713,7 +717,22 @@ ToolSummary SummarizeHere(const std::string& name, const Json& input) {
                                       ToWide(Truncated(StringArg(input, "new_string"), 400))};
     }
     if (name == "read_file") {
-        return {L"Прочитать файл", path};
+        std::wstring where = path.empty() ? ToWide(StringArg(input, "target_file")) : path;
+        if (const Json& offset = JsonAt(input, "offset"); offset.is_number_integer() && offset.get<long long>() > 1) {
+            where += std::format(L" · со строки {}", offset.get<long long>());
+        }
+        return {L"Прочитать файл", std::move(where)};
+    }
+    if (name == "grep") {
+        std::wstring detail = ToWide(StringArg(input, "pattern"));
+        std::wstring where = path;
+        if (const std::string glob = StringArg(input, "glob"); !glob.empty()) {
+            where += (where.empty() ? L"" : L" ") + ToWide(glob);
+        }
+        if (!where.empty()) {
+            detail += L"\n" + where;
+        }
+        return {L"Найти в файлах", std::move(detail)};
     }
     if (name == "list_directory") {
         return {L"Показать папку", path.empty() ? L"." : path};

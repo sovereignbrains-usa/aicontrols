@@ -10892,6 +10892,11 @@ void ChatWindow::OpenChat(std::wstring folder, SessionInfo session) {
                 const std::string full = ToUtf8(entry.text);
                 const std::string own = OwnToolName(full).empty() ? GrokToolName(full) : OwnToolName(full);
                 const Json input = Json::parse(entry.toolInput, nullptr, false);
+                if (own.empty() && GrokNativeRead(full) && input.is_object()) {  // a native read: the same line as live
+                    const ToolSummary summary = SummarizeTool(full, input);
+                    Add(Kind::Notice, summary.title + L": " + summary.detail, true);
+                    break;
+                }
                 if (own.empty() || !input.is_object()) {
                     Add(Kind::Notice, L"инструмент: " + entry.text, true);
                     break;

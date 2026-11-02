@@ -102,7 +102,8 @@ int main() {
         << R"({"type":"assistant","content":"","tool_calls":[{"id":"i1","name":"image_gen","arguments":"{\"prompt\":\"a fish\"}"},)"
         << R"({"id":"i2","name":"image_to_video","arguments":"{\"prompt\":\"swims\"}"}]})" << "\n"
         << R"({"type":"tool_result","tool_call_id":"i1","content":"{\"path\":\"C:\\\\1.jpg\"}"})" << "\n"
-        << R"({"type":"tool_result","tool_call_id":"i2","content":"Tool `image_to_video` failed: no video"})" << "\n";
+        << R"({"type":"tool_result","tool_call_id":"i2","content":"Tool `image_to_video` failed: no video"})" << "\n"
+        << R"({"type":"assistant","content":"","tool_calls":[{"id":"r1","name":"read_file","arguments":"{\"target_file\":\"C:\\\\a.cpp\"}"},{"id":"g1","name":"grep","arguments":"{\"pattern\":\"main\",\"path\":\"src\",\"glob\":\"*.cpp\"}"}]})" << "\n";
     std::ofstream(grokA / L"g-empty" / L"chat_history.jsonl")
         << R"({"type":"user","content":[{"type":"text","text":"<rules>be brief</rules>"}]})" << "\n";
     // Compacted twice (grok 1.0.62): the turns before each compaction in a segment, the history left with Grok's rules
@@ -216,10 +217,12 @@ This session is being continued
            "a grok tool call as it comes live, with its answer; its tool lookups left out");
     Expect(said.size() == 3 && said[2].kind == aic::EntryKind::Assistant && said[2].text == L"done", "the answer");
     const std::vector<aic::TranscriptEntry> made = aic::LoadTranscript(a, "g-2", 100, truncated);
-    Expect(made.size() == 4 && made[1].text == L"grok__web_search" && made[1].toolInput.find("\"fish\"") != std::string::npos &&
+    Expect(made.size() == 6 && made[1].text == L"grok__web_search" && made[1].toolInput.find("\"fish\"") != std::string::npos &&
                made[2].text == L"grok__image_gen" && made[2].toolOutput == LR"({"path":"C:\\1.jpg"})" && !made[2].toolFailed &&
-               made[3].text == L"grok__image_to_video" && made[3].toolFailed,
-           "grok's own tools in its history: the search, the picture, the video that failed");
+               made[3].text == L"grok__image_to_video" && made[3].toolFailed && made[4].text == L"read_file" &&
+               made[4].toolInput.find("a.cpp") != std::string::npos && made[5].text == L"grep" &&
+               made[5].toolInput.find("main") != std::string::npos,
+           "grok's own tools in its history: the search, the picture, the video that failed, a native read and grep");
     Expect(aic::RenameSession(a, "g-1", L"Навигация") && aic::SessionTitle(a, "g-1") == L"Навигация" &&
                fs::exists(grokA / L"g-1" / L"chat_history.jsonl"),
            "a grok chat renamed, its history left as it is");

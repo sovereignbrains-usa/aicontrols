@@ -42,21 +42,21 @@ constexpr const char* kProfile =
     "---\n"
     "name: aic\n"
     "description: AIControls chat\n"
-    "tools: search_tool, use_tool, web_search, web_fetch, image_gen, image_edit, image_to_video, reference_to_video, "
-    "spawn_subagent, get_command_or_subagent_output, wait_commands_or_subagents, kill_command_or_subagent, "
-    "Agent(aicontrols:hand)\n"
+    "tools: search_tool, use_tool, read_file, grep, web_search, web_fetch, image_gen, image_edit, image_to_video, "
+    "reference_to_video, spawn_subagent, get_command_or_subagent_output, wait_commands_or_subagents, "
+    "kill_command_or_subagent, Agent(aicontrols:hand)\n"
     "---\n";
 
 constexpr const char* kHand =
     "---\n"
     "name: hand\n"
-    "description: Helper for this AIControls chat. Files and commands go through search_tool and use_tool.\n"
-    "tools: search_tool, use_tool, web_search, web_fetch, image_gen, image_edit, image_to_video, reference_to_video\n"
+    "description: Helper for this AIControls chat. It reads and searches files itself; commands and writes go through search_tool and use_tool.\n"
+    "tools: search_tool, use_tool, read_file, grep, web_search, web_fetch, image_gen, image_edit, image_to_video, reference_to_video\n"
     "mcpInheritance: all\n"
     "---\n"
     "\n"
-    "You are a helper inside an AIControls chat. You have no filesystem tools and no shell of your own.\n"
-    "Files, commands and servers go through search_tool and use_tool only. Those calls wait for the user.\n"
+    "You are a helper inside an AIControls chat. You may read files with read_file and search them with grep.\n"
+    "Commands, writes and servers go through search_tool and use_tool only. Those calls wait for the user.\n"
     "Report a short result to the parent. Do not spawn agents.\n";
 
 constexpr const char* kPluginJson = "{\"name\":\"aicontrols\"}\n";
@@ -123,6 +123,43 @@ std::string OutputText(const Json& rawOutput) {
     return rawOutput.is_null() ? std::string() : rawOutput.dump(-1, ' ', false, Json::error_handler_t::replace);
 }
 
+// read_file and grep announce themselves on the first update that names them. A later update often keeps only
+// the id and a title like "Read `path`".
+std::string NativeToolName(const Json& update) {
+    const std::string named = JsonStr(JsonAt(JsonAt(update, "_meta"), "x.ai/tool"), "name");
+    if (GrokNativeRead(named)) {
+        return named;
+    }
+    if (const std::string title = JsonStr(update, "title"); GrokNativeRead(title)) {
+        return title;
+    }
+    const std::string variant = JsonStr(JsonAt(update, "rawInput"), "variant");
+    if (variant == "ReadFile") {
+        return "read_file";
+    }
+    if (variant == "Grep") {
+        return "grep";
+    }
+    return {};
+}
+
+Json NativeReadInput(const Json& update) {
+    Json input = JsonAt(update, "rawInput");
+    if (!input.is_object()) {
+        input = Json::object();
+    }
+    const Json& extra = JsonAt(JsonAt(JsonAt(update, "_meta"), "x.ai/tool"), "input");
+    if (!extra.is_object()) {
+        return input;
+    }
+    for (const auto& [key, value] : extra.items()) {
+        if (!input.contains(key) || input[key].is_null()) {
+            input[key] = value;
+        }
+    }
+    return input;
+}
+
 long long Number(const Json& object, const char* key) {
     const Json& value = JsonAt(object, key);
     return value.is_number() ? value.get<long long>() : 0;
@@ -156,6 +193,7 @@ void GrokProcess::Start(const ClaudeOptions& options, MessageHandler onMessage, 
         pendingModel_.clear();
         textOpen_ = false;
         permissions_.clear();
+        nativeReads_.clear();
         refusals_.clear();
         mcp_.clear();
     }
@@ -593,19 +631,47 @@ void GrokProcess::OnUpdate(const Json& update) {
         if (JsonStr(content, "type") == "text") {
             EmitText(JsonStr(content, "text"));
         }
-    } else if (type == "tool_call") {
+        return;
+    }
+    if (type != "tool_call" && type != "tool_call_update") {
+        return;
+    }
+    const std::string id = JsonStr(update, "toolCallId");
+    const std::string own = NativeToolName(update);
+    bool show = false;
+    bool native = false;
+    {
         std::lock_guard lock(stateMutex_);
         textOpen_ = false;  // what is said after the call is a new message
-    } else if (type == "tool_call_update") {
-        const std::string status = JsonStr(update, "status");
-        const Json& action = JsonAt(JsonAt(update, "rawOutput"), "action");
-        if (JsonStr(action, "type") == "search") {  // a web search, done on xAI's side: no card, a line in the feed
-            if (status == "completed") {
-                Emit(Json{{"type", "aic_tool"}, {"name", "web_search"}, {"input", action}});
+        const auto known = std::ranges::find(nativeReads_, id);
+        native = GrokNativeRead(own) || (!id.empty() && known != nativeReads_.end());
+        if (GrokNativeRead(own) && (id.empty() ? type == "tool_call" : known == nativeReads_.end())) {
+            if (!id.empty()) {
+                nativeReads_.push_back(id);
             }
-        } else if (status == "completed" || status == "failed") {
-            EmitToolResult(update);
+            show = true;
         }
+        if (native && type == "tool_call_update" && !id.empty()) {
+            const std::string status = JsonStr(update, "status");
+            if (status == "completed" || status == "failed") {
+                std::erase(nativeReads_, id);
+            }
+        }
+    }
+    if (show) {  // one line, when the call is named; the result has no card to land on
+        Emit(Json{{"type", "aic_tool"}, {"name", own}, {"input", NativeReadInput(update)}});
+    }
+    if (native || type != "tool_call_update") {
+        return;
+    }
+    const std::string status = JsonStr(update, "status");
+    const Json& action = JsonAt(JsonAt(update, "rawOutput"), "action");
+    if (JsonStr(action, "type") == "search") {  // a web search, done on xAI's side: no card, a line in the feed
+        if (status == "completed") {
+            Emit(Json{{"type", "aic_tool"}, {"name", "web_search"}, {"input", action}});
+        }
+    } else if (status == "completed" || status == "failed") {
+        EmitToolResult(update);
     }
 }
 

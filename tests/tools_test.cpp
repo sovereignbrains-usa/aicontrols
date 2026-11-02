@@ -241,6 +241,21 @@ int main() {
     Expect(aic::GrokToolName("grok__image_gen") == "image_gen" && aic::GrokToolName("grok__bash").empty() &&
                aic::GrokToolName("image_gen").empty() && aic::OwnToolName("grok__image_gen").empty(),
            "GrokToolName: only the web and Imagine");
+    Expect(aic::GrokNativeRead("read_file") && aic::GrokNativeRead("grep") && !aic::GrokNativeRead("image_gen") &&
+               !aic::GrokNativeRead("bash") && !aic::GrokNativeRead("search_replace"),
+           "native reads: a line, not a card");
+    {
+        const aic::ToolSummary read =
+            aic::SummarizeTool("read_file", {{"target_file", "C:\\a.cpp"}, {"offset", 10}});
+        const aic::ToolSummary found =
+            aic::SummarizeTool("grep", {{"pattern", "main"}, {"path", "src"}, {"glob", "*.cpp"}});
+        Expect(read.title == L"Прочитать файл" && read.detail.find(L"C:\\a.cpp") != std::wstring::npos &&
+                   read.detail.find(L"со строки 10") != std::wstring::npos,
+               "a native read names the file and the line", aic::ToUtf8(read.detail));
+        Expect(found.title == L"Найти в файлах" && found.detail.find(L"main") != std::wstring::npos &&
+                   found.detail.find(L"src") != std::wstring::npos && found.detail.find(L"*.cpp") != std::wstring::npos,
+               "a native search names the pattern", aic::ToUtf8(found.detail));
+    }
     Expect(aic::AutoAllows("image_gen", {{"prompt", "a fish"}}) && !aic::AutoAllows("image_to_video", {{"prompt", "a"}}) &&
                !aic::AutoAllows("web_fetch", {{"url", "https://x"}}) && aic::ToolNeedsApproval("image_gen"),
            "Auto draws pictures; videos and pages still ask");
