@@ -24,6 +24,7 @@ using std::max;
 #pragma comment(lib, "uxtheme.lib")
 
 #include "core/claude_process.h"
+#include "core/journal.h"
 
 namespace aic {
 namespace {
@@ -70,6 +71,7 @@ void BrowserView::Fail(const std::string& why, HRESULT code) {
         if (FAILED(code)) {
             failure_ += std::format(" (0x{:08X})", static_cast<unsigned>(code));
         }
+        JournalWrite("браузер", ToWide(failure_));  // the browser tab's failures go to the journal too
     }
     creating_ = false;
     changed_.notify_all();
@@ -261,7 +263,7 @@ std::wstring BrowserView::ResolveAddress(std::wstring text) {
                 query += std::format(L"%{:02X}", byte);
             }
         }
-        return L"https://yandex.ru/search/?text=" + query;
+        return L"https://www.startpage.com/sp/search?query=" + query;  // his choice (03.11.2026): Startpage, not Yandex
     }
     if (!hasScheme) {
         text = L"https://" + text;

@@ -34,6 +34,7 @@ add_library(aic_core STATIC
   src/core/github.cpp
   src/core/grok_process.cpp
   src/core/highlight.cpp
+  src/core/journal.cpp
   src/core/loopback_server.cpp
   src/core/markdown.cpp
   src/core/memory_writer.cpp
@@ -42,6 +43,7 @@ add_library(aic_core STATIC
   src/core/pty.cpp
   src/core/secrets.cpp
   src/core/store.cpp
+  src/core/title_writer.cpp
   src/core/tools.cpp
   src/core/usage.cpp
   src/core/vt_screen.cpp

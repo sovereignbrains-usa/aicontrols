@@ -94,10 +94,15 @@ std::wstring PromptTitle(const std::wstring& prompt) {
         at = end + 1;
     }
     std::wstring title = titled.empty() ? attached : titled;
-    // The header and the row trim this once, on a word. Cutting it here too (it used to stop at 70 and add an
-    // ellipsis) put a second ellipsis in the middle of a word: the list is narrower than those 70 characters,
-    // and the tip had nothing but the stub.
-    constexpr size_t kLongest = 400;
+    // Only until Haiku names the chat by what it is about (title_writer): the first sentence of it, not a whole
+    // paragraph, shortened on a word. The row trims it again to its width; the tip shows this.
+    for (size_t at = title.find_first_of(L".?!"); at != std::wstring::npos; at = title.find_first_of(L".?!", at + 1)) {
+        if (at >= 12 && at + 1 < title.size() && title[at + 1] == L' ') {
+            title.resize(title[at] == L'.' ? at : at + 1);  // a question keeps its mark
+            break;
+        }
+    }
+    constexpr size_t kLongest = 80;
     if (title.size() > kLongest) {
         size_t cut = title.find_last_of(L" \t", kLongest);
         if (cut == std::wstring::npos || cut < 40) {
@@ -1440,6 +1445,59 @@ bool RenameSession(const std::wstring& workspace, const std::string& id, const s
     line += '\n';
     std::ofstream out(file, std::ios::binary | std::ios::app);
     out.write(line.data(), static_cast<std::streamsize>(line.size()));  // one write: the CLI may append too
+    return out.good();
+}
+
+bool HasOwnTitle(const std::wstring& workspace, const std::string& id) {
+    if (id.empty() || id.find_first_of("/\\.:") != std::string::npos) {
+        return true;  // nothing to name
+    }
+    {
+        const std::lock_guard lock(g_chatsMutex);
+        if (RecordOf(Chats(), id) != nullptr) {
+            return true;  // a chat in parts: its record's title or its first part's
+        }
+    }
+    const fs::path file = SessionFile(workspace, id);
+    std::error_code error;
+    if (fs::exists(file, error)) {
+        const uint64_t size = fs::file_size(file, error);
+        if (error) {
+            return true;
+        }
+        constexpr uint64_t kChunk = 512 * 1024;
+        std::wstring custom;
+        std::wstring generated;
+        ScanTitles(ReadRange(file, 0, std::min(size, kChunk)), custom, generated);
+        if (size > kChunk) {
+            ScanTitles(ReadRange(file, size - kChunk, kChunk), custom, generated);
+        }
+        return !custom.empty() || !generated.empty();
+    }
+    const fs::path grok = GrokSessionDir(workspace, id);
+    return grok.empty() || !fs::exists(grok / kGrokHistory, error) || fs::exists(grok / kGrokTitle, error);
+}
+
+bool SetGeneratedTitle(const std::wstring& workspace, const std::string& id, const std::wstring& title) {
+    if (id.empty() || id.find_first_of("/\\.:") != std::string::npos || title.empty() ||
+        HasOwnTitle(workspace, id)) {
+        return false;  // a title given meanwhile stays
+    }
+    const fs::path file = SessionFile(workspace, id);
+    std::error_code error;
+    if (!fs::exists(file, error)) {
+        const fs::path grok = GrokSessionDir(workspace, id);
+        const std::string text = ToUtf8(title);
+        std::ofstream out(grok / kGrokTitle, std::ios::binary | std::ios::trunc);
+        out.write(text.data(), static_cast<std::streamsize>(text.size()));
+        return out.good();
+    }
+    // As the CLI's own generated title: a custom-title (a rename) is read above it.
+    std::string line = Json{{"type", "ai-title"}, {"aiTitle", ToUtf8(title)}, {"sessionId", id}}.dump(
+        -1, ' ', false, Json::error_handler_t::replace);
+    line += '\n';
+    std::ofstream out(file, std::ios::binary | std::ios::app);
+    out.write(line.data(), static_cast<std::streamsize>(line.size()));
     return out.good();
 }
 

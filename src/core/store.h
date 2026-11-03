@@ -192,6 +192,11 @@ bool MoveSession(const std::wstring& from, const std::wstring& to, const std::st
 // (the newest one wins, over the generated title too). Grok's: a file of ours in its folder, its own left as they are.
 // A chat in parts takes it in chats.json too: its title is otherwise its first part's.
 bool RenameSession(const std::wstring& workspace, const std::string& id, const std::wstring& title);
+// Whether a chat is named other than by its first message: a rename, a generated title, a chat in parts.
+bool HasOwnTitle(const std::wstring& workspace, const std::string& id);
+// A title from what the chat is about (title_writer), kept as the CLI's generated one: below a rename, and not
+// written if the chat has a title of its own by now.
+bool SetGeneratedTitle(const std::wstring& workspace, const std::string& id, const std::wstring& title);
 
 // The chats' own index, %APPDATA%\AIControls\chats.json: which sessions are one chat, and when each was last used.
 // A message sent in chat `id` at `ticks` (FILETIME): it goes up the list, and stays put whatever the CLI does to its

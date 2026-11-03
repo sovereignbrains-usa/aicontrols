@@ -9,7 +9,9 @@
 #include <vector>
 
 #include "core/chat_export.h"
+#include "core/journal.h"
 #include "core/store.h"
+#include "core/title_writer.h"
 
 namespace {
 
@@ -64,9 +66,56 @@ int main() {
         const std::wstring whole(sentence.begin(), sentence.end());
         const auto listed = aic::ListSessions(a);
         const auto found = std::ranges::find_if(listed, [](const aic::SessionInfo& s) { return s.id == "chat-long"; });
-        Expect(found != listed.end() && found->title == whole && whole.size() > 70 &&
-                   found->title.find(L"\u2026") == std::wstring::npos,
-               "a long first line stays whole, so the row's own ellipsis is the only cut");
+        Expect(found != listed.end() && whole.size() > 80 && found->title.size() <= 81 &&
+                   found->title.back() == 0x2026 && whole.starts_with(found->title.substr(0, found->title.size() - 1)) &&
+                   found->title[found->title.size() - 2] != L' ',
+               "a long first line is cut on a word, one ellipsis");
+        std::ofstream(historyA / L"chat-sentence.jsonl")
+            << "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"Fix the sidebar scrolling. It jumps "
+               "when a chat is added and the list is long.\"}}\n";
+        const auto again = aic::ListSessions(a);
+        const auto sentence1 = std::ranges::find_if(again, [](const aic::SessionInfo& s) { return s.id == "chat-sentence"; });
+        Expect(sentence1 != again.end() && sentence1->title == L"Fix the sidebar scrolling",
+               "the first line's first sentence, without its full stop");
+        Expect(!aic::HasOwnTitle(a, "chat-sentence") &&
+                   aic::SetGeneratedTitle(a, "chat-sentence", L"Прокрутка списка чатов") &&
+                   aic::SessionTitle(a, "chat-sentence") == L"Прокрутка списка чатов" &&
+                   aic::HasOwnTitle(a, "chat-sentence") &&
+                   !aic::SetGeneratedTitle(a, "chat-sentence", L"Другое"),
+               "a generated title is kept once and read");
+        Expect(aic::RenameSession(a, "chat-sentence", L"Моё") && aic::SessionTitle(a, "chat-sentence") == L"Моё",
+               "a rename is above the generated title");
+    }
+    Expect(aic::CleanTitle("«Прокрутка списка чатов».\n\nПояснение") == L"Прокрутка списка чатов" &&
+               aic::CleanTitle("Название: Сборка установщика") == L"Сборка установщика" &&
+               aic::CleanTitle("").empty() &&
+               aic::CleanTitle(std::string(200, 'a')).size() == aic::kTitleLongest + 1,
+           "the model's answer as a title");
+    {  // the failures journal, in a scratch folder (not the user's)
+        const fs::path folder = temp / L"aic_journal_test";
+        fs::remove_all(folder, error);
+        aic::SetJournalFolder(folder.wstring());
+        aic::JournalWrite("чат", L"Первый сбой");
+        aic::JournalWrite("браузер", L"Второй");
+        const auto entries = aic::ReadJournal();
+        Expect(entries.size() == 2 && entries.front().source == "чат" && entries.back().text == L"Второй",
+               "the journal reads back, in the order written");
+        Expect(aic::JournalUnseen() == 2, "both are not seen");
+        aic::MarkJournalSeen();
+        Expect(aic::JournalUnseen() == 0, "seen after a look");
+        Expect(aic::WriteJournalPage() && fs::exists(aic::JournalPage()) &&
+                   ReadAll(aic::JournalPage()).find("Первый сбой") != std::string::npos,
+               "its page has the entries");
+        const std::wstring report =
+            L"EventType=BEX64\r\nSig[0].Value=aicontrols.exe\r\nSig[1].Value=0.1.98.0\r\nSig[2].Value=6ae8eed4\r\n"
+            L"Sig[3].Value=aicontrols.exe\r\nSig[4].Value=0.1.98.0\r\nSig[5].Value=6ae8eed4\r\n"
+            L"Sig[6].Value=00000000001a822d\r\nSig[7].Value=c0000409\r\nSig[8].Value=0000000000000007\r\n"
+            L"AppPath=C:\\Users\\user\\AppData\\Local\\Programs\\AIControls\\aicontrols.exe\r\n";
+        const std::wstring summary = aic::CrashSummary(report);
+        Expect(summary.find(L"c0000409") != std::wstring::npos && summary.find(L"0x1a822d") != std::wstring::npos,
+               "a crash report is summed up");
+        Expect(aic::CrashSummary(L"EventType=WindowsUpdateFailure\r\n").empty(), "not a crash: nothing");
+        fs::remove_all(folder, error);
     }
     Expect(!aic::MoveSession(a, b, "chat-1"), "a chat that is not there is not moved");
     Expect(!aic::MoveSession(b, b, "chat-1"), "nor to its own project");

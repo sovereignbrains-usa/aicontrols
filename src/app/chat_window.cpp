@@ -54,6 +54,8 @@
 #include "core/github.h"
 #include "core/markdown.h"
 #include "core/memory_writer.h"
+#include "core/title_writer.h"
+#include "core/journal.h"
 #include "core/model_router.h"
 #include "core/pty.h"
 #include "core/secrets.h"
@@ -110,6 +112,7 @@ constexpr UINT kUsage = WM_APP + 15;        // PlanUsage*: the plan's limits as 
 constexpr UINT kMemorySaved = WM_APP + 14;  // MemorySave*: the memory committed and pushed
 constexpr UINT kGithubDone = WM_APP + 17;   // GithubDone*: the token checked, or the browser's sign-in ended
 constexpr UINT kBrowserTask = WM_APP + 18;  // std::function<void()>*: the browser tool's work for this thread
+constexpr UINT kChatTitled = WM_APP + 19;   // Haiku named a chat: the list reads its title again
 
 struct GithubDone {
     bool check = false;     // the saved token asked of the API, not a sign-in
@@ -598,6 +601,7 @@ enum class Target {
     PermissionChip,  // what the tools may do without a card
     UsageChip,
     Secrets,       // the sidebar's entry that opens the secrets
+    Journal,       // ... and its bug beside it: the failures journal
     SecretsClose,  // ... and the way back to the chats
     SecretRow,     // row: an index into the secrets' names
     SecretDelete,  // row: the same
@@ -660,6 +664,7 @@ struct Geometry {
     D2D1_RECT_F winClose{};
     D2D1_RECT_F sideToggle{};   // the header's button that shows or hides the sidebar
     D2D1_RECT_F secrets{};     // the sidebar's entry for the secrets
+    D2D1_RECT_F journal{};     // the bug left of it: the failures journal
     D2D1_RECT_F panel{};       // the secrets view: the sidebar itself while it is open
     D2D1_RECT_F panelClose{};
     D2D1_RECT_F nameField{};
@@ -1564,6 +1569,13 @@ private:
     std::thread voiceThread_;
     std::atomic<bool> usageRunning_ = false;
     std::thread memoryThread_;
+    size_t journalUnseen_ = 0;  // the bug's red dot: entries since the journal was last opened
+    void OpenJournal();
+    std::thread titleThread_;  // Haiku naming a chat after its first answer (title_writer)
+    std::atomic<bool> titleCancel_ = false;
+    std::atomic<bool> titling_ = false;
+    std::set<std::string> titled_;  // asked once a run: a chat Haiku could not name keeps its first line
+    void NameChat();
     bool updatePending_ = false;  // asked while Claude was answering: done when the turn ends
     bool previewWide_ = false;
     float wideSavedTerminal_ = kTerminal;  // the widths to go back to
@@ -1851,6 +1863,10 @@ int ChatWindow::Run(int show) {
         Add(Kind::Error, L"Встроенные шрифты не загрузились — показываю системным.");
     }
     RefreshSessions();
+    if (!gallery_) {  // crashes Windows saw since the last start go into the journal; the bug lights for them
+        ImportCrashReports();
+        journalUnseen_ = JournalUnseen();
+    }
     if (gallery_) {  // samples only: no CLI, no network, nothing written
         FillGallery();
         // For checking the browser tab by eye and by file: the address in AIC_GALLERY_BROWSER is opened through the
@@ -2102,6 +2118,20 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
     }
     case kBrowserTask:
         BrowserView::RunTask(lParam);
+        return 0;
+    case kChatTitled:
+        if (titleThread_.joinable()) {
+            titleThread_.join();
+        }
+        journalUnseen_ = JournalUnseen();  // a title that failed is in the journal
+        if (!sessionId_.empty()) {
+            const std::vector<SessionInfo> listed = ListSessions(workspace_);
+            const auto chat = std::ranges::find_if(listed, [&](const SessionInfo& s) { return SameChat(s, sessionId_); });
+            if (chat != listed.end() && !chat->title.empty()) {
+                title_ = chat->title;
+            }
+        }
+        ListChanged();
         return 0;
     case WM_NCCALCSIZE:
         // No system caption: the header is the title bar. The side and bottom frames stay (they are the
@@ -2962,6 +2992,10 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         if (memoryThread_.joinable()) {  // a push under way finishes: what was saved is not cut in half
             memoryThread_.join();
         }
+        titleCancel_ = true;
+        if (titleThread_.joinable()) {
+            titleThread_.join();
+        }
         cloneCancel_ = true;
         if (cloneThread_.joinable()) {
             cloneThread_.join();
@@ -3183,6 +3217,9 @@ void ChatWindow::OnClick(float x, float y) {
     case Target::Secrets:
         SetSecretsOpen(true);
         keepFocus = true;
+        break;
+    case Target::Journal:
+        OpenJournal();
         break;
     case Target::SecretsClose:
         SetSecretsOpen(false);
@@ -3557,7 +3594,8 @@ Geometry ChatWindow::Layout() const {
         // At the bottom, the settings' end: the secrets over the account.
         // The account's row with the secrets' padlock at its right end, as Claude's app keeps its small button there.
         g.secrets = D2D1::RectF(sidebarWidth - 6 - 34, g.height - 6 - 34, sidebarWidth - 6, g.height - 6);
-        g.account = D2D1::RectF(6, g.secrets.top, g.secrets.left - 2, g.secrets.bottom);
+        g.journal = D2D1::RectF(g.secrets.left - 2 - 34, g.secrets.top, g.secrets.left - 2, g.secrets.bottom);
+        g.account = D2D1::RectF(6, g.secrets.top, g.journal.left - 2, g.secrets.bottom);
         g.listTop = g.search.bottom + 6;
         g.listBottom = g.account.top - 10;
         if (update_) {
@@ -3750,6 +3788,9 @@ Hit ChatWindow::HitTest(float x, float y) const {
         }
         if (Inside(g.secrets, x, y)) {
             return {Target::Secrets};
+        }
+        if (Inside(g.journal, x, y)) {
+            return {Target::Journal};
         }
         if (Inside(g.update, x, y)) {  // over the account; the header's check below is only for a hidden sidebar
             return {Target::Update};
@@ -7990,6 +8031,32 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
         Line({c.x, c.y + 2.f}, {c.x, c.y + 4.f}, color, 1.5f);
     }
 
+    {  // the failures journal: a bug, with a red dot while something in it is not seen
+        const bool active = hover_.target == Target::Journal;
+        if (active) {
+            Fill(g.journal, 8.f, kRaised);
+        }
+        const uint32_t color = active ? kPrimary : kSecondary;
+        const D2D1_POINT_2F c{(g.journal.left + g.journal.right) / 2, (g.journal.top + g.journal.bottom) / 2 + 1.f};
+        brush_->SetColor(Color(color));
+        target_->DrawEllipse(D2D1::Ellipse(c, 4.f, 5.5f), brush_.get(), 1.4f);  // the body
+        Line({c.x, c.y - 4.5f}, {c.x, c.y + 5.f}, color, 1.1f);                   // its wings' seam
+        target_->FillEllipse(D2D1::Ellipse({c.x, c.y - 6.5f}, 2.2f, 1.8f), brush_.get());  // the head
+        for (const float side : {-1.f, 1.f}) {
+            Line({c.x + side * 1.2f, c.y - 8.f}, {c.x + side * 3.f, c.y - 10.f}, color, 1.1f);  // feelers
+            Line({c.x + side * 4.f, c.y - 2.f}, {c.x + side * 7.f, c.y - 4.f}, color, 1.2f);   // the legs
+            Line({c.x + side * 4.f, c.y + 1.f}, {c.x + side * 7.5f, c.y + 1.f}, color, 1.2f);
+            Line({c.x + side * 4.f, c.y + 4.f}, {c.x + side * 7.f, c.y + 6.5f}, color, 1.2f);
+        }
+        if (journalUnseen_ > 0) {
+            const D2D1_POINT_2F dot{g.journal.right - 9.f, g.journal.top + 9.f};
+            brush_->SetColor(Color(active ? kRaised : kPanel));  // a ring of the ground, so it reads apart from the legs
+            target_->FillEllipse(D2D1::Ellipse(dot, 4.5f, 4.5f), brush_.get());
+            brush_->SetColor(Color(kDanger));
+            target_->FillEllipse(D2D1::Ellipse(dot, 3.f, 3.f), brush_.get());
+        }
+    }
+
     if (rows_.empty()) {
         Text(L"Ничего не найдено", ui_.get(),
              D2D1::RectF(g.sidebar.left + 16, g.listTop, g.sidebar.right - 10, g.listTop + kHistoryRow), kSecondary);
@@ -10128,6 +10195,12 @@ void ChatWindow::OnPreviewMessage(const std::wstring& message) {
             SetPreviewWide(!previewWide_);
         } else if (command == "minimize") {
             ShowWindow(hwnd_, SW_MINIMIZE);
+        } else if (command == "journal-chat" && tab->preview == JournalPage()) {  // only the journal's own page
+            const std::wstring text = L"Разбери сбои из журнала AIControls (" + JournalFile() + L"):\n\n" + JournalText();
+            termFocus_ = false;
+            SetFocus(input_);
+            SendMessageW(input_, EM_REPLACESEL, TRUE, reinterpret_cast<LPARAM>(text.c_str()));
+            Flash(L"Журнал в сообщении: отправь, когда допишешь");
         }
         return;
     }
@@ -10284,6 +10357,46 @@ void ChatWindow::SaveMemoryNow() {
         }
     });
     Refresh();
+}
+
+// After an answer: a chat still named by its first line gets a title from what it is about. One at a time, once
+// a run; the user's own title (a rename, meanwhile too) is never replaced.
+void ChatWindow::OpenJournal() {
+    ImportCrashReports();  // a crash of a client still open beside this one, or one since the start
+    MarkJournalSeen();
+    journalUnseen_ = 0;
+    if (!WriteJournalPage()) {
+        Flash(L"Журнал не открылся: не записать " + JournalPage());
+        return;
+    }
+    OpenPreview(JournalPage());
+    Refresh();
+}
+
+void ChatWindow::NameChat() {
+    if (sessionId_.empty() || titling_ || titled_.contains(sessionId_) || HasOwnTitle(workspace_, sessionId_)) {
+        return;
+    }
+    if (titleThread_.joinable()) {
+        titleThread_.join();
+    }
+    titled_.insert(sessionId_);
+    titling_ = true;
+    const HWND hwnd = hwnd_;
+    const std::wstring workspace = workspace_;
+    const std::string session = sessionId_;
+    titleThread_ = std::thread([this, hwnd, workspace, session] {
+        const TitleWrite named = GenerateChatTitle(workspace, session, &titleCancel_);
+        if (named.ok && !titleCancel_) {
+            SetGeneratedTitle(workspace, session, named.title);
+        } else if (!named.ok && !titleCancel_ && named.error != "no message") {  // the chat keeps its first phrase
+            JournalWrite("названия", L"Название чата не придумалось: " + ToWide(named.error));
+        }
+        titling_ = false;
+        if (!titleCancel_) {
+            PostMessageW(hwnd, kChatTitled, 0, 0);
+        }
+    });
 }
 
 void ChatWindow::OnMemorySaved(const MemorySave& saved) {
@@ -10671,6 +10784,8 @@ std::wstring ChatWindow::TooltipText() {
         return L"Лимиты использования";
     case Target::Secrets:
         return L"Секреты";
+    case Target::Journal:
+        return journalUnseen_ > 0 ? std::format(L"Журнал сбоев: новых {}", journalUnseen_) : std::wstring(L"Журнал сбоев");
     case Target::SecretsClose:
         return L"Назад к чатам";
     case Target::SecretEye:
@@ -10952,6 +11067,8 @@ D2D1_RECT_F ChatWindow::TipAnchor(const Geometry& g) const {
         break;
     case Target::Secrets:
         return g.secrets;
+    case Target::Journal:
+        return g.journal;
     case Target::SecretsClose:
         return g.panelClose;
     case Target::SecretEye:
@@ -13250,6 +13367,7 @@ void ChatWindow::OnClaude(const Json& message) {
                 title_ = chat->title;
             }
             ListChanged();  // a new chat appears in the list, a title may have changed
+            NameChat();
         }
     } else if (type == "aic_usage") {  // Grok's plan: what _x.ai/billing answered
         const PlanUsage usage = ParseGrokBilling(JsonAt(message, "billing").dump());
@@ -13504,6 +13622,10 @@ void ChatWindow::Add(Kind kind, std::wstring text, bool leading) {
     item.kind = kind;
     item.leading = leading;
     item.text = kind == Kind::Assistant || kind == Kind::Error ? LimitInMoscow(text) : std::move(text);  // a spent limit: his clock
+    if (kind == Kind::Error && !gallery_) {  // every red line also goes to the failures journal
+        JournalWrite("чат", item.text);
+        journalUnseen_ = JournalUnseen();
+    }
     feed_.push_back(std::move(item));
     Refresh();
 }
@@ -13518,6 +13640,19 @@ void ChatWindow::FillGallery() {
         connectRow_ = kGrokLink;
         connectOpen_ = true;
         return;
+    }
+    {  // the failures journal: its own scratch folder with a sample of each kind, so the bug has its dot
+        wchar_t temp[MAX_PATH]{};
+        GetTempPathW(MAX_PATH, temp);
+        const std::filesystem::path folder = std::filesystem::path(temp) / L"aicontrols-gallery-journal";
+        std::error_code error;
+        std::filesystem::remove_all(folder, error);
+        SetJournalFolder(folder.wstring());
+        JournalWrite("чат", L"Claude завершился с кодом 1: stderr «API Error: 529 overloaded»");
+        JournalWrite("браузер", L"Окно браузера не создалось (0x80004005)");
+        JournalWrite("сбой", L"Клиент упал: c0000409 — аварийный выход (__fastfail: std::terminate, переполнение буфера, "
+                             L"неверный параметр)\nв aicontrols.exe+0x1a822d, сборка 6ae8eed4.");
+        journalUnseen_ = JournalUnseen();
     }
     const std::wstring longPath =
         L"C:\\Users\\user\\.claude\\projects\\C--Users-user-AppData-Roaming-ssh-desktop-app-claude-workspace\\memory\\project_aicontrols.md";
