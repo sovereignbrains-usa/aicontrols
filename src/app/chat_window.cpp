@@ -1888,6 +1888,19 @@ int ChatWindow::Run(int show) {
                 break;
             }
         }
+    } else {
+        // After a crash or a plain start: the project's latest chat, not an empty "Новый чат" row that vanishes
+        // the moment another chat is opened (03.11.2026, his: 'открывается новый чат в проекте ... пропадает').
+        for (const Project& project : projects_) {
+            if (project.folder != workspace_ || project.sessions.empty()) {
+                continue;
+            }
+            const auto latest = std::ranges::max_element(project.sessions, {}, [](const SessionInfo& s) {
+                return FileTicks(s.modified);
+            });
+            OpenChat(project.folder, *latest);
+            break;
+        }
     }
     CheckAppUpdate();
     SetTimer(hwnd_, kUpdateTimer, kUpdateCheck, nullptr);

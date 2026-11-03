@@ -1017,10 +1017,11 @@ ToolResult Tools::Execute(const std::string& name, const Json& input, const std:
 
 std::wstring Tools::Resolve(const std::string& path) const {
     fs::path p(ToWide(path));
+    const std::wstring cwd = Cwd();
     if (p.empty()) {
-        return cwd_;
+        return cwd;
     }
-    return p.is_relative() ? (fs::path(cwd_) / p).wstring() : p.wstring();
+    return p.is_relative() ? (fs::path(cwd) / p).wstring() : p.wstring();
 }
 
 ToolResult Tools::RunCommand(const Json& input, const std::atomic<bool>& cancel) const {
@@ -1195,7 +1196,8 @@ std::vector<std::wstring> Tools::Projects(const std::string& project) const {
     if (!project.empty()) {
         return {Resolve(project)};
     }
-    std::vector<std::wstring> folders{cwd_};
+    std::vector<std::wstring> folders;
+    folders.push_back(Cwd());
     for (std::wstring folder : LoadSettings().projects) {
         folders.push_back(std::move(folder));
     }
@@ -1246,9 +1248,10 @@ ToolResult Tools::ListChats(const Json& input) const {
     const std::string project = StringArg(input, "project");
     const size_t most = project.empty() ? 20 : 200;
     std::string out;
+    const std::wstring cwd = Cwd();
     for (const std::wstring& folder : Projects(project)) {
         const std::vector<SessionInfo> sessions = ListSessions(folder);
-        out += ToUtf8(folder) + (folder == cwd_ ? "  (this chat's project)" : "") + "\n";
+        out += ToUtf8(folder) + (folder == cwd ? "  (this chat's project)" : "") + "\n";
         if (sessions.empty()) {
             out += "  no chats\n";
         }

@@ -69,7 +69,15 @@ public:
     // Blocks until done; `cancel` stops a running command. Output is scrubbed of secret values.
     ToolResult Execute(const std::string& name, const Json& input, const std::atomic<bool>& cancel) const;
 
-    void SetCwd(std::wstring cwd) { cwd_ = std::move(cwd); }
+    // The chat's folder changes on the window's thread while tool calls read it on theirs.
+    void SetCwd(std::wstring cwd) {
+        std::lock_guard lock(cwdMutex_);
+        cwd_ = std::move(cwd);
+    }
+    std::wstring Cwd() const {
+        std::lock_guard lock(cwdMutex_);
+        return cwd_;
+    }
 
 private:
     ToolResult RunCommand(const Json& input, const std::atomic<bool>& cancel) const;
@@ -88,7 +96,8 @@ private:
     std::wstring Resolve(const std::string& path) const;
 
     SecretStore& secrets_;
-    std::wstring cwd_;
+    mutable std::mutex cwdMutex_;
+    std::wstring cwd_;  // guarded by cwdMutex_: use Cwd()
 };
 
 // Answers the CLI's mcp_message requests (initialize, tools/list, tools/call) for our server. A call runs
