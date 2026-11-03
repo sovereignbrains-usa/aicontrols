@@ -113,6 +113,8 @@ void BrowserView::EnsureHost() {
     static bool registered = false;
     if (!registered) {
         WNDCLASSW windowClass{};
+        // Redraw the whole bar on a resize: the pill's right end stayed behind at every old width (03.11.2026).
+        windowClass.style = CS_HREDRAW | CS_VREDRAW;
         windowClass.lpfnWndProc = HostProc;
         windowClass.hInstance = GetModuleHandleW(nullptr);
         windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
@@ -227,6 +229,7 @@ void BrowserView::ApplyPlace() {
         SetWindowPos(host_, front ? HWND_TOP : HWND_NOTOPMOST, origin.x, origin.y, width, height,
                      SWP_NOACTIVATE | SWP_SHOWWINDOW | (front ? 0 : SWP_NOZORDER));
         LayoutPage();
+        InvalidateRect(host_, nullptr, TRUE);
     }
 }
 
