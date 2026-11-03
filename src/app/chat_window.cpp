@@ -1112,12 +1112,14 @@ private:
         std::wstring preview;      // the preview tab (one at most, no shell): the HTML file it shows
         bool browser = false;      // a browser tab (no shell). Page 0 is the one the tool drives
         int browserPage = 0;       // which page of the browser this tab shows; the "+" opens 1, 2, ...
+        std::string server;        // user@host[:port]: the tab runs ssh to it instead of PowerShell
     };
     TermTab* Tab() const { return activeTab_ < tabs_.size() ? tabs_[activeTab_].get() : nullptr; }
     VtScreen* Screen() const { return Tab() != nullptr ? Tab()->screen.get() : nullptr; }
     TermTab* TabById(WPARAM id) const;
     void TerminalGrid(int& cols, int& rows) const;
-    void AddTerminalTab();
+    void AddTerminalTab(const std::string& server = {});  // a server: ssh to it, no host-key questions
+    void ShowTermAddMenu(POINT screen);                   // "+" at a shell: a new one, or a stored server
     void AddBrowserTab();  // another page, beside the one the tool drives
     void StartShell(TermTab& tab);
     void CloseTerminalTab(size_t index);
@@ -3107,9 +3109,10 @@ void ChatWindow::OnClick(float x, float y) {
         if (Tab() != nullptr && Tab()->browser) {  // beside a browser: another browser, not a shell
             AddBrowserTab();
         } else {
-            AddTerminalTab();
-            SyncTerminalSize();
-            SelectTerminalTab(activeTab_);
+            const Geometry g = Layout();
+            POINT screen{ToPx(g.termAdd.left), ToPx(g.termAdd.bottom + 4.f)};
+            ClientToScreen(hwnd_, &screen);
+            ShowTermAddMenu(screen);
         }
         keepFocus = true;
         break;
@@ -5817,11 +5820,15 @@ std::wstring ChatWindow::TabLabel(const TermTab& tab) const {
     if (!tab.name.empty()) {
         return tab.name;
     }
+    if (!tab.server.empty()) {
+        return ToWide(tab.server);
+    }
     return std::format(L"Терминал {}", tab.number);
 }
 
-void ChatWindow::AddTerminalTab() {
+void ChatWindow::AddTerminalTab(const std::string& server) {
     auto tab = std::make_unique<TermTab>();
+    tab->server = server;
     int number = 1;  // the lowest number not in use; a browser's number is its own
     while (std::ranges::any_of(tabs_, [&](const auto& other) { return !other->browser && other->number == number; })) {
         ++number;
@@ -5853,18 +5860,42 @@ void ChatWindow::StartShell(TermTab& tab) {
     const HWND hwnd = hwnd_;
     wchar_t profile[MAX_PATH]{};
     GetEnvironmentVariableW(L"USERPROFILE", profile, MAX_PATH);
+    std::wstring command = L"powershell.exe -NoLogo";
+    std::vector<wchar_t> environment;
+    if (!tab.server.empty()) {  // just connect: a new host is not asked about, nothing is written to known_hosts
+        std::string host = tab.server;
+        std::string port;
+        if (const size_t colon = host.rfind(':'); colon != std::string::npos) {
+            port = host.substr(colon + 1);
+            host.resize(colon);
+        }
+        command = L"ssh.exe -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL -o LogLevel=ERROR "
+                  L"-o ServerAliveInterval=15 -o NumberOfPasswordPrompts=1";
+        if (!port.empty()) {
+            command += L" -p " + ToWide(port);
+        }
+        command += L" " + ToWide(host);
+        if (secrets_.Has("ssh " + tab.server)) {  // its password goes to ssh through SSH_ASKPASS, never typed
+            environment = MakeEnvironmentBlock({{L"SSH_ASKPASS", OwnExe()},
+                                                {L"SSH_ASKPASS_REQUIRE", L"force"},
+                                                {L"AIC_ASKPASS", ToWide("ssh " + tab.server)}});
+        }
+    }
     try {
         tab.pty->Start(
-            cols, rows, L"powershell.exe -NoLogo", profile,
+            cols, rows, command, profile,
             [hwnd, id](std::string bytes) {
                 auto payload = std::make_unique<std::string>(std::move(bytes));
                 if (PostMessageW(hwnd, kTermData, id, reinterpret_cast<LPARAM>(payload.get()))) {
                     payload.release();
                 }
             },
-            [hwnd, id](DWORD code) { PostMessageW(hwnd, kTermExit, id, static_cast<LPARAM>(code)); });
+            [hwnd, id](DWORD code) { PostMessageW(hwnd, kTermExit, id, static_cast<LPARAM>(code)); },
+            std::move(environment));
     } catch (const std::exception& e) {
-        tab.screen->Feed("\x1b[31m" + ToUtf8(L"Не удалось запустить PowerShell: ") + e.what() + "\x1b[0m");
+        tab.screen->Feed("\x1b[31m" + ToUtf8(tab.server.empty() ? L"Не удалось запустить PowerShell: "
+                                                                : L"Не удалось запустить ssh: ") +
+                         e.what() + "\x1b[0m");
         tab.exited = true;
     }
 }
@@ -11020,6 +11051,39 @@ void ChatWindow::PaintRenameField(const D2D1_RECT_F& r) {
 }
 
 // ---- Right-click menus --------------------------------------------------------------------------------
+
+// "+" at a shell: another PowerShell, or a server whose name is among the secrets ("ssh root@1.2.3.4[:port]", the
+// password in it, or none to use the keys). Connecting is plain ssh in a tab: no fingerprint questions.
+void ChatWindow::ShowTermAddMenu(POINT screen) {
+    std::vector<std::string> servers;
+    for (const std::string& name : secrets_.Names()) {
+        if (name.starts_with("ssh ") && ServerSecretName(name) == name) {
+            servers.push_back(name.substr(4));
+        }
+    }
+    constexpr UINT kShell = 1, kAdd = 2, kFirstServer = 10;
+    wil::unique_hmenu menu(CreatePopupMenu());
+    AppendMenuW(menu.get(), MF_STRING, kShell, L"Новый терминал");
+    if (!servers.empty()) {
+        AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
+    }
+    for (size_t i = 0; i < servers.size(); ++i) {
+        AppendMenuW(menu.get(), MF_STRING, kFirstServer + static_cast<UINT>(i), (L"Сервер " + ToWide(servers[i])).c_str());
+    }
+    AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu.get(), MF_STRING, kAdd, L"Добавить сервер…");
+    const int choice = Menu(menu.get(), screen);
+    if (choice == kAdd) {
+        Flash(L"Секреты → имя «ssh user@host» (или с :порт), пароль в значении; для входа по ключу — любое значение", 7000);
+        return;
+    }
+    if (choice == 0) {
+        return;
+    }
+    AddTerminalTab(choice == kShell ? std::string() : servers[static_cast<size_t>(choice) - kFirstServer]);
+    SyncTerminalSize();
+    SelectTerminalTab(activeTab_);
+}
 
 void ChatWindow::ShowTabMenu(size_t index, POINT screen) {
     if (index >= tabs_.size()) {

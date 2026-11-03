@@ -25,7 +25,7 @@ Pty::~Pty() {
 }
 
 void Pty::Start(int cols, int rows, const std::wstring& commandLine, const std::wstring& cwd, DataHandler onData,
-                ExitHandler onExit) {
+                ExitHandler onExit, std::vector<wchar_t> environment) {
     Stop();
     stopping_ = false;
     onData_ = std::move(onData);
@@ -76,7 +76,8 @@ void Pty::Start(int cols, int rows, const std::wstring& commandLine, const std::
     std::wstring command = commandLine;
     PROCESS_INFORMATION info{};
     if (!CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE,
-                        CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT, nullptr, cwd.empty() ? nullptr : cwd.c_str(),
+                        CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT | (environment.empty() ? 0 : CREATE_UNICODE_ENVIRONMENT),
+                        environment.empty() ? nullptr : environment.data(), cwd.empty() ? nullptr : cwd.c_str(),
                         &startup.StartupInfo, &info)) {
         ThrowLastError("CreateProcess");
     }

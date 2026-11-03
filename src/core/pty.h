@@ -8,6 +8,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <vector>
 
 #include <wil/resource.h>
 
@@ -26,8 +27,9 @@ public:
     Pty& operator=(const Pty&) = delete;
 
     // Throws std::runtime_error when the program cannot start.
+    // `environment` is a full block (MakeEnvironmentBlock); empty: the program gets ours.
     void Start(int cols, int rows, const std::wstring& commandLine, const std::wstring& cwd, DataHandler onData,
-               ExitHandler onExit);
+               ExitHandler onExit, std::vector<wchar_t> environment = {});
     // Ends the program (and what it started) and the reader; no handler runs after this returns.
     void Stop();
 
