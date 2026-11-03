@@ -304,7 +304,7 @@ LRESULT CALLBACK BrowserView::HostProc(HWND hwnd, UINT message, WPARAM wParam, L
     if (message == WM_CTLCOLOREDIT && self != nullptr && self->field_ != nullptr) {
         const auto dc = reinterpret_cast<HDC>(wParam);
         SetTextColor(dc, RGB(0xf2, 0xf4, 0xf8));
-        SetBkColor(dc, RGB(0x18, 0x18, 0x1a));
+        SetBkColor(dc, RGB(0x23, 0x23, 0x27));  // the pill's own colour (PaintChrome), or the edit shows as a darker slab
         return reinterpret_cast<LRESULT>(self->field_);
     }
     if (message == WM_ERASEBKGND && self != nullptr && self->ground_ != nullptr) {
