@@ -2111,6 +2111,8 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
                     }
                 }
             });
+        browserView_->SetHooks([this](HMENU menu, POINT screen) { return Menu(menu, screen); },
+                               [this] { AddBrowserTab(); });
         SetBrowserPage(browserView_.get());
         // The frame is recalculated without the caption (WM_NCCALCSIZE).
         SetWindowPos(hwnd_, nullptr, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER);
@@ -13648,6 +13650,7 @@ void ChatWindow::FillGallery() {
         std::error_code error;
         std::filesystem::remove_all(folder, error);
         SetJournalFolder(folder.wstring());
+        SetBookmarksFolder((folder / L"bookmarks").wstring());  // the starting set, nothing of his touched
         JournalWrite("чат", L"Claude завершился с кодом 1: stderr «API Error: 529 overloaded»");
         JournalWrite("браузер", L"Окно браузера не создалось (0x80004005)");
         JournalWrite("сбой", L"Клиент упал: c0000409 — аварийный выход (__fastfail: std::terminate, переполнение буфера, "

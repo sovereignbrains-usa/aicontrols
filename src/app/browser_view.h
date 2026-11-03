@@ -10,11 +10,17 @@
 #include <condition_variable>
 #include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
 
+#include "core/bookmarks.h"
 #include "core/browser.h"
+
+namespace Gdiplus {
+class Bitmap;
+}
 
 namespace aic {
 
@@ -32,6 +38,8 @@ public:
     // UI thread: the user's button wants the page (starts it) or has put it away. The tool's own open and close
     // go through Ready and Close.
     void Want(bool on);
+    // UI thread: the window's own menu (its style) and its "another browser tab", for the bookmarks row.
+    void SetHooks(std::function<int(HMENU, POINT)> menu, std::function<void()> newTab);
     // UI thread: the address field, so a person can type where to go. The tool does not call this.
     void FocusAddress();
     // UI thread: another page beside the tool's. 0 is the tool's page; the rest are the person's own tabs.
@@ -70,6 +78,24 @@ private:
     void ApplyPlace();
     void LayoutPage();
     void NavigateBar();
+    void Go(const std::wstring& url);  // the page on show goes there (or will, once it exists)
+    // The bookmarks row under the address, and the star at the address's right end.
+    void LoadMarks();
+    void LayoutBar();
+    int HitBar(POINT point) const;  // a chip's index, or kHit*
+    void SetHot(int hot);
+    void OnBarClick(POINT point, bool middle);
+    void OnBarMenu(POINT point);
+    void ToggleStar();
+    void OpenMark(size_t index, bool newTab);
+    void SaveMarks();
+    std::wstring ActiveSource() const;
+    bool Marked(const std::wstring& source) const;
+    void PaintBar(HDC dc, const RECT& client);
+    void WatchIcon(ICoreWebView2* view);
+    void FetchIcon(ICoreWebView2* view);
+    Gdiplus::Bitmap* Icon(const std::wstring& host);
+    void InvalidateBar();
     void PaintChrome(HDC dc, const RECT& client);
     void ApplyFont();
     RECT FieldRect(const RECT& client) const;
@@ -90,6 +116,8 @@ private:
     HWND host_ = nullptr;  // owned popup, over the column; the WebView is its child
     HWND edit_ = nullptr;  // the address, at the top of host_
     HFONT font_ = nullptr;
+    HFONT chipFont_ = nullptr;   // the bookmarks' names
+    HFONT monoFont_ = nullptr;   // the letter of a bookmark whose site has not shown its icon yet
     HBRUSH field_ = nullptr;
     HBRUSH ground_ = nullptr;
     RECT bounds_{};  // client coordinates of window_, the last place asked for
@@ -98,6 +126,24 @@ private:
     UINT message_;
     std::function<void()> show_;
     std::function<void()> hide_;
+    std::function<int(HMENU, POINT)> menu_;
+    std::function<void()> newTab_;
+
+    // UI thread only: the bookmarks row.
+    static constexpr int kHitNone = -1, kHitStar = -2, kHitMore = -3;
+    struct Chip {
+        RECT rect{};
+        size_t index = 0;
+    };
+    std::vector<Bookmark> marks_;
+    bool marksLoaded_ = false;
+    std::vector<Chip> chips_;          // the ones that fit, left to right
+    std::vector<size_t> hidden_;       // the rest, behind the "»"
+    RECT more_{};                      // the "»", empty when all fit
+    RECT star_{};
+    int hot_ = kHitNone;
+    bool tracking_ = false;
+    std::map<std::wstring, std::shared_ptr<Gdiplus::Bitmap>> icons_;  // by host; empty: looked, none
     std::atomic<bool> shown_{false};
     std::atomic<bool> shutdown_{false};
 

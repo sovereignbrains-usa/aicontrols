@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 
+#include "core/bookmarks.h"
 #include "core/chat_export.h"
 #include "core/journal.h"
 #include "core/store.h"
@@ -115,6 +116,36 @@ int main() {
         Expect(summary.find(L"c0000409") != std::wstring::npos && summary.find(L"0x1a822d") != std::wstring::npos,
                "a crash report is summed up");
         Expect(aic::CrashSummary(L"EventType=WindowsUpdateFailure\r\n").empty(), "not a crash: nothing");
+        fs::remove_all(folder, error);
+    }
+    {  // the browser's bookmarks, in a scratch folder
+        const fs::path folder = temp / L"aic_bookmarks_test";
+        fs::remove_all(folder, error);
+        aic::SetBookmarksFolder(folder.wstring());
+        auto marks = aic::LoadBookmarks();
+        Expect(marks.size() == aic::DefaultBookmarks().size() && marks.front().name == L"ChatGPT",
+               "no file: the cloud AIs to start with");
+        marks.erase(marks.begin());
+        marks.push_back({L"Мой сайт", L"https://example.org/a"});
+        Expect(aic::SaveBookmarks(marks), "bookmarks saved");
+        const auto back = aic::LoadBookmarks();
+        Expect(back.size() == marks.size() && back.back().name == L"Мой сайт" && back.front().name == L"Claude",
+               "bookmarks read back in their order");
+        Expect(aic::SaveBookmarks({}) && aic::LoadBookmarks().empty(), "an emptied list stays empty");
+        std::vector<aic::Bookmark> some{{L"Qwen", L"https://chat.qwen.ai/"}};
+        Expect(aic::RestoreDefaultBookmarks(some) == aic::DefaultBookmarks().size() - 1 && some.front().name == L"Qwen",
+               "the missing defaults come back after the ones kept");
+        Expect(aic::BookmarkHost(L"https://WWW.Perplexity.ai/search?q=1") == L"perplexity.ai" &&
+                   aic::BookmarkHost(L"http://user@chat.qwen.ai:8080/c/1") == L"chat.qwen.ai" &&
+                   aic::BookmarkHost(L"about:blank").empty(),
+               "a bookmark's host");
+        Expect(aic::SameAddress(L"HTTPS://Chat.Qwen.ai/", L"https://chat.qwen.ai#top") &&
+                   !aic::SameAddress(L"https://chat.qwen.ai/c/1", L"https://chat.qwen.ai/c/2"),
+               "one address written two ways");
+        Expect(aic::BookmarkName(L"Qwen Chat - Alibaba Cloud", L"https://chat.qwen.ai/") == L"Qwen Chat" &&
+                   aic::BookmarkName(L"", L"https://www.example.org/x") == L"example.org" &&
+                   aic::BookmarkName(L"Очень длинное название страницы про всё на свете", L"https://a.b/").size() <= 25,
+               "a page's short name");
         fs::remove_all(folder, error);
     }
     Expect(!aic::MoveSession(a, b, "chat-1"), "a chat that is not there is not moved");

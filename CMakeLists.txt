@@ -25,6 +25,7 @@ add_library(aic_core STATIC
   src/core/app_update.cpp
   src/core/attachment.cpp
   src/core/auth.cpp
+  src/core/bookmarks.cpp
   src/core/bridge.cpp
   src/core/browser.cpp
   src/core/chat_export.cpp
