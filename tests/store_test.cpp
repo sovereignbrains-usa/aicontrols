@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 
+#include "core/ask.h"
 #include "core/bookmarks.h"
 #include "core/chat_export.h"
 #include "core/journal.h"
@@ -528,6 +529,39 @@ This session is being continued
     fs::remove_all(grokArc, error);
     fs::remove(archiveIndex, error);
 
+    // ask: the other model's API, the pieces that need no network.
+    {
+        Expect(aic::AskModels::Find("Gemini") != nullptr && aic::AskModels::Find("groq")->secret == "GROQ_API_KEY" &&
+                   aic::AskModels::Find("nobody") == nullptr,
+               "providers are found by name, any case");
+        const std::string body = aic::AskModels::RequestBody("m", "be brief", "hi \"there\"", 999999);
+        const aic::Json sent = aic::Json::parse(body);
+        Expect(sent["model"] == "m" && sent["max_tokens"] == 16000 && sent["messages"].size() == 2 &&
+                   sent["messages"][0]["role"] == "system" && sent["messages"][1]["content"] == "hi \"there\"",
+               "the request: system first, the prompt whole, the token cap held");
+        Expect(aic::Json::parse(aic::AskModels::RequestBody("m", "", "q", 0))["messages"].size() == 1 &&
+                   aic::Json::parse(aic::AskModels::RequestBody("m", "", "q", 0))["max_tokens"] == 1,
+               "no system message when there is none; at least one token");
+        std::string usage;
+        std::string askError;
+        const std::string answer = aic::AskModels::ParseReply(
+            R"({"choices":[{"message":{"content":"  Привет!\n"}}],"usage":{"prompt_tokens":12,"completion_tokens":3}})",
+            usage, askError);
+        Expect(answer == "Привет!" && usage == "12 in / 3 out" && askError.empty(), "an answer is trimmed, its usage read");
+        usage.clear();
+        Expect(aic::AskModels::ParseReply(R"({"choices":[{"message":{"content":null},"finish_reason":"length"}]})",
+                                          usage, askError).empty() &&
+                   askError.find("length") != std::string::npos,
+               "no text: the finish reason says why");
+        Expect(aic::AskModels::ErrorMessage(R"([{"error":{"code":400,"message":"API key not valid"}}])") ==
+                       "API key not valid" &&
+                   aic::AskModels::ErrorMessage(R"({"error":{"message":"rate limit"}})") == "rate limit" &&
+                   aic::AskModels::ErrorMessage("<html>bad gateway</html>") == "<html>bad gateway</html>",
+               "an error message from either shape, or the body's start");
+        Expect(aic::AskModels::ParseModels(R"({"data":[{"id":"a"},{"id":"b/c:free"}]})") == "a\nb/c:free" &&
+                   aic::AskModels::ParseModels(R"([{"name":"models/x"}])") == "models/x",
+               "model ids listed from both shapes");
+    }
     if (failures == 0) {
         std::cout << "store: all passed\n";
     }

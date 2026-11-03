@@ -24,6 +24,7 @@ find_package(unofficial-webview2 CONFIG REQUIRED)  # the HTML preview: the stati
 add_library(aic_core STATIC
   src/core/app_update.cpp
   src/core/attachment.cpp
+  src/core/ask.cpp
   src/core/auth.cpp
   src/core/bookmarks.cpp
   src/core/bridge.cpp

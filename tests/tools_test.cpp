@@ -209,7 +209,7 @@ int main() {
             if (id == "r1") {
                 Expect(body["result"]["protocolVersion"] == "2025-06-18", "initialize echoes the version");
             } else if (id == "r2") {
-                Expect(body["result"]["tools"].size() == 11, "tools/list has eleven tools");
+                Expect(body["result"]["tools"].size() == 12, "tools/list has twelve tools");
             } else if (id == "r3") {
                 Expect(body["id"] == 2 && body["result"]["isError"] == false &&
                            Has(body["result"]["content"][0]["text"], "crlf.txt"),

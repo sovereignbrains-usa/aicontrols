@@ -18,6 +18,7 @@
 
 #include <wil/resource.h>
 
+#include "core/ask.h"
 #include "core/attachment.h"
 #include "core/browser.h"
 #include "core/chat_export.h"
@@ -757,6 +758,16 @@ ToolSummary SummarizeHere(const std::string& name, const Json& input) {
         }
         return {L"Браузер", ToWide(detail)};
     }
+    if (name == "ask") {
+        const std::string provider = StringArg(input, "provider");
+        const std::string model = StringArg(input, "model");
+        std::string detail = provider + (model.empty() ? "" : " · " + model);
+        if (StringArg(input, "action") == "models") {
+            return {L"Список моделей", ToWide(detail)};
+        }
+        detail += "\n\n" + StringArg(input, "prompt");
+        return {L"Спросить другую модель", ToWide(detail)};
+    }
     if (name == "screenshot") {
         const std::wstring window = ToWide(StringArg(input, "window"));
         return {L"Снимок экрана", window.empty() ? L"весь экран" : L"окно «" + window + L"»"};
@@ -841,6 +852,8 @@ std::string Tools::SystemPrompt() {
            "browser drives a page in a tab of the user's own window (its own profile, not the user's): open an http or https "
            "address, read the page (text), picture it (screenshot), click (selector or the visible text of a link "
            "or button) or type into a field (selector, text, key Enter). Each action asks the user first. "
+           "ask hands a question to another model through its free API (gemini, groq, ...) when that is cheaper than doing it yourself: "
+           "a long text to sum up, a draft, a translation. Its answer is a guess: check it. "
            "You may hand a self-contained task to one helper with spawn_subagent. The only type is aicontrols:hand. "
            "It has the same MCP tools, the web and Imagine, and no shell of its own; its calls ask the user the same "
            "way. It cannot message the user or spawn its own helper. Wait for it and use its result. "
@@ -940,6 +953,24 @@ Json Tools::Definitions() const {
                       {"text", {{"type", "string"}, {"description", "click: the visible text of the link or button; type: what to type"}}},
                       {"key", {{"type", "string"}, {"enum", Json::array({"Enter"})}, {"description", "type: a key to press after the text"}}}},
                      Json::array({"action"}))}},
+        Json{{"name", "ask"},
+             {"description",
+              "A question to another model through its own API (free tiers): gemini, groq, openrouter, mistral, "
+              "cerebras, deepseek, qwen. Use it to hand over work that is cheaper to give away than to do: sum up a long "
+              "text, a draft, a translation, a second opinion. It returns only the answer, with the model and the token "
+              "count on the first line. What it says is a guess, not a fact: check it before you rely on it. The key is "
+              "a stored secret (GEMINI_API_KEY, GROQ_API_KEY, OPENROUTER_API_KEY, MISTRAL_API_KEY, CEREBRAS_API_KEY, "
+              "DEEPSEEK_API_KEY, DASHSCOPE_API_KEY); without it the call says where a key is had. The prompt leaves the "
+              "computer: the user is asked, and nothing private goes in it that the answer does not need. action "
+              "\"models\" lists the models a provider has."},
+             {"inputSchema",
+              Schema({{"provider", {{"type", "string"}, {"description", "gemini, groq, openrouter, mistral, cerebras, deepseek or qwen"}}},
+                      {"prompt", {{"type", "string"}, {"description", "The question, with everything the model needs: it sees nothing else"}}},
+                      {"model", {{"type", "string"}, {"description", "Default: the provider's own; openrouter and cerebras need one"}}},
+                      {"system", {{"type", "string"}, {"description", "Optional instruction for the model"}}},
+                      {"max_tokens", {{"type", "integer"}, {"description", "Answer length cap, 1-16000, default 4096"}}},
+                      {"action", {{"type", "string"}, {"enum", Json::array({"ask", "models"})}, {"description", "ask (default) or models"}}}},
+                     Json::array({"provider"}))}},
         Json{{"name", "list_chats"},
              {"description",
               "List this client's chats, Claude's and Grok's, newest first: id, who answers, last change, title. "
@@ -997,6 +1028,8 @@ ToolResult Tools::Execute(const std::string& name, const Json& input, const std:
             result = Screenshot(input);
         } else if (name == "browser") {
             result = Browser(input, cancel);
+        } else if (name == "ask") {
+            result = AskModels(secrets_).Ask(input, cancel);
         } else if (name == "list_chats") {
             result = ListChats(input);
         } else if (name == "read_chat") {

@@ -7,7 +7,7 @@ C++23, Win32, Direct2D и DirectWrite — без Electron, один exe.
 > Не официальный продукт Anthropic или xAI. «Claude» — товарный знак Anthropic.
 > Клиент запускает установленные у вас `claude.exe` и `grok.exe` и разговаривает с ними.
 
-Текущая сборка — **0.1.100**.
+Текущая сборка — **0.1.101**.
 
 ## Что умеет
 
@@ -47,6 +47,9 @@ C++23, Win32, Direct2D и DirectWrite — без Electron, один exe.
 - Полосы прокрутки тянутся мышью, средняя кнопка прокручивает, как в браузере. Своя шапка вместо заголовка окна.
 - Обновление само: более новый установщик в `build\installer` даёт кнопку внизу панели.
   После установки открывается тот же чат.
+- Инструмент `ask`: вопрос другой модели через её бесплатный API (Gemini, Groq, OpenRouter, Mistral, Cerebras, DeepSeek, Qwen) —
+  длинный текст сжать, черновик, перевод; в чат возвращается только ответ. Ключ — секрет `GEMINI_API_KEY`, `GROQ_API_KEY`,
+  `OPENROUTER_API_KEY`, `MISTRAL_API_KEY`, `CEREBRAS_API_KEY`, `DEEPSEEK_API_KEY` или `DASHSCOPE_API_KEY`. Каждый вызов спрашивает.
 - Трафик CLI идёт через мост на 127.0.0.1: напрямую, иначе sing-box `127.0.0.1:2080`, иначе `ssh -D`.
   Локальные адреса мост не пускает.
 
@@ -66,7 +69,7 @@ Visual Studio 2022 Build Tools (MSVC, C++23), CMake 3.28+, Ninja и [vcpkg](http
 ```bat
 tools\build.cmd dev        :: build\dev\aicontrols.exe (Debug)
 tools\build.cmd dist       :: build\dist\aicontrols.exe (Release)
-tools\dist.cmd 0.1.100     :: + установщик build\installer\AIControls-Setup-0.1.100.exe (Inno Setup 6)
+tools\dist.cmd 0.1.101     :: + установщик build\installer\AIControls-Setup-0.1.101.exe (Inno Setup 6)
 tools\build.cmd analyze    :: то же с MSVC /analyze — перед каждым пушем
 ctest --test-dir build\dev :: тесты ядра
 ```
@@ -88,7 +91,7 @@ src/core   всё без интерфейса:
            markdown         разбор в текст и стили           highlight      подсветка кода
            store            чаты, настройки                 chat_export    чат в Markdown
            journal          журнал сбоев                   title_writer   название чата
-           bookmarks        закладки браузера
+           bookmarks        закладки браузера             ask            вопрос другой модели по API
            vt_screen, pty   терминал                      browser        вкладка страницы
            bridge           выход CLI в сеть                 github, gdrive репозитории и Диск
            usage, voice     лимиты, голос                   app_update     установщик новее стоящего
