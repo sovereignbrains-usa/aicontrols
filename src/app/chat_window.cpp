@@ -1127,6 +1127,9 @@ private:
     void AddTerminalTab(const std::string& server = {});  // a server: ssh to it, no host-key questions
     void ShowTermAddMenu(POINT screen);                   // "+" at a shell: a new one, or a stored server
     void AddBrowserTab();  // another page, beside the one the tool drives
+    void AttachBrowserTab(int page, bool focusAddress);  // the tab of a page that exists
+    void AddPopupTab(int page);    // a page opened a window (a sign-in): its tab, on show
+    void ClosePopupTab(int page);  // that window closed itself
     void StartShell(TermTab& tab);
     void CloseTerminalTab(size_t index);
     void SelectTerminalTab(size_t index);
@@ -2113,6 +2116,8 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
             });
         browserView_->SetHooks([this](HMENU menu, POINT screen) { return Menu(menu, screen); },
                                [this] { AddBrowserTab(); });
+        browserView_->SetPopupHooks([this](int page) { AddPopupTab(page); },
+                                    [this](int page) { ClosePopupTab(page); });
         SetBrowserPage(browserView_.get());
         // The frame is recalculated without the caption (WM_NCCALCSIZE).
         SetWindowPos(hwnd_, nullptr, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER);
@@ -10048,6 +10053,30 @@ void ChatWindow::AddBrowserTab() {
         return;
     }
     const int page = browserView_->AddPage();
+    AttachBrowserTab(page, true);
+}
+
+void ChatWindow::AddPopupTab(int page) {
+    AttachBrowserTab(page, false);
+}
+
+void ChatWindow::ClosePopupTab(int page) {
+    for (size_t i = 0; i < tabs_.size(); ++i) {
+        if (tabs_[i]->browser && tabs_[i]->browserPage == page) {
+            CloseTerminalTab(i);
+            if (terminalOpen_) {
+                SelectTerminalTab(activeTab_);
+            }
+            PlaceBrowser();
+            return;
+        }
+    }
+    if (browserView_) {
+        browserView_->ClosePage(page);  // it never got a tab
+    }
+}
+
+void ChatWindow::AttachBrowserTab(int page, bool focusAddress) {
     auto created = std::make_unique<TermTab>();
     created->id = ++nextTabId_;
     created->browser = true;
@@ -10066,7 +10095,9 @@ void ChatWindow::AddBrowserTab() {
     }
     termFocus_ = false;  // the address takes the keys
     searchFocus_ = false;
-    browserView_->FocusAddress();
+    if (focusAddress) {
+        browserView_->FocusAddress();
+    }
     PlaceBrowser();
     Refresh();
 }

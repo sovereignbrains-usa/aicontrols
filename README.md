@@ -1,4 +1,4 @@
-# AIControls
+﻿# AIControls
 
 Нативный клиент чата под Windows: [Claude Code](https://docs.claude.com/en/docs/claude-code) и Grok Build в одном окне.
 Инструменты с подтверждением, секреты, терминал, браузер и репозитории GitHub.
@@ -7,7 +7,7 @@ C++23, Win32, Direct2D и DirectWrite — без Electron, один exe.
 > Не официальный продукт Anthropic или xAI. «Claude» — товарный знак Anthropic.
 > Клиент запускает установленные у вас `claude.exe` и `grok.exe` и разговаривает с ними.
 
-Текущая сборка — **0.1.101**.
+Текущая сборка — **0.1.102**.
 
 ## Что умеет
 
@@ -69,7 +69,7 @@ Visual Studio 2022 Build Tools (MSVC, C++23), CMake 3.28+, Ninja и [vcpkg](http
 ```bat
 tools\build.cmd dev        :: build\dev\aicontrols.exe (Debug)
 tools\build.cmd dist       :: build\dist\aicontrols.exe (Release)
-tools\dist.cmd 0.1.101     :: + установщик build\installer\AIControls-Setup-0.1.101.exe (Inno Setup 6)
+tools\dist.cmd 0.1.102     :: + установщик build\installer\AIControls-Setup-0.1.102.exe (Inno Setup 6)
 tools\build.cmd analyze    :: то же с MSVC /analyze — перед каждым пушем
 ctest --test-dir build\dev :: тесты ядра
 ```

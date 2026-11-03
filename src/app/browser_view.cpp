@@ -1442,12 +1442,28 @@ void BrowserView::Arm(ICoreWebView2* view) {
         &token);
     view->add_NewWindowRequested(
         Microsoft::WRL::Callback<ICoreWebView2NewWindowRequestedEventHandler>(
-            [view](ICoreWebView2*, ICoreWebView2NewWindowRequestedEventArgs* args) {
-                args->put_Handled(TRUE);
+            [this, view](ICoreWebView2*, ICoreWebView2NewWindowRequestedEventArgs* args) {
                 wil::unique_cotaskmem_string uri;
-                if (SUCCEEDED(args->get_Uri(&uri)) && uri && MayNavigate(ToUtf8(uri.get()))) {
+                const bool allowed = SUCCEEDED(args->get_Uri(&uri)) && uri && MayNavigate(ToUtf8(uri.get()));
+                if (!allowed) {
+                    args->put_Handled(TRUE);
+                } else if (environment_ && host_ != nullptr && !shutdown_) {
+                    // A real window tied to the page that opened it: a sign-in (Google, Kimi) answers
+                    // that page through window.opener and then closes itself. Navigating this very page
+                    // would throw the opener away and leave the sign-in blank.
+                    OpenPopup(args);
+                } else {
+                    args->put_Handled(TRUE);
                     view->Navigate(uri.get());
                 }
+                return S_OK;
+            })
+            .Get(),
+        &token);
+    view->add_WindowCloseRequested(
+        Microsoft::WRL::Callback<ICoreWebView2WindowCloseRequestedEventHandler>(
+            [this](ICoreWebView2* sender, IUnknown*) {
+                CloseRequested(sender);
                 return S_OK;
             })
             .Get(),
@@ -1527,6 +1543,110 @@ void BrowserView::CreateExtra(size_t index) {
                    .Get());
     if (FAILED(creating)) {
         page.opening = false;
+    }
+}
+
+void BrowserView::SetPopupHooks(std::function<void(int)> opened, std::function<void(int)> closed) {
+    popupOpened_ = std::move(opened);
+    popupClosed_ = std::move(closed);
+}
+
+// The page asked for a new window. It gets a page of its own (a slot after the person's tabs) that
+// the engine builds as that window, so that window.opener and postMessage keep working.
+void BrowserView::OpenPopup(ICoreWebView2NewWindowRequestedEventArgs* args) {
+    wil::com_ptr<ICoreWebView2Deferral> deferral;
+    if (FAILED(args->GetDeferral(deferral.put()))) {
+        args->put_Handled(TRUE);
+        return;
+    }
+    wil::com_ptr<ICoreWebView2NewWindowRequestedEventArgs> request(args);
+    extras_.push_back({});
+    const size_t index = extras_.size() - 1;
+    const int slot = static_cast<int>(index) + 1;
+    extras_[index].opening = true;
+    const HRESULT creating = environment_->CreateCoreWebView2Controller(
+        host_, Microsoft::WRL::Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
+                   [this, index, slot, deferral, request](HRESULT created, ICoreWebView2Controller* controller) -> HRESULT {
+                       auto giveUp = [&] {
+                           request->put_Handled(TRUE);
+                           deferral->Complete();
+                           if (index < extras_.size()) {
+                               extras_[index].opening = false;
+                               extras_[index].closed = true;
+                           }
+                           if (controller != nullptr) {
+                               controller->Close();
+                           }
+                           if (!shutdown_ && popupClosed_ && index < extras_.size()) {
+                               popupClosed_(slot);
+                           }
+                       };
+                       if (index >= extras_.size() || shutdown_ || FAILED(created) || controller == nullptr) {
+                           giveUp();
+                           return S_OK;
+                       }
+                       ExtraPage& arrived = extras_[index];
+                       arrived.opening = false;
+                       arrived.controller = controller;
+                       arrived.controller->get_CoreWebView2(arrived.view.put());
+                       if (!arrived.view) {
+                           arrived.controller.reset();
+                           giveUp();
+                           return S_OK;
+                       }
+                       arrived.controller->put_IsVisible(FALSE);
+                       if (const auto colored = arrived.controller.try_query<ICoreWebView2Controller2>()) {
+                           colored->put_DefaultBackgroundColor(COREWEBVIEW2_COLOR{255, 0x12, 0x12, 0x13});
+                       }
+                       wil::com_ptr<ICoreWebView2Settings> settings;
+                       if (SUCCEEDED(arrived.view->get_Settings(settings.put()))) {
+                           settings->put_IsStatusBarEnabled(FALSE);
+                       }
+                       Arm(arrived.view.get());
+                       WatchAddress(arrived.view.get());
+                       request->put_NewWindow(arrived.view.get());
+                       request->put_Handled(TRUE);
+                       deferral->Complete();
+                       if (popupOpened_) {
+                           popupOpened_(slot);  // the tab appears and shows this page
+                       } else {
+                           ShowPage(slot);
+                       }
+                       LayoutPage();
+                       if (host_ != nullptr) {
+                           InvalidateRect(host_, nullptr, FALSE);
+                       }
+                       return S_OK;
+                   })
+                   .Get());
+    if (FAILED(creating)) {
+        extras_[index].opening = false;
+        extras_[index].closed = true;
+        args->put_Handled(TRUE);
+        deferral->Complete();
+        if (popupClosed_) {
+            popupClosed_(slot);
+        }
+    }
+}
+
+// window.close() from a page: drop its tab, but not inside the engine's own event.
+void BrowserView::CloseRequested(ICoreWebView2* view) {
+    if (view == nullptr || view == view_.get() || shutdown_) {
+        return;  // the tool's page is not closed by a page
+    }
+    for (size_t i = 0; i < extras_.size(); ++i) {
+        if (extras_[i].view.get() == view) {
+            const int slot = static_cast<int>(i) + 1;
+            Post([this, slot] {
+                if (popupClosed_) {
+                    popupClosed_(slot);
+                } else {
+                    ClosePage(slot);
+                }
+            });
+            return;
+        }
     }
 }
 

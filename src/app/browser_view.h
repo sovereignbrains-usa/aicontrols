@@ -40,6 +40,7 @@ public:
     void Want(bool on);
     // UI thread: the window's own menu (its style) and its "another browser tab", for the bookmarks row.
     void SetHooks(std::function<int(HMENU, POINT)> menu, std::function<void()> newTab);
+    void SetPopupHooks(std::function<void(int)> opened, std::function<void(int)> closed);
     // UI thread: the address field, so a person can type where to go. The tool does not call this.
     void FocusAddress();
     // UI thread: another page beside the tool's. 0 is the tool's page; the rest are the person's own tabs.
@@ -109,6 +110,8 @@ private:
     void WatchAddress(ICoreWebView2* view);
     void Arm(ICoreWebView2* view);
     void CreateExtra(size_t index);
+    void OpenPopup(ICoreWebView2NewWindowRequestedEventArgs* args);
+    void CloseRequested(ICoreWebView2* view);
     static LRESULT CALLBACK HostProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
     static LRESULT CALLBACK EditProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam, UINT_PTR id, DWORD_PTR self);
 
@@ -128,6 +131,8 @@ private:
     std::function<void()> hide_;
     std::function<int(HMENU, POINT)> menu_;
     std::function<void()> newTab_;
+    std::function<void(int)> popupOpened_;  // a page opened a window (a sign-in): its slot, already a tab to show
+    std::function<void(int)> popupClosed_;  // that window asked to close itself (window.close)
 
     // UI thread only: the bookmarks row.
     static constexpr int kHitNone = -1, kHitStar = -2, kHitMore = -3;
