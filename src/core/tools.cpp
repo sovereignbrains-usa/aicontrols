@@ -1061,7 +1061,7 @@ ToolResult Tools::ExecuteOn(const std::string& on, const std::string& name, cons
     if (!target) {
         return Error("Bad `on`: expected user@host or user@host:port, got: " + on);
     }
-    if (const std::string secret = "ssh " + on; secrets_.Has(secret)) {
+    if (const std::string secret = "ssh " + on; secrets_.Get(secret).value_or("").size() > 0) {  // no password: keys only
         target->secret = secret;
     }
     const std::string path = StringArg(input, "path");

@@ -601,6 +601,7 @@ enum class Target {
     SecretsClose,  // ... and the way back to the chats
     SecretRow,     // row: an index into the secrets' names
     SecretDelete,  // row: the same
+    SecretOpen,    // row: a server's: a terminal tab with ssh to it
     SecretSave,
     SecretEye,     // show or hide the value being typed
     SecretCancel,  // leave editing a secret
@@ -1279,6 +1280,14 @@ private:
     void PaintSecrets(const Geometry& g);
     static D2D1_RECT_F SecretRowRect(const Geometry& g, size_t index);
     static D2D1_RECT_F SecretDeleteRect(const D2D1_RECT_F& row);
+    static D2D1_RECT_F SecretOpenRect(const D2D1_RECT_F& row);
+    // The secrets view's rows: the servers ("ssh user@host") under their own heading, the rest under theirs.
+    struct SecretLine {
+        bool header = false;
+        std::string name;  // the secret's name; a heading's text
+    };
+    std::vector<SecretLine> SecretLines() const;
+    void OpenServerTab(const std::string& server);
     static size_t SecretRowsFit(const Geometry& g);
     // A list that is longer than its room: the first row shown is kept within the list.
     static size_t ClampFirst(size_t first, size_t total, size_t rows) { return total > rows ? std::min(first, total - rows) : 0; }
@@ -2585,7 +2594,7 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
             ScrollTerminal(-static_cast<long long>(std::lround(steps * 3)));
         } else if (popup_ == Popup::None && secretsOpen_ && Inside(g.panel, ToDip(at.x), ToDip(at.y))) {
             const auto moved = static_cast<long long>(secretsFirst_) + wholeRows(2.f);
-            secretsFirst_ = ClampFirst(static_cast<size_t>(std::max<long long>(moved, 0)), secrets_.Names().size(),
+            secretsFirst_ = ClampFirst(static_cast<size_t>(std::max<long long>(moved, 0)), SecretLines().size(),
                                        SecretRowsFit(g));
             hover_ = HitTest(ToDip(at.x), ToDip(at.y));  // the rows moved under the pointer
             Refresh();
@@ -2705,6 +2714,7 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
                 return 0;
             case Target::SecretRow:
             case Target::SecretDelete:
+            case Target::SecretOpen:
                 ShowSecretMenu(hit.row, screen);
                 return 0;
             case Target::AttachmentChip:
@@ -3178,10 +3188,17 @@ void ChatWindow::OnClick(float x, float y) {
         SetSecretsOpen(false);
         break;
     case Target::SecretRow: {  // edit a secret: its name and value go into the form
-        const std::vector<std::string> names = secrets_.Names();
-        if (hit.row < names.size()) {
-            EditSecret(names[hit.row]);
+        const std::vector<SecretLine> lines = SecretLines();
+        if (hit.row < lines.size() && !lines[hit.row].header) {
+            EditSecret(lines[hit.row].name);
             keepFocus = true;
+        }
+        break;
+    }
+    case Target::SecretOpen: {
+        const std::vector<SecretLine> lines = SecretLines();
+        if (hit.row < lines.size() && !lines[hit.row].header) {
+            OpenServerTab(lines[hit.row].name.substr(4));
         }
         break;
     }
@@ -3195,9 +3212,9 @@ void ChatWindow::OnClick(float x, float y) {
         keepFocus = true;
         break;
     case Target::SecretDelete: {
-        const std::vector<std::string> names = secrets_.Names();
-        if (hit.row < names.size()) {
-            DeleteSecret(names[hit.row]);
+        const std::vector<SecretLine> lines = SecretLines();
+        if (hit.row < lines.size() && !lines[hit.row].header) {
+            DeleteSecret(lines[hit.row].name);
         }
         keepFocus = true;
         break;
@@ -3694,13 +3711,20 @@ Hit ChatWindow::HitTest(float x, float y) const {
         if (Inside(g.secretEye, x, y)) {
             return {Target::SecretEye};
         }
-        const size_t total = secrets_.Names().size();
+        const std::vector<SecretLine> lines = SecretLines();
+        const size_t total = lines.size();
         const size_t first = ClampFirst(secretsFirst_, total, SecretRowsFit(g));
         const size_t shown = std::min(total - first, SecretRowsFit(g));
         for (size_t i = 0; i < shown; ++i) {
+            if (lines[first + i].header) {
+                continue;
+            }
             const D2D1_RECT_F row = SecretRowRect(g, i);
             if (Inside(SecretDeleteRect(row), x, y)) {
                 return {Target::SecretDelete, first + i};
+            }
+            if (lines[first + i].name.starts_with("ssh ") && Inside(SecretOpenRect(row), x, y)) {
+                return {Target::SecretOpen, first + i};
             }
             if (Inside(row, x, y)) {
                 return {Target::SecretRow, first + i};
@@ -3922,7 +3946,7 @@ void ChatWindow::CreateInput() {
     StyleInput();
     fieldBrush_.reset(CreateSolidBrush(ToColorRef(kRaised)));
     nameEdit_ = CreateSecretField(false, L"Любое имя или ssh user@host");
-    valueEdit_ = CreateSecretField(true, L"Значение");
+    valueEdit_ = CreateSecretField(true, L"Значение (ssh: пароль или пусто — ключ)");
     PlaceChildren();
     SetFocus(input_);
 }
@@ -5575,7 +5599,7 @@ void ChatWindow::SubmitSecret() {
         }
         name = ToWide(server);
     }
-    if (value.empty()) {
+    if (value.empty() && !name.starts_with(L"ssh ")) {  // a server may have none: the keys log in
         Flash(L"Введите значение", 2500);
         SetFocus(valueEdit_);
         return;
@@ -5672,6 +5696,41 @@ D2D1_RECT_F ChatWindow::SecretDeleteRect(const D2D1_RECT_F& row) {
     return D2D1::RectF(row.right - 34, row.top + 3, row.right - 6, row.bottom - 3);
 }
 
+D2D1_RECT_F ChatWindow::SecretOpenRect(const D2D1_RECT_F& row) {
+    return D2D1::RectF(row.right - 66, row.top + 3, row.right - 38, row.bottom - 3);
+}
+
+std::vector<ChatWindow::SecretLine> ChatWindow::SecretLines() const {
+    std::vector<std::string> servers;
+    std::vector<std::string> others;
+    for (const std::string& name : secrets_.Names()) {
+        (name.starts_with("ssh ") && ServerSecretName(name) == name ? servers : others).push_back(name);
+    }
+    std::vector<SecretLine> lines;
+    if (!servers.empty()) {
+        lines.push_back({true, "Серверы"});
+        for (std::string& name : servers) {
+            lines.push_back({false, std::move(name)});
+        }
+    }
+    if (!others.empty()) {
+        lines.push_back({true, "Пароли и токены"});
+        for (std::string& name : others) {
+            lines.push_back({false, std::move(name)});
+        }
+    }
+    return lines;
+}
+
+// A tab with ssh to the server, in the terminal column.
+void ChatWindow::OpenServerTab(const std::string& server) {
+    SetSecretsOpen(false);
+    AddTerminalTab(server);
+    SetTerminalOpen(true);
+    SyncTerminalSize();
+    SelectTerminalTab(activeTab_);
+}
+
 size_t ChatWindow::SecretRowsFit(const Geometry& g) {
     const float room = g.nameField.top - 12 - g.secretsTop;
     return room <= 0 ? 0 : static_cast<size_t>(room / kSecretRow);
@@ -5699,27 +5758,53 @@ void ChatWindow::PaintSecrets(const Geometry& g) {
          D2D1::RectF(g.panel.left + kPanelPad, g.panel.top + 44, g.panel.right - kPanelPad, g.panel.top + 44 + kSecretsNote),
          kSecondary);
 
-    const std::vector<std::string> names = secrets_.Names();
-    if (names.empty()) {
+    const std::vector<SecretLine> lines = SecretLines();
+    if (lines.empty()) {
         Text(L"Секретов пока нет.", ui_.get(),
              D2D1::RectF(g.panel.left + kPanelPad, g.secretsTop, g.panel.right - kPanelPad, g.secretsTop + 28), kSecondary);
     }
     const size_t fit = SecretRowsFit(g);
-    secretsFirst_ = ClampFirst(secretsFirst_, names.size(), fit);
-    const size_t shown = std::min(names.size() - secretsFirst_, fit);
+    secretsFirst_ = ClampFirst(secretsFirst_, lines.size(), fit);
+    const size_t shown = std::min(lines.size() - secretsFirst_, fit);
     PaintBar(g, Scroller::Secrets);
     for (size_t slot = 0; slot < shown; ++slot) {
         const size_t i = secretsFirst_ + slot;
         const D2D1_RECT_F row = SecretRowRect(g, slot);
-        const bool onRow = (hover_.target == Target::SecretRow || hover_.target == Target::SecretDelete) && hover_.row == i;
-        if (onRow || names[i] == editingSecret_) {
+        if (lines[i].header) {
+            Text(ToWide(lines[i].name), small_.get(), D2D1::RectF(row.left + 10, row.top + 6, row.right, row.bottom), kSecondary);
+            continue;
+        }
+        const std::string& name = lines[i].name;
+        const bool server = name.starts_with("ssh ");
+        const bool onRow = (hover_.target == Target::SecretRow || hover_.target == Target::SecretDelete ||
+                            hover_.target == Target::SecretOpen) &&
+                           hover_.row == i;
+        if (onRow || name == editingSecret_) {
             Fill(row, 8.f, kRaised);
         }
-        if (names[i] == editingSecret_) {  // the one in the form: a mark at its left edge
+        if (name == editingSecret_) {  // the one in the form: a mark at its left edge
             Fill(D2D1::RectF(row.left, row.top + 8, row.left + 3, row.bottom - 8), 1.5f, kAccent);
         }
-        Text(ToWide(names[i]), ui_.get(), D2D1::RectF(row.left + 10, row.top, row.right - 100, row.bottom), kPrimary);
-        Text(L"••••••••", uiRight_.get(), D2D1::RectF(row.right - 96, row.top, row.right - 40, row.bottom), kSecondary);
+        Text(ToWide(server ? name.substr(4) : name), ui_.get(),
+             D2D1::RectF(row.left + 10, row.top, row.right - 100, row.bottom), kPrimary);
+        bool byKey = false;  // a server with no password: the keys in ~\.ssh
+        if (server) {
+            if (std::optional<std::string> value = secrets_.Get(name)) {
+                byKey = value->empty();
+                SecureZeroMemory(value->data(), value->size());
+            }
+        }
+        Text(byKey ? L"ключ" : L"••••••••", uiRight_.get(), D2D1::RectF(row.right - 96, row.top, row.right - 40, row.bottom),
+             kSecondary);
+        if (onRow && server) {  // a prompt ">_": open the terminal
+            const D2D1_RECT_F open = SecretOpenRect(row);
+            const bool hot = hover_.target == Target::SecretOpen;
+            const D2D1_POINT_2F c{(open.left + open.right) / 2, (open.top + open.bottom) / 2};
+            const uint32_t color = hot ? kPrimary : kSecondary;
+            Line({c.x - 5.f, c.y - 4.f}, {c.x - 1.f, c.y}, color, 1.4f);
+            Line({c.x - 5.f, c.y + 4.f}, {c.x - 1.f, c.y}, color, 1.4f);
+            Line({c.x + 1.f, c.y + 4.f}, {c.x + 5.f, c.y + 4.f}, color, 1.4f);
+        }
         if (onRow) {  // a bin
             const D2D1_RECT_F bin = SecretDeleteRect(row);
             const bool danger = hover_.target == Target::SecretDelete;
@@ -5875,7 +5960,7 @@ void ChatWindow::StartShell(TermTab& tab) {
             command += L" -p " + ToWide(port);
         }
         command += L" " + ToWide(host);
-        if (secrets_.Has("ssh " + tab.server)) {  // its password goes to ssh through SSH_ASKPASS, never typed
+        if (const auto password = secrets_.Get("ssh " + tab.server); password && !password->empty()) {  // goes to ssh through SSH_ASKPASS, never typed
             environment = MakeEnvironmentBlock({{L"SSH_ASKPASS", OwnExe()},
                                                 {L"SSH_ASKPASS_REQUIRE", L"force"},
                                                 {L"AIC_ASKPASS", ToWide("ssh " + tab.server)}});
@@ -8456,7 +8541,7 @@ std::optional<ScrollBar> ChatWindow::Bar(const Geometry& g, Scroller s) const {
             return std::nullopt;
         }
         const size_t fit = SecretRowsFit(g);
-        const size_t total = secrets_.Names().size();
+        const size_t total = SecretLines().size();
         right = g.panel.right - 3.f;
         top = g.secretsTop;
         bottom = g.secretsTop + static_cast<float>(fit) * kSecretRow;
@@ -8541,7 +8626,7 @@ void ChatWindow::ScrollTo(Scroller s, float pos) {
         firstRow_ = ClampFirst(whole(pos), rows_.size(), SidebarRows(Layout()));
         break;
     case Scroller::Secrets:
-        secretsFirst_ = ClampFirst(whole(pos), secrets_.Names().size(), SecretRowsFit(Layout()));
+        secretsFirst_ = ClampFirst(whole(pos), SecretLines().size(), SecretRowsFit(Layout()));
         break;
     case Scroller::Terminal:
         if (Screen() != nullptr) {
@@ -10592,6 +10677,8 @@ std::wstring ChatWindow::TooltipText() {
         return showValue_ ? L"Скрыть значение" : L"Показать значение";
     case Target::SecretDelete:
         return L"Удалить секрет";
+    case Target::SecretOpen:
+        return L"Открыть терминал с ssh на этот сервер";
     case Target::EffortReset:
         return L"Вернуть как было";
     case Target::Send:
@@ -11166,17 +11253,25 @@ void ChatWindow::ClearTerminalTab(size_t index) {
 }
 
 void ChatWindow::ShowSecretMenu(size_t index, POINT screen) {
-    const std::vector<std::string> names = secrets_.Names();
-    if (index >= names.size()) {
+    const std::vector<SecretLine> lines = SecretLines();
+    if (index >= lines.size() || lines[index].header) {
         return;
     }
-    constexpr UINT kEdit = 1, kCopyName = 2, kDelete = 3;
+    std::vector<std::string> names(lines.size());
+    names[index] = lines[index].name;
+    constexpr UINT kEdit = 1, kCopyName = 2, kDelete = 3, kOpen = 4;
     wil::unique_hmenu menu(CreatePopupMenu());
+    if (names[index].starts_with("ssh ")) {
+        AppendMenuW(menu.get(), MF_STRING, kOpen, L"Открыть терминал");
+    }
     AppendMenuW(menu.get(), MF_STRING, kEdit, L"Изменить");
     AppendMenuW(menu.get(), MF_STRING, kCopyName, L"Копировать имя");
     AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu.get(), MF_STRING, kDelete, L"Удалить");
     switch (Menu(menu.get(), screen)) {
+    case kOpen:
+        OpenServerTab(names[index].substr(4));
+        break;
     case kEdit:
         EditSecret(names[index]);
         break;
