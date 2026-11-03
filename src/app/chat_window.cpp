@@ -4818,17 +4818,35 @@ void ChatWindow::PaintMarkdown(const FeedItem& item, float x, float y, float lef
             brush_->SetColor(Color(kLine));
             target_->DrawRoundedRectangle(D2D1::RoundedRect(panel, 8.f, 8.f), brush_.get(), 1.f);
             if ((span.flags & kMdTable) != 0) {
-                // The grid is drawn here, not by the font: a box character is shorter than its line, and the
-                // dividers broke between the rows (30.10.2026, his screenshot). The characters stay for copying.
+                // One straight rule per column and per row, a single device pixel, aliased. A stroke per box
+                // character faded at its own end, so the verticals went dim in the gap between the rows
+                // (03.11.2026, his screenshot: the divider dropped from full white to half between the two
+                // lines). The characters stay, invisible, so a copy still has the grid.
                 wil::com_ptr<ID2D1SolidColorBrush> hidden;
                 target_->CreateSolidColorBrush(Color(kCodeText), hidden.put());
                 hidden->SetOpacity(0.f);
-                const float pixel = 96.f / Dpi();  // one device pixel, in DIPs
-                const auto snap = [&](float v) { return (std::floor(v / pixel) + 0.5f) * pixel; };
+                const float pixel = Pixel();
+                struct Run {
+                    float from = std::numeric_limits<float>::max();
+                    float to = std::numeric_limits<float>::lowest();
+                };
+                std::map<int, Run> down;    // column -> top and bottom of every divider in it
+                std::map<int, Run> across;  // rule row -> left and right
+                const auto runOf = [](std::map<int, Run>& runs, int key) -> Run& {
+                    for (auto& item : runs) {
+                        const int delta = item.first - key;  // the same rule, a fraction of a pixel over
+                        if (delta >= -1 && delta <= 1) {
+                            return item.second;
+                        }
+                    }
+                    return runs[key];
+                };
                 const size_t end = std::min(span.start + span.length, item.shown.size());
                 for (size_t i = span.start; i < end; ++i) {
                     const wchar_t c = item.shown[i];
-                    if (c != L'│' && c != L'─' && c != L'┼' && c != L'┴') {
+                    const bool vert = c == L'│' || c == L'┼' || c == L'┴';
+                    const bool horz = c == L'─' || c == L'┼' || c == L'┴';
+                    if (!vert && !horz) {
                         continue;
                     }
                     FLOAT atX = 0, atY = 0;
@@ -4838,16 +4856,32 @@ void ChatWindow::PaintMarkdown(const FeedItem& item, float x, float y, float lef
                     }
                     const float cellLeft = x + cell.left;
                     const float cellTop = y + cell.top;
-                    const float centerX = snap(cellLeft + cell.width / 2.f);
-                    const float centerY = snap(cellTop + cell.height / 2.f);
-                    if (c != L'│') {
-                        target_->DrawLine({cellLeft, centerY}, {cellLeft + cell.width, centerY}, code.get(), pixel);
+                    if (horz) {
+                        const int key = static_cast<int>(std::floor((cellTop + cell.height * 0.5f) / pixel));
+                        Run& run = runOf(across, key);
+                        run.from = std::min(run.from, cellLeft);
+                        run.to = std::max(run.to, cellLeft + cell.width);
                     }
-                    if (c != L'─') {
-                        target_->DrawLine({centerX, cellTop}, {centerX, c == L'┴' ? centerY : cellTop + cell.height},
-                                          code.get(), pixel);
+                    if (vert) {
+                        const int key = static_cast<int>(std::floor((cellLeft + cell.width * 0.5f) / pixel));
+                        Run& run = runOf(down, key);
+                        run.from = std::min(run.from, cellTop);
+                        // A tee closes the grid: nothing hangs below that rule.
+                        run.to = std::max(run.to, c == L'┴' ? cellTop + cell.height * 0.5f : cellTop + cell.height);
                     }
                     item.layout->SetDrawingEffect(hidden.get(), DWRITE_TEXT_RANGE{static_cast<UINT32>(i), 1});
+                }
+                for (const auto& [col, run] : down) {
+                    const float x0 = static_cast<float>(col) * pixel;
+                    Solid(D2D1::RectF(x0, std::floor(run.from / pixel) * pixel, x0 + pixel,
+                                      std::ceil(run.to / pixel) * pixel),
+                          kCodeText);
+                }
+                for (const auto& [row, run] : across) {
+                    const float y0 = static_cast<float>(row) * pixel;
+                    Solid(D2D1::RectF(std::floor(run.from / pixel) * pixel, y0,
+                                      std::ceil(run.to / pixel) * pixel, y0 + pixel),
+                          kCodeText);
                 }
             }
         } else {
