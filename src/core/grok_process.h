@@ -118,6 +118,7 @@ private:
     bool sessionOpen_ = false;   // session/new answered
     bool mcpReady_ = false;      // Grok has connected to our tools (or we stopped waiting for it)
     bool turnActive_ = false;
+    std::string apiError_;       // the turn's real failure (retry_state failed), for the bare "Internal error"
     std::deque<Json> queue_;     // prompts (ACP content blocks) waiting for the session or the turn
     std::string pendingModel_;   // SetModel before the session was open
     bool textOpen_ = false;      // a streamed text block is running

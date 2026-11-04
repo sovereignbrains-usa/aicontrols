@@ -560,6 +560,14 @@ void GrokProcess::OnResponse(const Json& message) {
 void GrokProcess::OnNotification(const std::string& method, const Json& params) {
     if (method == "session/update") {
         OnUpdate(JsonAt(params, "update"));
+    } else if (method == "_x.ai/session/update") {
+        // The real reason of a failed turn ("API error (status 402 Payment Required): Grok Build usage balance
+        // exhausted") comes here; the prompt's own error is only "Internal error" (04.11.2026, his journal).
+        const Json& update = JsonAt(params, "update");
+        if (JsonStr(update, "sessionUpdate") == "retry_state" && JsonStr(update, "type") == "failed") {
+            std::lock_guard lock(stateMutex_);
+            apiError_ = JsonStr(update, "message");
+        }
     } else if (method == "_x.ai/mcp_initialized") {
         MarkReady();
     }
@@ -789,6 +797,7 @@ void GrokProcess::Pump() {
         queue_.pop_front();
         turnActive_ = true;
         textOpen_ = false;
+        apiError_.clear();
         session = sessionId_;
     }
     EmitState("running");
@@ -798,8 +807,11 @@ void GrokProcess::Pump() {
 
 void GrokProcess::FinishTurn(const Json& result, const Json& error) {
     bool more = false;
+    std::string apiError;
     {
         std::lock_guard lock(stateMutex_);
+        apiError = std::move(apiError_);
+        apiError_.clear();
         turnActive_ = false;
         textOpen_ = false;
         refusals_.clear();  // a "no" whose call never came: not carried to the next turn
@@ -809,7 +821,7 @@ void GrokProcess::FinishTurn(const Json& result, const Json& error) {
     if (!error.is_null()) {
         out["subtype"] = "error_during_execution";
         out["is_error"] = true;
-        out["result"] = JsonStr(error, "message");
+        out["result"] = apiError.empty() ? JsonStr(error, "message") : "Grok: " + apiError;
     } else {
         // The last request of the turn is the chat's size now ("Auto" and the context ring read it).
         const Json& meta = JsonAt(result, "_meta");
