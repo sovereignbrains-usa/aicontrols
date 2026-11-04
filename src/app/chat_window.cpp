@@ -1747,6 +1747,7 @@ wil::com_ptr<ID2D1PathGeometry> githubMark_;  // the projects' mark, made when f
     WPARAM generation_ = 0;      // the open chat's process; stale posts are dropped, a parked chat's go to it
     bool running_ = false;
     bool busy_ = false;
+    bool stopAsked_ = false;  // Stop was pressed: the turn's bare "error_during_execution" is his doing, not a failure
     bool stateEvents_ = false;  // the CLI reports its session state; else a result ends the turn
     std::string sessionId_;
     std::wstring title_;
@@ -13381,7 +13382,10 @@ void ChatWindow::OnClaude(const Json& message) {
             }
         }
         const Json& isError = JsonAt(message, "is_error");
-        if ((isError.is_boolean() && isError.get<bool>()) || JsonStr(message, "subtype") != "success") {
+        const bool stopped = std::exchange(stopAsked_, false);
+        const bool bareStop = stopped && JsonStr(message, "result").empty() &&
+                              JsonStr(message, "subtype") == "error_during_execution";
+        if (!bareStop && ((isError.is_boolean() && isError.get<bool>()) || JsonStr(message, "subtype") != "success")) {
             std::string text = JsonStr(message, "result");
             if (text.empty()) {
                 text = JsonStr(message, "subtype");
@@ -13635,6 +13639,7 @@ void ChatWindow::CancelApprovals() {
 }
 
 void ChatWindow::StopTurn() {
+    stopAsked_ = true;
     CancelApprovals();
     runner_->host.CancelAll();
     runner_->agent->Interrupt();
