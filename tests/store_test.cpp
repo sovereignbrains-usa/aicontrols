@@ -496,6 +496,16 @@ This session is being continued
                "the copy has both parts, whole");
         Expect(fs::exists(historyArc / L"part-c.jsonl") && fs::exists(grokArc / L"part-g" / L"extra.bin"),
                "archiving does not remove the live chat");
+        {  // on a volume that can pack files, the copy is packed (the live chat is not touched)
+            DWORD flags = 0;
+            const std::wstring volume = fs::absolute(copied).root_path().wstring();
+            if (GetVolumeInformationW(volume.c_str(), nullptr, 0, nullptr, nullptr, &flags, nullptr, 0) &&
+                (flags & FILE_FILE_COMPRESSION) != 0) {
+                const DWORD packed = GetFileAttributesW(copied.c_str());
+                Expect(packed != INVALID_FILE_ATTRIBUTES && (packed & FILE_ATTRIBUTE_COMPRESSED) != 0,
+                       "the archived chat's folder is stored packed");
+            }
+        }
         const auto listedCopy = aic::ListArchivedChats();
         Expect(listedCopy.size() == 1 && listedCopy[0].id == "part-g" && listedCopy[0].title == L"Архивный" &&
                    listedCopy[0].folder == arc && listedCopy[0].parts.size() == 2 && !listedCopy[0].parts[0].grok &&

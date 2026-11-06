@@ -2,6 +2,7 @@
 
 #include <shellapi.h>
 #include <shlobj.h>
+#include <winioctl.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -1003,6 +1004,21 @@ bool SameSize(const fs::path& left, const fs::path& right) {
     return fs::file_size(left, a) == fs::file_size(right, b) && !a && !b;
 }
 
+// NTFS compression for a folder: files made in it afterwards are stored packed, and read back as they were. Archived
+// transcripts are text in thousands of near-equal lines (Grok's phase changes, tool output), about ten to one. Where
+// the volume cannot (FAT, a share) nothing happens and the copy is as big as before.
+void CompressFolder(const fs::path& folder) {
+    const HANDLE handle = CreateFileW(folder.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                      nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) {
+        return;
+    }
+    USHORT format = COMPRESSION_FORMAT_DEFAULT;
+    DWORD returned = 0;
+    DeviceIoControl(handle, FSCTL_SET_COMPRESSION, &format, sizeof(format), nullptr, 0, &returned, nullptr);
+    CloseHandle(handle);
+}
+
 // A file, or a folder and everything in it. False if any of it did not arrive the same size.
 bool CopyTree(const fs::path& from, const fs::path& to) {
     std::error_code error;
@@ -1155,6 +1171,7 @@ bool ArchiveChat(const std::wstring& workspace, const SessionInfo& session) {
     if (error || !fs::is_directory(partial, error)) {
         return false;
     }
+    CompressFolder(partial);  // what goes in is stored packed: transcripts shrink about tenfold
     const auto rollback = [&] {
         std::error_code gone;
         fs::remove_all(partial, gone);
