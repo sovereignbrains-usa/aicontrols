@@ -134,10 +134,10 @@ int BrowserView::BarHeight() const {
 
 RECT BrowserView::FieldRect(const RECT& client) const {
     const int bar = Dip(48);  // the address row only: the bookmarks row hangs under it
-    const int marginX = Dip(12);
+    const int marginX = Dip(12) + Dip(32);  // the back arrow stands left of the pill
     const int fieldH = Dip(32);
     const int top = std::max(0, (bar - fieldH) / 2);
-    const int right = std::max(marginX + Dip(64), static_cast<int>(client.right) - marginX);
+    const int right = std::max(marginX + Dip(64), static_cast<int>(client.right) - Dip(12));
     return RECT{marginX, top, right, top + fieldH};
 }
 
@@ -844,6 +844,30 @@ void BrowserView::PaintChrome(HDC dc, const RECT& client) {
     Gdiplus::Graphics canvas(dc);
     canvas.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
     canvas.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
+    {
+        // The back arrow: lit while the page has somewhere to go back to.
+        BOOL can = FALSE;
+        if (ICoreWebView2* view = ActiveView()) {
+            view->get_CanGoBack(&can);
+        }
+        if (can && hot_ == kHitBack) {
+            const Gdiplus::SolidBrush hover(Gdiplus::Color(255, 0x2e, 0x2e, 0x33));
+            canvas.FillEllipse(&hover, static_cast<float>(back_.left), static_cast<float>(back_.top),
+                               static_cast<float>(back_.right - back_.left),
+                               static_cast<float>(back_.bottom - back_.top));
+        }
+        const BYTE shade = !can ? 0x55 : (hot_ == kHitBack ? 0xf2 : 0xb4);
+        Gdiplus::Pen arrow(Gdiplus::Color(255, shade, shade, shade), std::max(1.4f, DipF(1.6f)));
+        arrow.SetLineJoin(Gdiplus::LineJoinRound);
+        arrow.SetStartCap(Gdiplus::LineCapRound);
+        arrow.SetEndCap(Gdiplus::LineCapRound);
+        const float ax = (back_.left + back_.right) / 2.f;
+        const float ay = (back_.top + back_.bottom) / 2.f;
+        const float half = DipF(6.f);
+        canvas.DrawLine(&arrow, ax + half, ay, ax - half, ay);
+        canvas.DrawLine(&arrow, ax - half, ay, ax - half * 0.15f, ay - half * 0.85f);
+        canvas.DrawLine(&arrow, ax - half, ay, ax - half * 0.15f, ay + half * 0.85f);
+    }
     const float radius = DipF(8.f);
     const float left = static_cast<float>(field.left);
     const float top = static_cast<float>(field.top);
@@ -937,12 +961,14 @@ void BrowserView::LayoutBar() {
     hidden_.clear();
     more_ = {};
     star_ = {};
+    back_ = {};
     if (host_ == nullptr) {
         return;
     }
     RECT client{};
     GetClientRect(host_, &client);
     const RECT field = FieldRect(client);
+    back_ = RECT{Dip(8), field.top, Dip(8) + Dip(32), field.bottom};
     star_ = RECT{field.right - Dip(30), field.top + Dip(4), field.right - Dip(6), field.bottom - Dip(4)};
     if (marks_.empty()) {
         return;
@@ -986,6 +1012,9 @@ void BrowserView::LayoutBar() {
 }
 
 int BrowserView::HitBar(POINT point) const {
+    if (PtInRect(&back_, point)) {
+        return kHitBack;
+    }
     if (PtInRect(&star_, point) && !BookmarkHost(ActiveSource()).empty()) {
         return kHitStar;
     }
@@ -1074,7 +1103,12 @@ void BrowserView::ToggleStar() {
 
 void BrowserView::OnBarClick(POINT point, bool middle) {
     const int hit = HitBar(point);
-    if (hit == kHitStar && !middle) {
+    if (hit == kHitBack) {
+        BOOL can = FALSE;
+        if (ICoreWebView2* view = ActiveView(); view != nullptr && SUCCEEDED(view->get_CanGoBack(&can)) && can) {
+            view->GoBack();
+        }
+    } else if (hit == kHitStar && !middle) {
         ToggleStar();
     } else if (hit == kHitMore) {
         if (!menu_ || host_ == nullptr) {
@@ -1401,6 +1435,16 @@ void BrowserView::WatchAddress(ICoreWebView2* view) {
         return;
     }
     EventRegistrationToken token{};
+    view->add_HistoryChanged(  // the arrow lights or dims with the page's history
+        Microsoft::WRL::Callback<ICoreWebView2HistoryChangedEventHandler>(
+            [this](ICoreWebView2* sender, IUnknown*) {
+                if (sender != nullptr && sender == ActiveView()) {
+                    InvalidateBar();
+                }
+                return S_OK;
+            })
+            .Get(),
+        &token);
     view->add_SourceChanged(
         Microsoft::WRL::Callback<ICoreWebView2SourceChangedEventHandler>(
             [this](ICoreWebView2* sender, ICoreWebView2SourceChangedEventArgs*) {
@@ -1470,10 +1514,26 @@ void BrowserView::Arm(ICoreWebView2* view) {
         &token);
     wil::com_ptr<ICoreWebView2_4> four;
     if (SUCCEEDED(view->QueryInterface(IID_PPV_ARGS(four.put())))) {
-        four->add_DownloadStarting(  // the agent downloads nothing, and neither does a tab beside it
+        four->add_DownloadStarting(  // a file lands in Downloads only after the person says yes (the agent's page too)
             Microsoft::WRL::Callback<ICoreWebView2DownloadStartingEventHandler>(
-                [](ICoreWebView2*, ICoreWebView2DownloadStartingEventArgs* args) {
-                    args->put_Cancel(TRUE);
+                [this](ICoreWebView2*, ICoreWebView2DownloadStartingEventArgs* args) {
+                    std::wstring name = L"(без имени)", from;
+                    wil::unique_cotaskmem_string path;
+                    if (SUCCEEDED(args->get_ResultFilePath(&path)) && path) {
+                        name = std::filesystem::path(path.get()).filename().wstring();
+                    }
+                    wil::com_ptr<ICoreWebView2DownloadOperation> operation;
+                    wil::unique_cotaskmem_string uri;
+                    if (SUCCEEDED(args->get_DownloadOperation(&operation)) && operation &&
+                        SUCCEEDED(operation->get_Uri(&uri)) && uri) {
+                        from = BookmarkHost(uri.get());
+                    }
+                    const std::wstring text = L"Сохранить файл в Загрузки?\n\n" + name +
+                                              (from.empty() ? L"" : L"\nс " + from);
+                    if (MessageBoxW(host_ != nullptr ? host_ : window_, text.c_str(), L"Загрузка из браузера",
+                                    MB_YESNO | MB_ICONQUESTION | MB_SETFOREGROUND) != IDYES) {
+                        args->put_Cancel(TRUE);
+                    }
                     return S_OK;
                 })
                 .Get(),

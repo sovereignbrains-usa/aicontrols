@@ -135,7 +135,7 @@ private:
     std::function<void(int)> popupClosed_;  // that window asked to close itself (window.close)
 
     // UI thread only: the bookmarks row.
-    static constexpr int kHitNone = -1, kHitStar = -2, kHitMore = -3;
+    static constexpr int kHitNone = -1, kHitStar = -2, kHitMore = -3, kHitBack = -4;
     struct Chip {
         RECT rect{};
         size_t index = 0;
@@ -146,6 +146,7 @@ private:
     std::vector<size_t> hidden_;       // the rest, behind the "»"
     RECT more_{};                      // the "»", empty when all fit
     RECT star_{};
+    RECT back_{};                      // the "back" arrow, left of the address
     int hot_ = kHitNone;
     bool tracking_ = false;
     std::map<std::wstring, std::shared_ptr<Gdiplus::Bitmap>> icons_;  // by host; empty: looked, none
