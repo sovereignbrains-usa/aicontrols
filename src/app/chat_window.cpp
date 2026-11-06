@@ -2139,6 +2139,7 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
                                [this] { AddBrowserTab(); });
         browserView_->SetPopupHooks([this](int page) { AddPopupTab(page); },
                                     [this](int page) { ClosePopupTab(page); });
+        browserView_->SetTitleHook([this] { Refresh(); });  // the tabs are named after their pages
         SetBrowserPage(browserView_.get());
         // The frame is recalculated without the caption (WM_NCCALCSIZE).
         SetWindowPos(hwnd_, nullptr, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER);
@@ -3645,18 +3646,37 @@ Geometry ChatWindow::Layout() const {
     }
     if (termWidth > 0) {
         g.term = D2D1::RectF(0, kHeader, termWidth, g.height);
-        g.termScreen = D2D1::RectF(g.term.left + 14, g.term.top + 44, g.term.right - 8, g.term.bottom - 12);
-        float tabLeft = g.term.left + 10;
+        g.termScreen = D2D1::RectF(g.term.left + 14, g.term.top + 8, g.term.right - 8, g.term.bottom - 12);
+        // The tabs sit in the header, in the row of the panel's buttons, right after them.
+        const float stripTop = buttonTop;
+        const float stripBottom = buttonTop + kButton;
+        const float stripLeft = g.browserBtn.right + 12.f;
+        const bool wide = (PreviewShown() || BrowserShown() || previewWide_) && !PreviewOwnsControls();
+        // Not under the header's buttons at the right (a panel widened over the window reaches them).
+        const float headerLimit =
+            (g.memory.right > g.memory.left ? g.memory.left : (g.update.right > g.update.left ? g.update.left : g.winMin.left)) - 8.f;
+        const float stripRight = std::max(std::min(g.term.right - 8.f, headerLimit) - (wide ? 32.f : 0.f), stripLeft + 96.f);
+        const float addWidth = PreviewOwnsControls() ? 0.f : 28.f + 4.f;
+        std::vector<float> widths;
+        float total = 0;
         for (const auto& tab : tabs_) {
-            const float width = TextWidth(TabLabel(*tab), ui_.get()) + 16 + 20;
-            g.termTabs.push_back(D2D1::RectF(tabLeft, g.term.top + 8, tabLeft + width, g.term.top + 36));
+            const float width = std::clamp(TextWidth(TabLabel(*tab), ui_.get()) + 16 + 20, 64.f, 170.f);
+            widths.push_back(width);
+            total += width + 4;
+        }
+        const float room = stripRight - stripLeft - addWidth;
+        const float scale = total > room && total > 0 ? std::max(0.f, room) / total : 1.f;
+        float tabLeft = stripLeft;
+        for (const float w : widths) {
+            const float width = std::max(40.f, std::floor((w + 4) * scale) - 4.f);
+            g.termTabs.push_back(D2D1::RectF(tabLeft, stripTop, tabLeft + width, stripBottom));
             tabLeft += width + 4;
         }
         if (!PreviewOwnsControls()) {
-            g.termAdd = D2D1::RectF(tabLeft, g.term.top + 8, tabLeft + 28, g.term.top + 36);
+            g.termAdd = D2D1::RectF(tabLeft, stripTop, tabLeft + 28, stripBottom);
         }
-        if ((PreviewShown() || BrowserShown() || previewWide_) && !PreviewOwnsControls()) {
-            g.termWide = D2D1::RectF(g.term.right - 12 - 28, g.term.top + 8, g.term.right - 12, g.term.top + 36);
+        if (wide) {
+            g.termWide = D2D1::RectF(stripRight + 4.f, stripTop, stripRight + 4.f + 28, stripBottom);
         }
     }
     if (secretsOpen_ && sidebarWidth > 0) {
@@ -3869,21 +3889,22 @@ Hit ChatWindow::HitTest(float x, float y) const {
         }
         return {};
     }
+    // The tabs, "+" and the widen arrows are in the header, above the panel.
+    if (Inside(g.termWide, x, y)) {
+        return {Target::PreviewWide};
+    }
+    for (size_t i = 0; i < g.termTabs.size(); ++i) {
+        if (Inside(TabCloseRect(g.termTabs[i]), x, y) && !(PreviewOwnsControls() && i == activeTab_)) {
+            return {Target::TermTabClose, i};
+        }
+        if (Inside(g.termTabs[i], x, y)) {
+            return {Target::TermTab, i};
+        }
+    }
+    if (Inside(g.termAdd, x, y)) {
+        return {Target::TermAdd};
+    }
     if (Inside(g.term, x, y)) {
-        if (Inside(g.termWide, x, y)) {
-            return {Target::PreviewWide};
-        }
-        for (size_t i = 0; i < g.termTabs.size(); ++i) {
-            if (Inside(TabCloseRect(g.termTabs[i]), x, y) && !(PreviewOwnsControls() && i == activeTab_)) {
-                return {Target::TermTabClose, i};
-            }
-            if (Inside(g.termTabs[i], x, y)) {
-                return {Target::TermTab, i};
-            }
-        }
-        if (Inside(g.termAdd, x, y)) {
-            return {Target::TermAdd};
-        }
         return Inside(g.termScreen, x, y) ? Hit{Target::TermScreen} : Hit{};
     }
     if (Inside(g.winClose, x, y)) {
@@ -6052,6 +6073,12 @@ void ChatWindow::TerminalGrid(int& cols, int& rows) const {
 
 std::wstring ChatWindow::TabLabel(const TermTab& tab) const {
     if (tab.browser) {
+        if (browserView_) {
+            std::wstring title = browserView_->PageTitle(tab.browserPage);
+            if (!title.empty()) {
+                return title;
+            }
+        }
         return tab.browserPage == 0 ? L"Браузер" : std::format(L"Браузер {}", tab.number);
     }
     if (!tab.preview.empty()) {
@@ -6517,7 +6544,15 @@ void ChatWindow::PaintTerminal(const Geometry& g) {
         if (active || hovered) {
             Fill(r, 6.f, active ? kRaised : kCard);
         }
-        Text(TabLabel(*tabs_[i]), ui_.get(), D2D1::RectF(r.left + 10, r.top, r.right - 22, r.bottom),
+        std::wstring label = TabLabel(*tabs_[i]);
+        const float room = r.right - 22 - (r.left + 10);
+        if (TextWidth(label, ui_.get()) > room) {  // too long for the tab: cut, with an ellipsis
+            while (label.size() > 1 && TextWidth(label + L"…", ui_.get()) > room) {
+                label.pop_back();
+            }
+            label += L"…";
+        }
+        Text(label, ui_.get(), D2D1::RectF(r.left + 10, r.top, r.right - 22, r.bottom),
              active ? kPrimary : kSecondary);
         if ((active || hovered) && !(PreviewOwnsControls() && active)) {  // such a page closes itself
             const D2D1_RECT_F x = TabCloseRect(r);

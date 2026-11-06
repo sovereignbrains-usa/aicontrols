@@ -41,6 +41,10 @@ public:
     // UI thread: the window's own menu (its style) and its "another browser tab", for the bookmarks row.
     void SetHooks(std::function<int(HMENU, POINT)> menu, std::function<void()> newTab);
     void SetPopupHooks(std::function<void(int)> opened, std::function<void(int)> closed);
+    // UI thread: `changed` runs when a page's title or address changes (the tabs are named after them).
+    void SetTitleHook(std::function<void()> changed);
+    // UI thread: what the page in `slot` is called (its title, else its address's host); empty while it has none.
+    std::wstring PageTitle(int slot) const;
     // UI thread: the address field, so a person can type where to go. The tool does not call this.
     void FocusAddress();
     // UI thread: another page beside the tool's. 0 is the tool's page; the rest are the person's own tabs.
@@ -94,6 +98,8 @@ private:
     bool Marked(const std::wstring& source) const;
     void PaintBar(HDC dc, const RECT& client);
     void WatchIcon(ICoreWebView2* view);
+    void ReadTitle(ICoreWebView2* view);  // a page's title or address changed: read it once, tell the window
+    static std::wstring TitleOf(ICoreWebView2* view);
     void FetchIcon(ICoreWebView2* view);
     Gdiplus::Bitmap* Icon(const std::wstring& host);
     void InvalidateBar();
@@ -133,6 +139,8 @@ private:
     std::function<void()> newTab_;
     std::function<void(int)> popupOpened_;  // a page opened a window (a sign-in): its slot, already a tab to show
     std::function<void(int)> popupClosed_;  // that window asked to close itself (window.close)
+    std::function<void()> titleChanged_;    // a page's title or address changed
+    std::map<ICoreWebView2*, std::wstring> titles_;  // what each page is called, by view (UI thread)
 
     // UI thread only: the bookmarks row.
     static constexpr int kHitNone = -1, kHitStar = -2, kHitMore = -3, kHitBack = -4;

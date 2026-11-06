@@ -1451,6 +1451,7 @@ void BrowserView::WatchAddress(ICoreWebView2* view) {
                 if (sender != nullptr && sender == ActiveView()) {
                     InvalidateBar();  // the star and the lit chip follow the page
                 }
+                ReadTitle(sender);
                 if (edit_ == nullptr || GetFocus() == edit_ || sender == nullptr || sender != ActiveView()) {
                     return S_OK;
                 }
@@ -1460,6 +1461,14 @@ void BrowserView::WatchAddress(ICoreWebView2* view) {
                     return S_OK;
                 }
                 SetWindowTextW(edit_, source.get());
+                return S_OK;
+            })
+            .Get(),
+        &token);
+    view->add_DocumentTitleChanged(
+        Microsoft::WRL::Callback<ICoreWebView2DocumentTitleChangedEventHandler>(
+            [this](ICoreWebView2* sender, IUnknown*) {
+                ReadTitle(sender);
                 return S_OK;
             })
             .Get(),
@@ -1609,6 +1618,66 @@ void BrowserView::CreateExtra(size_t index) {
 void BrowserView::SetPopupHooks(std::function<void(int)> opened, std::function<void(int)> closed) {
     popupOpened_ = std::move(opened);
     popupClosed_ = std::move(closed);
+}
+
+void BrowserView::SetTitleHook(std::function<void()> changed) {
+    titleChanged_ = std::move(changed);
+}
+
+// Read on every paint and layout, so the engine is asked only when a page says its title or address changed.
+std::wstring BrowserView::PageTitle(int slot) const {
+    ICoreWebView2* view = nullptr;
+    if (slot <= 0) {
+        view = view_.get();
+    } else if (static_cast<size_t>(slot - 1) < extras_.size()) {
+        view = extras_[static_cast<size_t>(slot - 1)].view.get();
+    }
+    if (view == nullptr) {
+        return {};
+    }
+    const auto found = titles_.find(view);
+    return found == titles_.end() ? std::wstring{} : found->second;
+}
+
+void BrowserView::ReadTitle(ICoreWebView2* view) {
+    if (view == nullptr) {
+        return;
+    }
+    titles_[view] = TitleOf(view);
+    if (titleChanged_) {
+        titleChanged_();
+    }
+}
+
+std::wstring BrowserView::TitleOf(ICoreWebView2* view) {
+    wil::unique_cotaskmem_string source;
+    std::wstring address;
+    if (SUCCEEDED(view->get_Source(&source)) && source != nullptr && wcscmp(source.get(), L"about:blank") != 0) {
+        address = source.get();
+    }
+    if (address.empty()) {
+        return {};  // a blank page: the tab keeps its plain name
+    }
+    wil::unique_cotaskmem_string title;
+    if (SUCCEEDED(view->get_DocumentTitle(&title)) && title != nullptr && title.get()[0] != L'\0') {
+        std::wstring text = title.get();
+        // The engine gives the address as the title while the page has none.
+        if (text != address) {
+            return text;
+        }
+    }
+    // The host of the address: "https://www.example.com/a" -> "example.com".
+    const size_t scheme = address.find(L"://");
+    if (scheme == std::wstring::npos) {
+        return address;
+    }
+    size_t start = scheme + 3;
+    size_t end = address.find_first_of(L"/?#", start);
+    std::wstring host = address.substr(start, end == std::wstring::npos ? std::wstring::npos : end - start);
+    if (host.starts_with(L"www.")) {
+        host.erase(0, 4);
+    }
+    return host;
 }
 
 // The page asked for a new window. It gets a page of its own (a slot after the person's tabs) that
