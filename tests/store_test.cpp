@@ -171,6 +171,13 @@ int main() {
            "a compacted chat: the mark, no summary");
     Expect(entries.size() == 3 && entries[1].text == L"Summary:\n1. the word is pelican",
            "the summary kept on the mark, without the CLI's words to itself");
+    // The CLI's notes after a Stop are bookkeeping, not the user's words.
+    std::ofstream(historyA / L"chat-3.jsonl")
+        << R"({"type":"user","message":{"role":"user","content":"go"}})" << "\n"
+        << R"({"type":"user","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]}})" << "\n"
+        << R"({"type":"user","message":{"role":"user","content":"again"}})" << "\n";
+    const std::vector<aic::TranscriptEntry> stopped = aic::LoadTranscript(a, "chat-3", 100, truncated);
+    Expect(stopped.size() == 2 && stopped[1].text == L"again", "the CLI's note after a Stop is not a user's message");
     // A switch after it: the summary and what came after, not what it sums up; each part's words by its CLI.
     const std::wstring handoff = aic::ChatSoFar({{false, entries}, {true, {{aic::EntryKind::Assistant, L"pelican"}}}}, 100);
     Expect(handoff.find(L"remember pelican") == std::wstring::npos && handoff.find(L"the word is pelican") != std::wstring::npos &&

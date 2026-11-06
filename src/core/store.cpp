@@ -1583,8 +1583,10 @@ std::vector<TranscriptEntry> LoadClaudeFile(const fs::path& file, size_t limit, 
                     }
                 }
             }
-            // Tool results carry no text; "<command-…>" and the like are the CLI's own bookkeeping.
-            if ((!text.empty() && text.front() != L'<') || (text.empty() && !images.empty())) {
+            // Tool results carry no text; "<command-…>" and the like are the CLI's own bookkeeping, and so is the
+            // "[Request interrupted by user…]" it writes after a Stop.
+            if ((!text.empty() && text.front() != L'<' && !text.starts_with(L"[Request interrupted by user")) ||
+                (text.empty() && !images.empty())) {
                 entries.push_back({EntryKind::User, std::move(text), std::move(images)});
             }
         } else if (type == "assistant") {
