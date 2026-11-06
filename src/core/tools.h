@@ -114,6 +114,9 @@ public:
     void HandleMcp(const std::string& requestId, const Json& request);
     // Stops running commands; their replies still go out (as errors), the CLI is waiting for them.
     void CancelAll();
+    // Stops the one running call of this tool with this input (the card's "Прервать"): its reply goes out as an
+    // error and the model's turn goes on. False when no such call is running.
+    bool CancelOne(const std::string& name, const Json& input);
 
 private:
     void Reap();
@@ -122,6 +125,8 @@ private:
         std::thread thread;
         std::atomic<bool> done = false;
         std::atomic<bool> cancel = false;
+        std::string name;  // what it runs, to find it from its card
+        Json arguments;
     };
 
     Tools& tools_;

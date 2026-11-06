@@ -1410,6 +1410,32 @@ void ToolHost::CancelAll() {
     }
 }
 
+bool ToolHost::CancelOne(const std::string& name, const Json& input) {
+    std::lock_guard lock(mutex_);
+    bool found = false;
+    for (Job& job : jobs_) {
+        if (!job.done && !job.cancel && job.name == name && job.arguments == input) {
+            job.cancel = true;
+            found = true;
+        }
+    }
+    if (!found) {  // the input came back changed (a default filled in): a single call of that tool is it
+        Job* only = nullptr;
+        int running = 0;
+        for (Job& job : jobs_) {
+            if (!job.done && !job.cancel && job.name == name) {
+                only = &job;
+                ++running;
+            }
+        }
+        if (running == 1) {
+            only->cancel = true;
+            found = true;
+        }
+    }
+    return found;
+}
+
 void ToolHost::Reap() {
     std::lock_guard lock(mutex_);
     for (auto it = jobs_.begin(); it != jobs_.end();) {
@@ -1446,6 +1472,8 @@ void ToolHost::HandleMcp(const std::string& requestId, const Json& request) {
         Job& job = jobs_.emplace_back();
         const std::string name = JsonStr(params, "name");
         Json arguments = JsonAt(params, "arguments");
+        job.name = name;
+        job.arguments = arguments;
         job.thread = std::thread([this, &job, requestId, id, name, arguments = std::move(arguments)] {
             const ToolResult result = tools_.Execute(name, arguments, job.cancel);
             Json content = Json::array({Json{{"type", "text"}, {"text", result.text}}});

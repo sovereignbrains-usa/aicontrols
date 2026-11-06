@@ -137,6 +137,9 @@ struct CloneDone {
     std::string output;
 };
 constexpr UINT_PTR kStatusTimer = 1;
+// A call that is let through shows how long it has been running, and after kCancelAfter a button to stop it.
+constexpr UINT_PTR kCallTimer = 20;
+constexpr ULONGLONG kCancelAfter = 4000;  // ms
 constexpr UINT_PTR kTipTimer = 2;  // the pointer has rested on something long enough for its hint
 constexpr UINT_PTR kPreviewTimer = 3;  // the preview looks whether its file (or one beside it) has changed
 constexpr UINT kPreviewCheck = 700;    // ms
@@ -399,6 +402,7 @@ struct FeedItem {
     Json input;
     Verdict verdict = Verdict::Pending;
     bool done = false;         // the result has come back
+    ULONGLONG ranFrom = 0;     // GetTickCount64 when the call was let through: how long it has been running
     bool outputError = false;
     std::wstring output;       // what the tool returned
     size_t outputStart = 0;    // where it begins in the card's layout
@@ -627,6 +631,7 @@ enum class Target {
     CardPreview,    // row: a card that wrote a page: show it in the preview
     CardOpen,       // row: a card that wrote a file: open the file
     CardReveal,     // row: the same: show it in its folder
+    CardCancel,     // row: a call that has run a while: stop this one, the turn goes on
     FeedImage,      // row: the feed item, sub: its picture
     InsidePopup,  // on a panel, nothing to click
 };
@@ -1344,6 +1349,13 @@ private:
     // A page gets "preview" first; other files have it empty.
     static void ApprovalFileButtons(const Geometry& g, const FeedItem& item, D2D1_RECT_F& preview, D2D1_RECT_F& open,
                                     D2D1_RECT_F& reveal);
+    // "Прервать" in the title row of a call that is running; empty before it has run a while.
+    static D2D1_RECT_F CancelCallRect(const Geometry& g, const FeedItem& item);
+    static bool CallRunning(const FeedItem& item) {
+        return item.kind == Kind::Approval && item.verdict == Verdict::Allowed && !item.done;
+    }
+    void StartCall(FeedItem& item);  // the call is let through: the clock starts
+    void CancelCall(size_t index);
 
     // Pictures in the feed: above the bubble of the message they went with, or in the card of Grok's call that
     // made them; a click shows one over the window (the arrows go through the others), the right button copies,
@@ -1454,6 +1466,7 @@ private:
     }
     bool AnyBusy() const;
     void Submit();
+    void WarnLimits();
     void OnClaude(const Json& message);
     void OnClaudeExit(const ExitInfo& exit);
     void Add(Kind kind, std::wstring text, bool leading = false);
@@ -1471,6 +1484,13 @@ private:
         // After the processes: the tool threads answer through them, so they are joined first.
         Tools tools;
         ToolHost host{tools, [this](const std::string& id, Json response) { agent->Respond(id, std::move(response)); }};
+    };
+    // What a chat has used since this window opened it (the "Лимиты" panel shows it): the tokens that count against
+    // the plan in full (input, written to the cache, output) and those read back from the cache.
+    struct Spend {
+        long long fresh = 0;
+        long long cached = 0;
+        int turns = 0;
     };
     // A chat put aside while it answers: what is a chat's own, swapped out of the window's members.
     struct Parked {
@@ -1494,6 +1514,7 @@ private:
         std::wstring folderName;
         std::string autoModel = "sonnet";
         long long lastContext = 0;
+        Spend spend;
         std::wstring route;
         std::optional<FeedPoint> feedAnchor;
         std::optional<FeedPoint> feedFocus;
@@ -1721,6 +1742,9 @@ wil::com_ptr<ID2D1PathGeometry> githubMark_;  // the projects' mark, made when f
     // input), as switching down in a big chat would rewrite its whole cache.
     std::string autoModel_ = "sonnet";
     long long lastContext_ = 0;
+    Spend spend_;  // the open chat's (see Spend)
+    long long warnedSession_ = 0;  // the reset time of the windows already warned about (once each)
+    long long warnedWeek_ = 0;
     // Effort, applied when its panel closes.
     std::string pendingEffort_;
     bool draggingEffort_ = false;
@@ -2838,6 +2862,11 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
             KillTimer(hwnd_, kStatusTimer);
             status_.clear();
             Refresh();
+        } else if (wParam == kCallTimer) {
+            if (std::ranges::none_of(feed_, CallRunning)) {
+                KillTimer(hwnd_, kCallTimer);  // the next call starts it again
+            }
+            Refresh();
         } else if (wParam == kPreviewTimer) {
             CheckPreview();
         } else if (wParam == kVoiceTimer) {
@@ -3291,6 +3320,9 @@ void ChatWindow::OnClick(float x, float y) {
     case Target::ApprovalDeny:
         Decide(hit.row, false);
         break;
+    case Target::CardCancel:
+        CancelCall(hit.row);
+        break;
     case Target::CardPreview:
         OpenPreview(WrittenFile(feed_[hit.row], workspace_));
         return;
@@ -3680,7 +3712,8 @@ Geometry ChatWindow::Layout() const {
     }
     case Popup::Usage: {
         const float popupRight = ClampTo(g.usage.right + 4, 10.f + kUsageWidth, g.area - 10);
-        const float height = GrokRunning() ? 14 + 24 + kUsageRow + kUsageNote + 4 : 14 + 24 + 2 * kUsageRow + 4;
+        const float height = (GrokRunning() ? 14 + 24 + kUsageRow + kUsageNote + 4 : 14 + 24 + 2 * kUsageRow + 4) +
+                             (spend_.turns > 0 ? kUsageNote : 0.f);
         // Above the box, like the other panels: the input's own window would hide whatever lay over it.
         g.popup = D2D1::RectF(popupRight - kUsageWidth, g.box.top - 6 - height, popupRight, g.box.top - 6);
         break;
@@ -3906,6 +3939,9 @@ Hit ChatWindow::HitTest(float x, float y) const {
                 if (Inside(ImageRect(g, item, k), x, y)) {
                     return {Target::FeedImage, i, k};
                 }
+            }
+            if (const D2D1_RECT_F stop = CancelCallRect(g, item); stop.right > stop.left && Inside(stop, x, y)) {
+                return {Target::CardCancel, i};
             }
             if (HasFileActions(item)) {
                 D2D1_RECT_F preview{}, open{}, reveal{};
@@ -5037,6 +5073,35 @@ void ChatWindow::ApprovalFileButtons(const Geometry& g, const FeedItem& item, D2
     place(reveal);
 }
 
+D2D1_RECT_F ChatWindow::CancelCallRect(const Geometry& g, const FeedItem& item) {
+    if (!CallRunning(item) || item.ranFrom == 0 || GetTickCount64() - item.ranFrom < kCancelAfter) {
+        return {};
+    }
+    const float right = g.left + g.column - kCardPad - 110.f - 6.f;  // left of the "Идёт 12 с" label
+    const float top = item.top + kCardPad;
+    return D2D1::RectF(right - 78.f, top, right, top + kCardTitle);
+}
+
+void ChatWindow::StartCall(FeedItem& item) {
+    item.ranFrom = GetTickCount64();
+    SetTimer(hwnd_, kCallTimer, 1000, nullptr);
+}
+
+// Stops this one call. Its reply goes to the model as an error, and the turn goes on with it (the whole turn is
+// the "stop" button's).
+void ChatWindow::CancelCall(size_t index) {
+    if (index >= feed_.size() || !CallRunning(feed_[index])) {
+        return;
+    }
+    if (runner_->host.CancelOne(feed_[index].tool, feed_[index].input)) {
+        Flash(L"Вызов прерван, ход продолжается", 3000);
+    } else {
+        Flash(L"Этот вызов идёт внутри " + AgentName() + L": остановить можно только весь ход", 4500);
+    }
+    hover_ = {};
+    Refresh();
+}
+
 void ChatWindow::PaintApproval(const Geometry& g, const FeedItem& item, float left) {
     const bool pending = item.verdict == Verdict::Pending;
     const D2D1_RECT_F card = D2D1::RectF(left, item.top, left + g.column, item.top + item.height);
@@ -5055,6 +5120,18 @@ void ChatWindow::PaintApproval(const Geometry& g, const FeedItem& item, float le
         if (item.verdict == Verdict::Allowed) {
             label = !item.done ? L"Выполняется…" : (item.outputError ? L"Ошибка" : L"Готово");
             labelColor = item.done && item.outputError ? kDanger : kSecondary;
+            if (!item.done && item.ranFrom != 0) {  // how long it has run (a hung call shows itself)
+                const ULONGLONG seconds = (GetTickCount64() - item.ranFrom) / 1000;
+                if (seconds >= 3) {
+                    label = seconds < 60 ? std::format(L"Идёт {} с", seconds)
+                                         : std::format(L"Идёт {}:{:02}", seconds / 60, seconds % 60);
+                }
+                if (const D2D1_RECT_F stop = CancelCallRect(g, item); stop.right > stop.left) {
+                    const bool hot = onItem && hover_.target == Target::CardCancel;
+                    Fill(stop, 6.f, hot ? kLine : kRaised);
+                    Text(L"Прервать", cardButton_.get(), stop, hot ? kPrimary : kSecondary);
+                }
+            }
         } else {
             label = item.verdict == Verdict::Denied ? L"Отклонено" : L"Отменено";
         }
@@ -5548,9 +5625,16 @@ void ChatWindow::PaintUsage(const Geometry& g) {
         }
         top += kUsageRow;
     }
+    float note = top - 8;
     if (grok) {
-        Text(L"Разбивка по Build, Imagine и чату — на grok.com", ui_.get(), D2D1::RectF(left, top - 8, right, top + 14),
+        Text(L"Разбивка по Build, Imagine и чату — на grok.com", ui_.get(), D2D1::RectF(left, note, right, note + 22),
              kSecondary);
+        note += kUsageNote;
+    }
+    if (spend_.turns > 0) {  // this chat's own, since the window opened it
+        Text(std::format(L"Этот чат: {} тыс. токенов в лимит, {} тыс. из кэша · {} ход.", std::max(1LL, spend_.fresh / 1000),
+                         spend_.cached / 1000, spend_.turns),
+             ui_.get(), D2D1::RectF(left, note, right, note + 22), kSecondary);
     }
 }
 
@@ -10839,6 +10923,8 @@ std::wstring ChatWindow::TooltipText() {
                                                       : L"Голосовой ввод: говори, потом нажми ещё раз (Ctrl+M)");
     case Target::FeedImage:
         return L"Открыть здесь. Правая кнопка: копировать, открыть в программе, показать в папке";
+    case Target::CardCancel:
+        return L"Прервать только этот вызов: " + AgentName() + L" получит ошибку и продолжит";
     case Target::CardPreview:
     case Target::CardOpen:
     case Target::CardReveal:
@@ -11149,6 +11235,11 @@ D2D1_RECT_F ChatWindow::TipAnchor(const Geometry& g) const {
     case Target::FeedImage:
         if (row < feed_.size() && hover_.sub < feed_[row].images.size()) {
             return ImageRect(g, feed_[row], hover_.sub);
+        }
+        break;
+    case Target::CardCancel:
+        if (row < feed_.size()) {
+            return CancelCallRect(g, feed_[row]);
         }
         break;
     case Target::CardPreview:
@@ -13054,6 +13145,7 @@ void ChatWindow::ResetChat() {
     lastSent_ = 0;
     title_.clear();
     lastContext_ = 0;
+    spend_ = {};
     currentMessageId_.clear();
     streamed_.clear();
     feed_.clear();
@@ -13086,6 +13178,7 @@ void ChatWindow::SwapChat(Parked& chat) {
     swap(folderName_, chat.folderName);
     swap(autoModel_, chat.autoModel);
     swap(lastContext_, chat.lastContext);
+    swap(spend_, chat.spend);
     swap(route_, chat.route);
     swap(feedAnchor_, chat.feedAnchor);
     swap(feedFocus_, chat.feedFocus);
@@ -13240,6 +13333,28 @@ void ChatWindow::NewChat() {
     RebuildRows();  // the new chat shows under its project while that folder is open
 }
 
+// A plan window at 80% or more: said once, under the message that goes on spending it, with what this chat costs
+// a turn (it is read again whole each time).
+void ChatWindow::WarnLimits() {
+    if (GrokSelected()) {
+        return;
+    }
+    const auto warn = [&](const Limit& raw, long long& warned, const wchar_t* name, bool week) {
+        const Limit limit = Current(raw);
+        if (limit.percent < 80 || limit.resetsAt == 0 || warned == limit.resetsAt) {
+            return;
+        }
+        warned = limit.resetsAt;
+        std::wstring text = std::format(L"{} израсходован на {}%. {}", name, limit.percent, ResetText(limit, week));
+        if (lastContext_ > 20'000) {
+            text += std::format(L". Каждый ход в этом чате читает ≈ {} тыс. токенов контекста", lastContext_ / 1000);
+        }
+        Add(Kind::Notice, std::move(text));
+    };
+    warn(session_, warnedSession_, L"Лимит сессии (5 ч)", false);
+    warn(week_, warnedWeek_, L"Недельный лимит", true);
+}
+
 void ChatWindow::Submit() {
     if (readingArchive_) {
         Flash(L"Архив: только чтение. Верните чат, чтобы продолжить", 3500);
@@ -13296,6 +13411,7 @@ void ChatWindow::Submit() {
     runner_->agent->SendUserContent(std::move(content));
     Add(Kind::User, std::move(shown));
     feed_.back().images = std::move(images);
+    WarnLimits();
     attachments_.clear();
     SetWindowTextW(input_, L"");
     PlaceChildren();
@@ -13400,8 +13516,21 @@ void ChatWindow::OnClaude(const Json& message) {
         if (!GrokRunning()) {
             FetchUsage();  // a turn spent some: the ring follows
         }
+        long long turnFresh = 0;   // what the turn took from the plan in full ...
+        long long turnCached = 0;  // ... and what it only read back from the cache
         {  // how big the chat is now, for "Auto": its last request (the turn's sum counts the chat once per call)
             const Json& total = JsonAt(message, "usage");
+            const auto sum = [&](const char* key) {
+                const Json& value = JsonAt(total, key);
+                return value.is_number_integer() ? value.get<long long>() : 0LL;
+            };
+            turnFresh = sum("input_tokens") + sum("cache_creation_input_tokens") + sum("output_tokens");
+            turnCached = sum("cache_read_input_tokens");
+            if (turnFresh + turnCached > 0) {
+                spend_.fresh += turnFresh;
+                spend_.cached += turnCached;
+                ++spend_.turns;
+            }
             const Json& iterations = JsonAt(total, "iterations");
             const Json& usage = iterations.is_array() && !iterations.empty() ? iterations.back() : total;
             const auto tokens = [&](const char* key) {
@@ -13418,6 +13547,16 @@ void ChatWindow::OnClaude(const Json& message) {
         const bool stopped = std::exchange(stopAsked_, false);
         const bool bareStop = stopped && JsonStr(message, "result").empty() &&
                               JsonStr(message, "subtype") == "error_during_execution";
+        // What a turn cost, said where it is unexpected: one he stopped (the plan counts what was spent anyway,
+        // 03.11.2026, his: "прервал запрос — лимит всё равно ушёл"), and a heavy one.
+        const auto thousands = [](long long tokens) { return std::max(1LL, (tokens + 500) / 1000); };
+        if (stopped && turnFresh + turnCached > 0) {
+            Add(Kind::Notice, std::format(L"Ход остановлен: до этого ушло ≈ {} тыс. токенов в лимит (+ {} тыс. из кэша)",
+                                          thousands(turnFresh), thousands(turnCached)));
+        } else if (turnFresh >= 50'000) {
+            Add(Kind::Notice, std::format(L"Тяжёлый ход: ≈ {} тыс. токенов в лимит (+ {} тыс. из кэша)",
+                                          thousands(turnFresh), thousands(turnCached)));
+        }
         if (!bareStop && ((isError.is_boolean() && isError.get<bool>()) || JsonStr(message, "subtype") != "success")) {
             std::string text = JsonStr(message, "result");
             if (text.empty()) {
@@ -13577,6 +13716,7 @@ void ChatWindow::AskApproval(const std::string& requestId, const Json& request) 
     item.input = input;
     if (AllowedUnasked(name, input)) {  // the card still shows the call and its output, already allowed
         item.verdict = Verdict::Allowed;
+        StartCall(item);
         runner_->agent->Respond(requestId, Json{{"behavior", "allow"}, {"updatedInput", input}});
     }
     feed_.push_back(std::move(item));
@@ -13653,6 +13793,7 @@ void ChatWindow::Decide(size_t index, bool allow) {
     FeedItem& item = feed_[index];
     item.verdict = allow ? Verdict::Allowed : Verdict::Denied;
     if (allow) {
+        StartCall(item);
         runner_->agent->Respond(item.requestId, Json{{"behavior", "allow"}, {"updatedInput", item.input}});
     } else {
         runner_->agent->Respond(item.requestId, Json{{"behavior", "deny"}, {"message", "The user declined this call."}});
