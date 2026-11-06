@@ -1028,7 +1028,7 @@ private:
     // The chat's folder: the default, recent ones, any folder, or a GitHub repository (cloned first).
     void LoadRepos();
     void SetWorkspace(const std::wstring& folder);  // the folder only: it becomes a project, unfolded
-    void SwitchWorkspace(const std::wstring& folder);  // ... and a new chat starts there
+    void SwitchWorkspace(const std::wstring& folder, bool fresh = false);  // ... its latest chat opens (fresh: a new one starts)
     void NewChatIn(const std::wstring& folder);
     void PickWorkspace();
     void OpenRepo(size_t index);
@@ -7650,12 +7650,31 @@ void ChatWindow::SetWorkspace(const std::wstring& path) {
 }
 
 // The chats now work in `folder`: a new chat starts there.
-void ChatWindow::SwitchWorkspace(const std::wstring& folder) {
+void ChatWindow::SwitchWorkspace(const std::wstring& folder, bool fresh) {
     if (folder.empty() || folder == workspace_) {
         return;
     }
     LeaveChat();
     SetWorkspace(folder);
+    // Back in a project: its latest chat opens, not an empty one that is gone the moment another is chosen
+    // (03.11.2026, his: "заново захожу — открывается новый чат в проекте, перехожу — он пропадает").
+    if (!fresh) {
+        const std::vector<SessionInfo> listed = ListSessions(folder);
+        const SessionInfo* last = nullptr;
+        for (const SessionInfo& session : listed) {
+            if (!IsDoomed(folder, session) && (last == nullptr || FileTicks(session.modified) > FileTicks(last->modified))) {
+                last = &session;
+            }
+        }
+        if (last != nullptr) {
+            PlaceChildren();
+            OpenChat(folder, *last);
+            RefreshSessions();
+            Flash(L"Проект: " + folderName_, 2500);
+            Refresh();
+            return;
+        }
+    }
     StartClaude();
     TakeDraft("*" + ToUtf8(workspace_));
     RefreshSessions();
@@ -7668,7 +7687,7 @@ void ChatWindow::NewChatIn(const std::wstring& folder) {
     if (folder == workspace_) {
         NewChat();
     } else {
-        SwitchWorkspace(folder);
+        SwitchWorkspace(folder, true);
     }
 }
 
@@ -8562,7 +8581,7 @@ void ChatWindow::ShowProjectMenu(size_t row, POINT screen) {
 // Off the sidebar only: the folder and its chats stay where they are, and picking the folder again brings them back.
 void ChatWindow::RemoveProject(const std::wstring& folder) {
     if (folder == workspace_) {
-        SwitchWorkspace(DefaultWorkspace());
+        SwitchWorkspace(DefaultWorkspace(), true);
         if (folder == workspace_) {
             return;  // the answer running was kept
         }
@@ -13660,8 +13679,52 @@ void ChatWindow::StopTurn() {
 }
 
 void ChatWindow::OnClaudeExit(const ExitInfo& exit) {
+    const bool wasBusy = busy_;
     running_ = false;
     busy_ = false;
+    // The CLI no longer has the conversation it was asked to resume (its file was deleted or moved to the archive;
+    // 05.11.2026: the chat stopped answering, with a red line in the journal). Not an error to the reader: the chat
+    // goes on in a new session, and what was said goes with the next message.
+    if (exit.code != 0 && !GrokRunning() && !sessionId_.empty() && !readingArchive_ &&
+        exit.stderrTail.find("No conversation found") != std::string::npos) {
+        constexpr size_t kLongest = 40'000;
+        size_t end = feed_.size();
+        std::wstring retry;  // the message that went to the dead process: it goes again
+        if (wasBusy && end > 0 && feed_[end - 1].kind == Kind::User) {
+            retry = feed_[--end].text;
+        }
+        std::wstring said;
+        for (size_t i = 0; i < end; ++i) {
+            const FeedItem& item = feed_[i];
+            if (item.kind == Kind::User || item.kind == Kind::Assistant) {
+                said += (item.kind == Kind::User ? L"\n\nUser: " : L"\n\nClaude: ") + item.text;
+            }
+        }
+        if (said.size() > kLongest) {
+            said = L"\n\n…" + said.substr(said.size() - kLongest);
+        }
+        if (!said.empty()) {
+            handoff_ = "<earlier_chat>\nThe earlier session of this chat is lost on this computer. "
+                       "The chat so far, from what the window showed:" +
+                       ToUtf8(said) + "\n</earlier_chat>";
+        }
+        chainFrom_ = sessionId_;  // the list keeps one chat
+        sessionId_.clear();
+        lastContext_ = 0;
+        currentMessageId_.clear();
+        streamed_.clear();
+        Add(Kind::Notice, L"Прошлая сессия не найдена: продолжаю в новой, переписка выше уйдёт ей сводкой");
+        if (StartClaude() && !retry.empty()) {
+            Json content = Json::array();
+            if (!handoff_.empty()) {
+                content.push_back(Json{{"type", "text"}, {"text", std::exchange(handoff_, {})}});
+            }
+            content.push_back(Json{{"type", "text"}, {"text", ToUtf8(retry)}});
+            runner_->agent->SendUserContent(std::move(content));
+            busy_ = true;
+        }
+        return;
+    }
     std::wstring text = std::format(L"{} завершился (код {}).", GrokRunning() ? L"grok.exe" : L"claude.exe", exit.code);
     if (const std::wstring tail = LastLines(exit.stderrTail, 6); !tail.empty()) {
         text += L"\n" + tail;
