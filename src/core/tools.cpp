@@ -1074,6 +1074,11 @@ ToolResult Tools::RunCommand(const Json& input, const std::atomic<bool>& cancel)
     const std::wstring script =
         L"$ProgressPreference='SilentlyContinue';[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);"
         L"$OutputEncoding=[Console]::OutputEncoding;$global:AicOk=$true;$global:AicCode=0;"
+        // Windows PowerShell 5.1 reads a file without a BOM as ANSI: Cyrillic in UTF-8 sources came out as 'Ð¿Ñ€…'.
+        // A BOM still wins over this; writing is left as the command asks.
+        L"$PSDefaultParameterValues['Get-Content:Encoding']='UTF8';"
+        L"$PSDefaultParameterValues['Select-String:Encoding']='UTF8';"
+        L"$PSDefaultParameterValues['Import-Csv:Encoding']='UTF8';"
         L"try{& {\n" +
         ToWide(command) +
         L"\n$global:AicOk=$?;$global:AicCode=$LASTEXITCODE} 2>&1 | ForEach-Object{"

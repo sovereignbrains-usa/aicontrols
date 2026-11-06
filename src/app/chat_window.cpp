@@ -4429,6 +4429,18 @@ float ChatWindow::ItemWidth(const FeedItem& item, float column) {
 void ChatWindow::MeasureFeed(float column, float view) {
     const auto stale = [&](const FeedItem& item) { return item.layout && item.layoutWidth != ItemWidth(item, column); };
     bool any = false;
+    // Where the feed stands before anything is laid out again, and the height it had: a card that gets its output or
+    // loses its buttons, an answer measured anew, changes height above what is read; the feed has to keep to the item
+    // at its top (it slid down under the reader before, scrolled up) unless it follows the end.
+    const auto top = TopOfView();
+    const auto heightOf = [&] {
+        float sum = 0;
+        for (const FeedItem& item : feed_) {
+            sum += item.height;
+        }
+        return sum;
+    };
+    const float heightBefore = heightOf();
     for (FeedItem& item : feed_) {
         if (!item.layout) {
             MeasureItem(item, column);
@@ -4444,10 +4456,12 @@ void ChatWindow::MeasureFeed(float column, float view) {
         }
     }
     if (!any) {
+        if (heightOf() != heightBefore) {
+            BackToView(top);
+        }
         return;
     }
     // What is in sight and a screen's worth round it, so the wheel mostly comes to items laid out already.
-    const auto top = TopOfView();
     if (stick_) {
         float above = 0;
         for (size_t i = feed_.size(); i-- > 0 && above < 2 * view;) {
