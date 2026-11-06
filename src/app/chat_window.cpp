@@ -622,6 +622,7 @@ enum class Target {
     SideTab,      // row: 0 the general chats, 1 the projects: what the list below shows
     AddProject,   // "+" beside the search on the projects' tab: a folder or a GitHub repository (right click: their order)
     ModelRow,     // row: an index into the models
+    GrokInstall,  // under the models, when grok.exe is not there: fetches it and signs in
     AutoToggle,   // "Auto" atop the models
     FastToggle,   // "Fast" in the Grok row's options
     EffortTrack,
@@ -706,6 +707,7 @@ struct Geometry {
     float listTop = 0;
     // Models.
     D2D1_RECT_F autoRow{};
+    D2D1_RECT_F grokRow{};  // the offer to install Grok, last in the models
     float modelsTop = 0;
     D2D1_RECT_F options{};  // beside the Grok row
     D2D1_RECT_F fastRow{};
@@ -1061,6 +1063,7 @@ private:
     // take Grok's answer for Claude's); empty for the rest of the turn.
     std::wstring TurnWho() const;
     void MergeModels();
+    void SeedGrokModels();
     void RefreshAuth();
     void SignIn();
     void SignOut();
@@ -1737,6 +1740,7 @@ wil::com_ptr<ID2D1PathGeometry> githubMark_;  // the projects' mark, made when f
     size_t grokBase_ = std::string::npos;
     size_t grokFast_ = std::string::npos;
     bool optionsOpen_ = false;  // the Grok row's options beside the menu
+    bool grokOffer_ = false;    // grok.exe was missing when the models opened: a row offers to install it
     std::string defaultResolved_;  // what the CLI's "default" stands for
     // "Auto" (settings model "auto"): the alias the chat runs on now, and how big the chat is (the last turn's
     // input), as switching down in a big chat would rewrite its whole cache.
@@ -1805,16 +1809,8 @@ int ChatWindow::Run(int show) {
     if (!claudeModels_.is_array()) {
         claudeModels_ = Json::array();
     }
-    if (!FindGrokExe().empty()) {
-        const Json efforts = {"xhigh", "high", "medium", "low"};
-        grokModels_ = Json::array(
-            {Json{{"value", "grok-4.7"}, {"displayName", "Grok 4.7"}, {"supportedEffortLevels", efforts}},
-             Json{{"value", "grok-4.7-build-fast"}, {"displayName", "Grok 4.7 Fast"}, {"supportedEffortLevels", efforts}},
-             Json{{"value", "grok-4.6"}, {"displayName", "Grok 4.6"}, {"supportedEffortLevels", efforts}},
-             Json{{"value", "grok-4.5"}, {"displayName", "Grok 4.5"},
-                  {"supportedEffortLevels", Json::array({"high", "medium", "low"})}}});
-        MergeModels();
-    }
+    SeedGrokModels();
+
     workspace_ = DefaultWorkspace();
     if (std::error_code error; !settings_.workspace.empty() && std::filesystem::is_directory(settings_.workspace, error)) {
         workspace_ = settings_.workspace;  // the project chosen last time
@@ -3071,6 +3067,10 @@ void ChatWindow::OnClick(float x, float y) {
         case Target::AutoToggle:
             ToggleAuto();
             return;
+        case Target::GrokInstall:
+            ClosePopup();
+            InstallGrokCli();  // the download, then the sign-in in the browser; the models come when it is done
+            return;
         case Target::FastToggle:
             ToggleFast();
             return;
@@ -3681,11 +3681,16 @@ Geometry ChatWindow::Layout() const {
     case Popup::Models: {
         const float rows = static_cast<float>(mainModels_.size());
         const float autoHeight = autoIndex_ == std::string::npos ? 0 : kMenuRow + 9;  // and the line under it
-        const float height = 12 + autoHeight + rows * kMenuRow;
+        const float offerHeight = grokOffer_ ? kMenuRow + 9 : 0;  // and the line over it
+        const float height = 12 + autoHeight + rows * kMenuRow + offerHeight;
         const float popupLeft = ClampTo(g.model.left, 10.f, g.area - 10 - kModelsWidth);
         g.popup = D2D1::RectF(popupLeft, g.box.top - 6 - height, popupLeft + kModelsWidth, g.box.top - 6);
         g.autoRow = D2D1::RectF(g.popup.left + 6, g.popup.top + 6, g.popup.right - 6, g.popup.top + 6 + kMenuRow);
         g.modelsTop = g.popup.top + 6 + autoHeight;
+        if (grokOffer_) {
+            const float at = g.modelsTop + rows * kMenuRow + 9;
+            g.grokRow = D2D1::RectF(g.popup.left + 6, at, g.popup.right - 6, at + kMenuRow);
+        }
         for (size_t i = 0; i < mainModels_.size(); ++i) {
             if (!OptionsFor(i)) {
                 continue;
@@ -3734,6 +3739,9 @@ Hit ChatWindow::HitTest(float x, float y) const {
         if (Inside(g.popup, x, y)) {
             if (autoIndex_ != std::string::npos && Inside(g.autoRow, x, y)) {
                 return {Target::AutoToggle};
+            }
+            if (grokOffer_ && Inside(g.grokRow, x, y)) {
+                return {Target::GrokInstall};
             }
             if (y >= g.modelsTop) {
                 const auto row = static_cast<size_t>((y - g.modelsTop) / kMenuRow);
@@ -7061,6 +7069,9 @@ void ChatWindow::OnSetupEvent(const SetupEvent& event) {
         } else {
             links_[kGrokLink] = GrokLink();
         }
+        if (event.ok) {
+            SeedGrokModels();  // installed just now: its models join the list
+        }
         if (event.ok && GrokSelected() && !running_) {
             StartClaude();  // the chat waited for it
         }
@@ -9310,6 +9321,20 @@ void ChatWindow::PaintModels(const Geometry& g) {
         } else if (i < 9) {
             Text(std::to_wstring(i + 1), uiRight_.get(), D2D1::RectF(r.left, r.top, r.right - 10, r.bottom), kSecondary);
         }
+    }
+
+    if (grokOffer_) {  // no grok.exe: its models are not in the list, so the way to them is
+        brush_->SetColor(Color(kLine));
+        target_->FillRectangle(D2D1::RectF(g.popup.left + 10, g.grokRow.top - 5, g.popup.right - 10, g.grokRow.top - 4),
+                               brush_.get());
+        const bool hot = hover_.target == Target::GrokInstall;
+        if (hot) {
+            Fill(g.grokRow, 6.f, kRaised);
+        }
+        Text(L"Grok", ui_.get(), D2D1::RectF(g.grokRow.left + 10, g.grokRow.top, g.grokRow.right - 100, g.grokRow.bottom),
+             kSecondary);
+        Text(L"Установить", uiRight_.get(),
+             D2D1::RectF(g.grokRow.left, g.grokRow.top, g.grokRow.right - 10, g.grokRow.bottom), hot ? kPrimary : kAccent);
     }
 
     if (optionsOpen_) {  // the Grok row's options
@@ -11621,6 +11646,7 @@ void ChatWindow::OpenPopup(Popup popup) {
         break;
     case Popup::Models:
         optionsOpen_ = false;
+        grokOffer_ = FindGrokExe().empty();
         break;
     case Popup::Usage:
     case Popup::Image:
@@ -12846,8 +12872,22 @@ void ChatWindow::ToggleFast() {
     Refresh();
 }
 
-void ChatWindow::MergeModels() {
-    models_ = claudeModels_;
+// The models known before grok.exe has answered (measured 27.10.2026); only when the CLI is there.
+void ChatWindow::SeedGrokModels() {
+    if (FindGrokExe().empty() || (grokModels_.is_array() && !grokModels_.empty())) {
+        return;
+    }
+    const Json efforts = {"xhigh", "high", "medium", "low"};
+    grokModels_ = Json::array(
+        {Json{{"value", "grok-4.7"}, {"displayName", "Grok 4.7"}, {"supportedEffortLevels", efforts}},
+         Json{{"value", "grok-4.7-build-fast"}, {"displayName", "Grok 4.7 Fast"}, {"supportedEffortLevels", efforts}},
+         Json{{"value", "grok-4.6"}, {"displayName", "Grok 4.6"}, {"supportedEffortLevels", efforts}},
+         Json{{"value", "grok-4.5"}, {"displayName", "Grok 4.5"},
+              {"supportedEffortLevels", Json::array({"high", "medium", "low"})}}});
+    MergeModels();
+}
+
+void ChatWindow::MergeModels() {    models_ = claudeModels_;
     for (const Json& model : grokModels_) {
         models_.push_back(model);
     }
