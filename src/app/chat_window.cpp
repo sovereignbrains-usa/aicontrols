@@ -13515,8 +13515,10 @@ void ChatWindow::OnClaude(const Json& message) {
             busy_ = JsonStr(message, "state") != "idle";
         } else if (subtype == "status" && JsonStr(message, "status") == "compacting") {
             Flash(L"Сжимаю чат, чтобы дальше он тратил меньше лимита…", 8000);
+        } else if (subtype == "status" && JsonStr(message, "status") == "compact_failed") {
+            Flash(L"Сжать чат не вышло — идём дальше как есть", 8000);
         } else if (subtype == "compact_boundary") {
-            // A long chat is summed up (--autocompact): every later turn reads the summary, not all of it.
+            // A long chat is summed up (Claude --autocompact 150k, Grok at ~100k): later turns read the summary.
             const Json& meta = JsonAt(message, "compact_metadata");
             const Json& before = JsonAt(meta, "pre_tokens");
             const Json& after = JsonAt(meta, "post_tokens");

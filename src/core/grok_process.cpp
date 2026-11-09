@@ -257,7 +257,13 @@ void GrokProcess::Start(const ClaudeOptions& options, MessageHandler onMessage, 
     cmd += L" stdio";
 
     // web_fetch is off in grok.exe unless asked for.
-    std::vector<std::pair<std::wstring, std::wstring>> overrides = {{L"NO_COLOR", L"1"}, {L"GROK_WEB_FETCH", L"1"}};
+    // Compact at 40% of the 256k window (~100k tokens), not the CLI's 85% (~205k). Measured 09.11.2026: a call
+    // stays near 6–12 s through ~55k tokens and is 15–21 s by 76–90k, and a week of chats spent most of its
+    // prompt mass above 80k. Claude's 150k cap would have cut only ~7% of that. grok 1.0.76 reads this variable
+    // (0–100; anything else is ignored). The model's real window stays 256k.
+    std::vector<std::pair<std::wstring, std::wstring>> overrides = {{L"NO_COLOR", L"1"},
+                                                                    {L"GROK_WEB_FETCH", L"1"},
+                                                                    {L"GROK_AUTO_COMPACT_THRESHOLD_PERCENT", L"40"}};
     if (!options.proxy.empty()) {
         overrides.insert(overrides.end(), {{L"HTTPS_PROXY", options.proxy},
                                            {L"HTTP_PROXY", options.proxy},
@@ -602,8 +608,12 @@ void GrokProcess::OnNotification(const std::string& method, const Json& params) 
     } else if (method == "_x.ai/session/update") {
         // The real reason of a failed turn ("API error (status 402 Payment Required): Grok Build usage balance
         // exhausted") comes here; the prompt's own error is only "Internal error" (04.11.2026, his journal).
+        // Auto-compact is the same channel (SessionUpdate), not session/update.
         const Json& update = JsonAt(params, "update");
-        if (JsonStr(update, "sessionUpdate") == "retry_state" && JsonStr(update, "type") == "failed") {
+        const std::string kind = JsonStr(update, "sessionUpdate");
+        if (kind.starts_with("auto_compact")) {
+            OnUpdate(update);
+        } else if (kind == "retry_state" && JsonStr(update, "type") == "failed") {
             std::lock_guard lock(stateMutex_);
             apiError_ = JsonStr(update, "message");
         }
@@ -678,6 +688,40 @@ void GrokProcess::OnRequest(const Json& id, const std::string& method, const Jso
 
 void GrokProcess::OnUpdate(const Json& update) {
     const std::string type = JsonStr(update, "sessionUpdate");
+    if (type == "auto_compact_started") {
+        // The window already says this for Claude's --autocompact.
+        Emit(Json{{"type", "system"}, {"subtype", "status"}, {"status", "compacting"}});
+        return;
+    }
+    if (type == "auto_compact_completed") {
+        Json meta = Json::object();
+        auto tokens = [](const Json& value) -> long long {
+            if (value.is_number_integer()) {
+                return value.get<long long>();
+            }
+            if (value.is_number_unsigned()) {
+                return static_cast<long long>(value.get<unsigned long long>());
+            }
+            if (value.is_number_float()) {
+                return static_cast<long long>(value.get<double>());
+            }
+            return -1;
+        };
+        const long long before = tokens(JsonAt(update, "tokens_before"));
+        const long long after = tokens(JsonAt(update, "tokens_after"));
+        if (before >= 0) {
+            meta["pre_tokens"] = before;
+        }
+        if (after >= 0) {
+            meta["post_tokens"] = after;
+        }
+        Emit(Json{{"type", "system"}, {"subtype", "compact_boundary"}, {"compact_metadata", std::move(meta)}});
+        return;
+    }
+    if (type == "auto_compact_failed" || type == "auto_compact_cancelled") {
+        Emit(Json{{"type", "system"}, {"subtype", "status"}, {"status", "compact_failed"}});
+        return;
+    }
     if (type == "agent_message_chunk") {
         const Json& content = JsonAt(update, "content");
         if (JsonStr(content, "type") == "text") {

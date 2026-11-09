@@ -34,6 +34,7 @@ namespace aic {
 // helper. The web and Imagine are asked about as grok__<name> (GrokOwnTool). Empty effort is sent as low: with
 // no flag grok.exe uses high.
 // ClaudeOptions is reused: exe (grok.exe), cwd, proxy, model, effort, resume, appendSystemPrompt (the rules).
+// The process gets GROK_AUTO_COMPACT_THRESHOLD_PERCENT=40, so a chat is summed up near 100k tokens instead of ~205k.
 class GrokProcess : public AgentProcess {
 public:
     GrokProcess() = default;
