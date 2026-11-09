@@ -827,6 +827,40 @@ ToolSummary SummarizeTool(const std::string& name, const Json& input) {
 
 Tools::Tools(SecretStore& secrets, std::wstring cwd) : secrets_(secrets), cwd_(std::move(cwd)) {}
 
+std::string ShortMemoryIndex(const std::string& index) {
+    constexpr size_t kMax = 200;
+    std::string out;
+    out.reserve(std::min(index.size(), size_t{12000}));
+    size_t i = 0;
+    while (i < index.size()) {
+        size_t end = index.find('\n', i);
+        if (end == std::string::npos) {
+            end = index.size();
+        }
+        std::string_view line(index.data() + i, end - i);
+        if (!line.empty() && line.back() == '\r') {
+            line.remove_suffix(1);
+        }
+        if (line.size() <= kMax) {
+            out.append(line);
+        } else {
+            size_t cut = kMax;
+            while (cut > 0 && (static_cast<unsigned char>(line[cut]) & 0xC0) == 0x80) {
+                --cut;
+            }
+            const size_t space = line.rfind(' ', cut);
+            if (space != std::string_view::npos && space >= 80) {
+                cut = space;
+            }
+            out.append(line.substr(0, cut));
+            out += "…";
+        }
+        out.push_back('\n');
+        i = end < index.size() ? end + 1 : end;
+    }
+    return out;
+}
+
 std::string Tools::SystemPrompt() {
     return "You are running inside AIControls, a native Windows chat client, on the user's computer. Claude Code's "
            "own local tools are off: use only the mcp__aic__* tools run_command, read_file, list_directory, "
@@ -857,6 +891,34 @@ std::string Tools::SystemPrompt() {
            "You may hand a self-contained task to one helper with spawn_subagent. The only type is aicontrols:hand. "
            "It has the same MCP tools, the web and Imagine, and no shell of its own; its calls ask the user the same "
            "way. It cannot message the user or spawn its own helper. Wait for it and use its result. "
+           "Reply in the language the user writes in.";
+}
+
+std::string Tools::GrokSystemPrompt() {
+    return "You are running inside AIControls, a native Windows chat client, on the user's computer. "
+           "Your own tools are on. Use them directly: read_file, grep, list_dir, search_replace, write, "
+           "and run_terminal_command (PowerShell 5.1, non-interactive; a fresh shell each call, so use cwd or "
+           "chain with &&). Do not look those up with search_tool. "
+           "search_tool then use_tool is only for this client's tools you do not have: run_command when the "
+           "command needs a stored secret or `on` (a server), browser, ask, screenshot, drive_search, "
+           "drive_read, list_chats and read_chat. One search_tool is enough for a tool you already saw. "
+           "list_chats and read_chat are this client's other chats, Claude's and Grok's: when the user points "
+           "at one, read it rather than guess. drive_search and drive_read read the user's Google Drive: search "
+           "rather than ask for a path. "
+           "`on` is user@host[:port]. It acts on that server through ssh, by key or by the password stored as "
+           "the secret `ssh user@host` (you never see it). Remote paths are the server's; its shell is bash or "
+           "sh. Secrets go in env_secrets or as {{secret:NAME}}; their values are cut out of every output. "
+           "The client's permission mode already decides what runs. In «Без вопросов» nothing waits. Do not "
+           "announce a call or ask the user to allow it. "
+           "An HTML or SVG file you write on this computer opens in the live preview beside the chat and reloads "
+           "when it or a CSS or JS file beside it changes. Paths you mention as C:\\... are clickable. "
+           "Prefer non-interactive commands. "
+           "browser is a tab in the user's window (its own profile): open an http or https address, read the "
+           "text, picture it, click or type. Each action asks first. "
+           "ask hands a question to another model through its free API when that is cheaper; its answer is a "
+           "guess, check it. "
+           "You may hand one self-contained task to a helper, type aicontrols:hand. It reads files itself, has "
+           "no shell, cannot spawn, and cannot message the user. Wait for it. "
            "Reply in the language the user writes in.";
 }
 

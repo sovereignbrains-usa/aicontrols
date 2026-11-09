@@ -8575,15 +8575,12 @@ std::string ChatWindow::MemoryPrompt() const {
     const std::string index((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
     return "\n\n# Memory\nYou share a persistent memory with Claude, the other assistant of this client: the folder " +
            ToUtf8(folder.wstring()) +
-           ". Use it, not a memory of your own. Each memory is one Markdown file holding one fact, with frontmatter "
-           "(name: a kebab-case slug, description: one line, metadata: type: user | feedback | project | "
-           "reference); feedback and project notes go on with **Why:** and **How to apply:** lines. MEMORY.md is "
-           "the index, one line per memory: - [Title](file.md) — hook. Read the notes that bear on the task with "
-           "read_file before working. When you learn something worth keeping across chats (who the user is, how "
-           "they want the work done, a project's state or constraint, with dates made absolute), update the note "
-           "that covers it or write a new one with write_file, and add its line to MEMORY.md. Do not save what the "
-           "code or git already records or what matters to this chat only. The index now:\n" +
-           (index.empty() ? std::string("(empty)") : index);
+           ". Each note is one Markdown file. The index below is already here, one short hook per note. "
+           "Open a note with read_file only when its hook matches the task. Do not read MEMORY.md and do not open "
+           "the other notes. When you learn a stable fact worth keeping across chats, update that note or write a "
+           "new one and add its line to MEMORY.md. Do not save what the code or git already records, or what "
+           "matters to this chat only.\n" +
+           (index.empty() ? std::string("(empty)\n") : ShortMemoryIndex(index));
 }
 
 // The tab chosen: the list is the other side's from the top; what was typed in the search stays (it looks through both).
@@ -9419,8 +9416,9 @@ void ChatWindow::PaintEffort(const Geometry& g) {
             target_->FillEllipse(D2D1::Ellipse({x, middle}, 2.f, 2.f), brush_.get());
         }
     }
-    const std::wstring note = pendingEffort_.empty() ? L"Auto — решает модель"
-                                                     : L"Применится при закрытии";
+    const std::wstring note = pendingEffort_.empty()
+                                  ? (GrokSelected() ? L"Auto — для Grok это low" : L"Auto — решает модель")
+                                  : L"Применится при закрытии";
     Text(note, ui_.get(), D2D1::RectF(titleLeft, g.track.bottom + 4, g.popup.right - 14, g.popup.bottom - 4),
          kSecondary);
 }
@@ -13137,7 +13135,7 @@ bool ChatWindow::StartClaude() {
         return false;
     }
     options.cwd = workspace_;
-    options.appendSystemPrompt = Tools::SystemPrompt() + ProjectPrompt();
+    options.appendSystemPrompt = (grok ? Tools::GrokSystemPrompt() : Tools::SystemPrompt()) + ProjectPrompt();
     // One memory for all the projects: the CLI would keep one per folder, and a project's chats would start
     // knowing nothing.
     options.settings = Json{{"autoMemoryDirectory", ToUtf8(SharedMemoryFolder())}}.dump();

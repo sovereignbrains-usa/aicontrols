@@ -305,6 +305,22 @@ int main() {
         const std::string prompt = aic::Tools::SystemPrompt();
         Expect(Has(prompt, "mcp__aic__") && Has(prompt, "`on`") && Has(prompt, "language the user writes"),
                "system prompt");
+        const std::string grokPrompt = aic::Tools::GrokSystemPrompt();
+        Expect(Has(grokPrompt, "run_terminal_command") && Has(grokPrompt, "search_tool then use_tool") &&
+                   !Has(grokPrompt, "use only the mcp__aic__"),
+               "grok uses its own tools and MCP only for the rest");
+        const std::string cut = aic::ShortMemoryIndex("- [A](a.md) — " + std::string(400, 'x') + "\n- short\n");
+        Expect(cut.find("…") != std::string::npos && Has(cut, "- short\n") && cut.find(std::string(400, 'x')) == std::string::npos,
+               "a long memory hook is cut");
+        std::string letters;
+        for (int n = 0; n < 120; ++n) {
+            letters += "\xD1\x8F";
+        }
+        const std::string utf = aic::ShortMemoryIndex(letters);
+        const size_t ellipsis = utf.find("…");
+        Expect(ellipsis != std::string::npos && ellipsis > 0 &&
+                   (static_cast<unsigned char>(utf[ellipsis - 1]) & 0xC0) != 0xC0,
+               "a hook is not cut in the middle of a character");
     }
 
     // `on` is checked before ssh is started: nothing that looks like an option or a shell word gets through.

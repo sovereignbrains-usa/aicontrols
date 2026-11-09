@@ -56,6 +56,8 @@ ToolSummary SummarizeTool(const std::string& name, const Json& input);
 // secret's name ("ssh root@1.2.3.4", or "root@1.2.3.4" alone); empty when it names no server. `on` with that
 // server logs in with the password when no key works.
 std::string ServerSecretName(std::string_view text);
+// The memory index as Grok receives it: each line kept, a long one cut to a short hook on a UTF-8 boundary.
+std::string ShortMemoryIndex(const std::string& index);
 
 // The tools: run_command, read_file, write_file, edit_file, list_directory (the five work on a server too), and
 // list_chats and read_chat for the client's own chats.
@@ -66,6 +68,8 @@ public:
     Json Definitions() const;  // the MCP tools/list payload; run_command names the stored secrets
     // What the model is told about this client, appended to the CLI's system prompt.
     static std::string SystemPrompt();
+    // The same for Grok. Its own file, search and shell tools are on; MCP is only for what those cannot do.
+    static std::string GrokSystemPrompt();
     // Blocks until done; `cancel` stops a running command. Output is scrubbed of secret values.
     ToolResult Execute(const std::string& name, const Json& input, const std::atomic<bool>& cancel) const;
 

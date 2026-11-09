@@ -32,26 +32,65 @@ std::string RandomToken() {
     return token;
 }
 
-// What Grok may use of its own: the two tools that reach MCP servers (ours), the web and Imagine (28.10.2026, his:
-// "надо включить поиск в интернете и Imagine"). Everything else it can do, it does through the five tools, where
-// the user is asked and the secrets are kept. web_search runs on xAI's side and asks nobody; the rest ask.
-// A helper (02.11.2026, his: "субагента себе сделай") is the only type spawn_subagent can name. Checked on grok
-// 1.0.70: the enum is just aicontrols:hand, an omitted type becomes that hand, and general-purpose is not offered.
-// The hand has the same list without spawn, so it cannot start another one and it has no shell of its own.
+// What Grok may use. A YAML list: one comma-separated line is a single string, and grok.exe then ignores it and
+// sends every built-in tool (measured 09.11.2026: 27 schemas, video and workflow the largest). The names are the
+// ones the model is shown. Left out: image_to_video, reference_to_video, workflow, the schedulers, monitor, plan
+// mode and ask_user_question. disallowedTools strips those even if the allowlist is not applied.
+// A helper (02.11.2026, his: "субагента себе сделай") is the only type spawn_subagent can name, from the plugin
+// written beside this profile. The hand has no shell and cannot start another agent.
 constexpr const char* kProfile =
     "---\n"
     "name: aic\n"
     "description: AIControls chat\n"
-    "tools: search_tool, use_tool, read_file, grep, web_search, web_fetch, image_gen, image_edit, image_to_video, "
-    "reference_to_video, spawn_subagent, get_command_or_subagent_output, wait_commands_or_subagents, "
-    "kill_command_or_subagent, Agent(aicontrols:hand)\n"
+    "tools:\n"
+    "  - read_file\n"
+    "  - grep\n"
+    "  - list_dir\n"
+    "  - search_replace\n"
+    "  - write\n"
+    "  - run_terminal_command\n"
+    "  - web_search\n"
+    "  - web_fetch\n"
+    "  - search_tool\n"
+    "  - use_tool\n"
+    "  - todo_write\n"
+    "  - spawn_subagent\n"
+    "  - get_command_or_subagent_output\n"
+    "  - wait_commands_or_subagents\n"
+    "  - kill_command_or_subagent\n"
+    "  - image_gen\n"
+    "  - image_edit\n"
+    "disallowedTools:\n"
+    "  - image_to_video\n"
+    "  - reference_to_video\n"
+    "  - workflow\n"
+    "  - scheduler_create\n"
+    "  - scheduler_delete\n"
+    "  - scheduler_list\n"
+    "  - monitor\n"
+    "  - enter_plan_mode\n"
+    "  - exit_plan_mode\n"
+    "  - ask_user_question\n"
     "---\n";
 
 constexpr const char* kHand =
     "---\n"
     "name: hand\n"
     "description: Helper for this AIControls chat. It reads and searches files itself; commands and writes go through search_tool and use_tool.\n"
-    "tools: search_tool, use_tool, read_file, grep, web_search, web_fetch, image_gen, image_edit, image_to_video, reference_to_video\n"
+    "tools:\n"
+    "  - read_file\n"
+    "  - grep\n"
+    "  - search_tool\n"
+    "  - use_tool\n"
+    "  - web_search\n"
+    "  - web_fetch\n"
+    "  - image_gen\n"
+    "  - image_edit\n"
+    "disallowedTools:\n"
+    "  - image_to_video\n"
+    "  - reference_to_video\n"
+    "  - run_terminal_command\n"
+    "  - spawn_subagent\n"
     "mcpInheritance: all\n"
     "---\n"
     "\n"
@@ -212,9 +251,9 @@ void GrokProcess::Start(const ClaudeOptions& options, MessageHandler onMessage, 
     if (!options.model.empty()) {
         cmd += L" --model " + QuoteArg(ToWide(options.model));
     }
-    if (!options.effort.empty()) {
-        cmd += L" --effort " + QuoteArg(ToWide(options.effort));
-    }
+    // An empty effort is the chip "Auto". grok.exe with no --effort reasons at high (measured on grok-4.7,
+    // 09.11.2026), which is most of a turn's time. Auto for this client is low; a chosen level is sent as it is.
+    cmd += L" --effort " + QuoteArg(ToWide(options.effort.empty() ? "low" : options.effort));
     cmd += L" stdio";
 
     // web_fetch is off in grok.exe unless asked for.
