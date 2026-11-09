@@ -1,0 +1,39 @@
+name: Ошибка
+description: Сбой. Журнал кладёт «Разобрать в чате».
+labels: ["bug"]
+body:
+  - type: input
+    id: build
+    attributes:
+      label: Версия сборки
+      description: Версия установщика (0.1.113) или штамп из строки журнала (6910abcd, у сборки не из установщика — с хвостом dev).
+      placeholder: "0.1.113"
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Windows
+      description: Выпуск и версия.
+      placeholder: "Windows 11 24H2"
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Шаги
+      description: Что сделать, чтобы увидеть это снова.
+    validations:
+      required: true
+  - type: textarea
+    id: journal
+    attributes:
+      label: Журнал
+      description: |
+        Жучок внизу панели, затем «Разобрать в чате». Вставьте то, что попало в сообщение. Строка выглядит так:
+
+        2026-11-09 12:00:00 · чат · 6910abcd
+        текст сбоя
+      render: text
+    validations:
+      required: true

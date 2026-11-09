@@ -1,0 +1,20 @@
+name: build
+
+on:
+  push:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure, build, test
+        shell: cmd
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VS=%%i"
+          call "%VS%\Common7\Tools\VsDevCmd.bat" -no_logo -arch=x64 -host_arch=x64
+          set VSLANG=1033
+          cmake --preset dev || exit /b 1
+          cmake --build --preset dev || exit /b 1
+          ctest --test-dir build\dev --output-on-failure || exit /b 1

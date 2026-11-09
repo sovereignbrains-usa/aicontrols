@@ -1,0 +1,10 @@
+name: Задача
+description: Какую задачу закрывает.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: task
+    attributes:
+      label: Какую задачу закрывает
+    validations:
+      required: true

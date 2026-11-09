@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Уязвимость
+    url: https://github.com/sovereignbrains/aicontrols/security/advisories/new
+    about: Приватно, не публичным issue. Значения секретов не вставляйте.
