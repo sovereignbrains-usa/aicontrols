@@ -4951,22 +4951,19 @@ void ChatWindow::PaintMarkdown(const FeedItem& item, float x, float y, float lef
         }
         return brush.get();
     };
+    // Two passes: every box is measured first, the brushes go on after. A hit test lays the whole text out again
+    // once any drawing effect changed since the last one, and the table's rule characters were hidden one by one
+    // between their hit tests: 611 layouts of a 12k-character answer, 2 s a frame (13.11.2026, user: 'лагает пиздец
+    // клиент в определенных чатах ... 0фпс', Grok's report with a table). Now it is one layout a frame at most.
+    wil::com_ptr<ID2D1SolidColorBrush> hidden;  // the rule characters stay, invisible, so a copy still has the grid
+    target_->CreateSolidColorBrush(Color(kCodeText), hidden.put());
+    hidden->SetOpacity(0.f);
+    std::vector<UINT32> hide;
     for (const MdSpan& span : item.spans) {
-        const DWRITE_TEXT_RANGE range{static_cast<UINT32>(span.start), static_cast<UINT32>(span.length)};
-        if ((span.flags & kMdToken) != 0) {  // after its block's span: the color of one part of the code
-            item.layout->SetDrawingEffect(tokenBrush(span.token), range);
-            continue;
-        }
-        if ((span.flags & kMdLink) != 0) {
-            item.layout->SetDrawingEffect(link.get(), range);
-        }
-        if ((span.flags & kMdQuote) != 0) {
-            item.layout->SetDrawingEffect(quote.get(), range);
-        }
         if ((span.flags & kMdCode) == 0) {
             continue;
         }
-        item.layout->SetDrawingEffect(code.get(), range);
+        const DWRITE_TEXT_RANGE range{static_cast<UINT32>(span.start), static_cast<UINT32>(span.length)};
         UINT32 count = 0;
         item.layout->HitTestTextRange(range.startPosition, range.length, 0, 0, nullptr, 0, &count);
         std::vector<DWRITE_HIT_TEST_METRICS> boxes(count);
@@ -4989,10 +4986,7 @@ void ChatWindow::PaintMarkdown(const FeedItem& item, float x, float y, float lef
                 // One straight rule per column and per row, a single device pixel, aliased. A stroke per box
                 // character faded at its own end, so the verticals went dim in the gap between the rows
                 // (03.11.2026, his screenshot: the divider dropped from full white to half between the two
-                // lines). The characters stay, invisible, so a copy still has the grid.
-                wil::com_ptr<ID2D1SolidColorBrush> hidden;
-                target_->CreateSolidColorBrush(Color(kCodeText), hidden.put());
-                hidden->SetOpacity(0.f);
+                // lines). The characters stay, invisible (hide), so a copy still has the grid.
                 const float pixel = Pixel();
                 struct Run {
                     float from = std::numeric_limits<float>::max();
@@ -5037,7 +5031,7 @@ void ChatWindow::PaintMarkdown(const FeedItem& item, float x, float y, float lef
                         // A tee closes the grid: nothing hangs below that rule.
                         run.to = std::max(run.to, c == L'┴' ? cellTop + cell.height * 0.5f : cellTop + cell.height);
                     }
-                    item.layout->SetDrawingEffect(hidden.get(), DWRITE_TEXT_RANGE{static_cast<UINT32>(i), 1});
+                    hide.push_back(static_cast<UINT32>(i));
                 }
                 for (const auto& [col, run] : down) {
                     const float x0 = static_cast<float>(col) * pixel;
@@ -5058,6 +5052,25 @@ void ChatWindow::PaintMarkdown(const FeedItem& item, float x, float y, float lef
                      4.f, kRaised);
             }
         }
+    }
+    for (const MdSpan& span : item.spans) {
+        const DWRITE_TEXT_RANGE range{static_cast<UINT32>(span.start), static_cast<UINT32>(span.length)};
+        if ((span.flags & kMdToken) != 0) {  // after its block's span: the color of one part of the code
+            item.layout->SetDrawingEffect(tokenBrush(span.token), range);
+            continue;
+        }
+        if ((span.flags & kMdLink) != 0) {
+            item.layout->SetDrawingEffect(link.get(), range);
+        }
+        if ((span.flags & kMdQuote) != 0) {
+            item.layout->SetDrawingEffect(quote.get(), range);
+        }
+        if ((span.flags & kMdCode) != 0) {
+            item.layout->SetDrawingEffect(code.get(), range);
+        }
+    }
+    for (const UINT32 at : hide) {
+        item.layout->SetDrawingEffect(hidden.get(), DWRITE_TEXT_RANGE{at, 1});
     }
 }
 
