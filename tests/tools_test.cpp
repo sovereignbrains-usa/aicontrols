@@ -257,6 +257,16 @@ int main() {
                    found.detail.find(L"src") != std::wstring::npos && found.detail.find(L"*.cpp") != std::wstring::npos,
                "a native search names the pattern", aic::ToUtf8(found.detail));
     }
+    {
+        std::string old;
+        for (int i = 0; i < 100; ++i) {
+            old += "строка " + std::to_string(i) + "\n";
+        }
+        const std::wstring edit = aic::SummarizeTool("edit_file", {{"path", "C:\\a.txt"}, {"old_string", old}, {"new_string", "x"}}).detail;
+        Expect(edit.find(L"… ещё строк: ") != std::wstring::npos && edit.find(L"строка 3\n") != std::wstring::npos &&
+                   edit.find(L"\uFFFD") == std::wstring::npos,
+               "a long edit is cut at a line, says how much is left", aic::ToUtf8(edit.substr(edit.size() - 60)));
+    }
     Expect(aic::AutoAllows("image_gen", {{"prompt", "a fish"}}) && !aic::AutoAllows("image_to_video", {{"prompt", "a"}}) &&
                !aic::AutoAllows("web_fetch", {{"url", "https://x"}}) && aic::ToolNeedsApproval("image_gen"),
            "Auto draws pictures; videos and pages still ask");

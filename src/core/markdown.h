@@ -38,6 +38,10 @@ bool IsLocalPath(std::wstring_view text);
 // the parser marks such code kMdRelative, and the app drops the link unless a file is found by that name.
 bool IsRelativePath(std::wstring_view text);
 
+// `code` that is only a file's name: Pochta.exe, my notes.txt (an extension with a letter, no separators). Also a
+// guess, marked kMdRelative: the app links it if the file is in the project or its full path was in the chat.
+bool IsFileName(std::wstring_view text);
+
 // The text to show, without the markup, and how its runs are styled.
 struct MdText {
     std::wstring text;

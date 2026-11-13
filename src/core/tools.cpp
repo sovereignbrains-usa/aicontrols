@@ -216,8 +216,21 @@ ToolResult ReadWindow(std::string_view bytes, const Json& input, const char* wha
     return ToolResult{LineWindow(bytes.substr(start), first, LineArg(input, "limit"), total), false};
 }
 
+// The start of a text for a card: whole lines when a line ends in the last quarter, never half a UTF-8 letter
+// (a cut one showed as garbage), and how many lines are left out, so a long edit does not look cut by mistake.
 std::string Truncated(const std::string& text, size_t limit) {
-    return text.size() <= limit ? text : text.substr(0, limit) + "…";
+    if (text.size() <= limit) {
+        return text;
+    }
+    size_t cut = limit;
+    while (cut > 0 && (static_cast<unsigned char>(text[cut]) & 0xC0) == 0x80) {
+        --cut;
+    }
+    if (const size_t newline = text.rfind('\n', cut); newline != std::string::npos && newline >= limit * 3 / 4) {
+        cut = newline;
+    }
+    const size_t rest = static_cast<size_t>(std::count(text.begin() + static_cast<std::ptrdiff_t>(cut), text.end(), '\n'));
+    return text.substr(0, cut) + (rest > 1 ? std::format("\n… ещё строк: {}", rest) : std::string("…"));
 }
 
 Json Schema(Json properties, Json required) {
@@ -724,8 +737,8 @@ ToolSummary SummarizeHere(const std::string& name, const Json& input) {
         return {L"Записать файл", path + L"\n" + ToWide(Truncated(content, 800))};
     }
     if (name == "edit_file") {
-        return {L"Изменить файл", path + L"\n− " + ToWide(Truncated(StringArg(input, "old_string"), 400)) + L"\n+ " +
-                                      ToWide(Truncated(StringArg(input, "new_string"), 400))};
+        return {L"Изменить файл", path + L"\n− " + ToWide(Truncated(StringArg(input, "old_string"), 1200)) + L"\n+ " +
+                                      ToWide(Truncated(StringArg(input, "new_string"), 1200))};
     }
     if (name == "read_file") {
         std::wstring where = path.empty() ? ToWide(StringArg(input, "target_file")) : path;

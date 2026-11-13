@@ -330,8 +330,11 @@ Json ContentBlock(const Attachment& attachment) {
     case Attachment::Type::Text:
         break;
     }
+    // Marked off, so the history shows "📎 name" in its place (13.11.2026: a chat read again showed the file's whole
+    // content as the message, and Grok joins the blocks into one text, where only a closing mark tells where it ends).
     return Json{{"type", "text"},
-                {"text", "Файл «" + ToUtf8(attachment.name) + "»:\n\n" + attachment.text}};
+                {"text", std::string(kAttachedOpen) + ToUtf8(attachment.name) + "\">\n" + attachment.text + "\n" +
+                             std::string(kAttachedClose)}};
 }
 
 std::wstring SaveChatImage(const std::string& base64, const std::string& mediaType) {

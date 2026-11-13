@@ -198,6 +198,18 @@ int main() {
         Expect(guesses.size() == 3 && guesses[0] == L"Desktop\\a.txt" && guesses[1] == L"~/x/b.md" &&
                    guesses[2] == L"src\\c.cpp:7",
                "bare relative paths are guesses too", std::to_string(guesses.size()));
+        using aic::IsFileName;
+        Expect(IsFileName(L"Pochta.exe") && IsFileName(L"my notes.txt") && IsFileName(L"AIControls-Setup-0.1.115.exe"),
+               "file names");
+        Expect(!IsFileName(L"0.1.115") && !IsFileName(L".gitignore") && !IsFileName(L"a.size()") &&
+                   !IsFileName(L"std::x.y") && !IsFileName(L"--out=a.txt") && !IsFileName(L"exe"),
+               "not file names: versions, dot files, calls, scopes, flags");
+        const auto named = ParseMarkdown(L"run `Pochta.exe`, not Pochta.exe");
+        size_t links = 0;
+        for (const aic::MdSpan& span : named.spans) {
+            links += (span.flags & aic::kMdRelative) != 0 && span.url == L"Pochta.exe";
+        }
+        Expect(links == 1, "a file name in code is a guess, bare text is not", std::to_string(links));
     }
     std::cout << (failures == 0 ? "all passed\n" : "FAILED\n");
     return failures == 0 ? 0 : 1;

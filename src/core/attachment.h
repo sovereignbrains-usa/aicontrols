@@ -5,6 +5,7 @@
 
 #include <optional>
 #include <string>
+#include <string_view>
 
 #include <wil/com.h>
 
@@ -35,7 +36,10 @@ bool ClipboardHasImage();
 // thread. On failure: empty and a message in `error`.
 std::string CaptureScreenBase64(const std::wstring& window, std::wstring& error);
 
-// The message content block the API expects for it.
+// The message content block the API expects for it. A text file goes as
+// <attached_file name="…">\n…\n</attached_file>; the transcript readers show it as "📎 name".
+inline constexpr std::string_view kAttachedOpen = "<attached_file name=\"";
+inline constexpr std::string_view kAttachedClose = "</attached_file>";
 Json ContentBlock(const Attachment& attachment);
 
 // Pictures shown in the chat are kept as files, to be opened, copied and found again later:

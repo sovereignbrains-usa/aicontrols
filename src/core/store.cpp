@@ -14,6 +14,7 @@
 #include <string_view>
 #include <utility>
 
+#include "core/attachment.h"
 #include "core/claude_process.h"
 #include "core/tools.h"
 
@@ -76,6 +77,51 @@ void ForEachLine(std::string_view text, Fn&& fn) {
 }
 
 std::wstring TextOf(const Json& content, bool images = true);  // images: a line for each picture
+
+// A text file sent along is shown as "📎 name", not its content (13.11.2026: a chat read again showed the whole file
+// as the message). Now it comes as <attached_file name="…">…</attached_file>. Before, it was "Файл «name»:\n\n…":
+// a block of its own in Claude's transcript (`whole`), but Grok joins the blocks with a space, so there the words
+// typed after it are only guessed: past the last "\n " (a file ends in a line break).
+std::string MarkAttachedFiles(std::string text, bool whole) {
+    const auto mark = [](std::string_view name) { return "📎 " + std::string(name); };
+    for (size_t open = text.find(kAttachedOpen); open != std::string::npos; open = text.find(kAttachedOpen, open)) {
+        const size_t nameAt = open + kAttachedOpen.size();
+        const size_t nameEnd = text.find("\">", nameAt);
+        const size_t close = nameEnd == std::string::npos ? nameEnd : text.find(kAttachedClose, nameEnd);
+        if (close == std::string::npos) {
+            break;
+        }
+        size_t end = close + kAttachedClose.size();
+        while (end < text.size() && (text[end] == ' ' || text[end] == '\r' || text[end] == '\n')) {
+            ++end;
+        }
+        std::string line = mark(std::string_view(text).substr(nameAt, nameEnd - nameAt));
+        line += end < text.size() ? "\n\n" : "";
+        text.replace(open, end - open, line);
+        open += line.size();
+    }
+    constexpr std::string_view kOld = "Файл «";
+    constexpr std::string_view kOldEnd = "»:\n\n";
+    const size_t first = text.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos || std::string_view(text).substr(first, kOld.size()) != kOld) {
+        return text;
+    }
+    const size_t nameEnd = text.find(kOldEnd, first + kOld.size());
+    if (nameEnd == std::string::npos || nameEnd - first > 400 ||
+        text.find('\n', first) < nameEnd) {
+        return text;
+    }
+    std::string shown = mark(std::string_view(text).substr(first + kOld.size(), nameEnd - first - kOld.size()));
+    if (!whole) {
+        if (const size_t join = text.rfind("\n "); join != std::string::npos && join > nameEnd) {
+            const std::string_view words = std::string_view(text).substr(join + 2);
+            if (words.find_first_not_of(" \t\r\n") != std::string_view::npos) {
+                shown += "\n\n" + std::string(words);
+            }
+        }
+    }
+    return shown;
+}
 
 // A message as a title: the first line of the words; a picture or file mark (an attachment's line) only if there are
 // none, and then without the mark, which a font may draw as a squiggle. Shortened.
@@ -209,7 +255,7 @@ std::wstring TextOf(const Json& content, bool images) {
             const std::string type = JsonStr(block, "type");
             std::wstring part;
             if (type == "text" && !JsonStr(block, "text").starts_with("<earlier_chat>")) {  // a switch's handoff
-                part = ToWide(JsonStr(block, "text"));
+                part = ToWide(MarkAttachedFiles(JsonStr(block, "text"), true));
             } else if (type == "image" && images) {
                 part = L"📎 фото";
             } else if (type == "document") {
@@ -364,6 +410,7 @@ std::wstring GrokPromptText(const Json& content) {
         const size_t end = text.find(kHandoffEnd);
         text.erase(0, end == std::string::npos ? text.size() : end + kHandoffEnd.size());
     }
+    text = MarkAttachedFiles(std::move(text), false);
     const size_t first = text.find_first_not_of(" \t\r\n");
     const size_t last = text.find_last_not_of(" \t\r\n");
     return first == std::string::npos ? std::wstring() : ToWide(std::string_view(text).substr(first, last - first + 1));

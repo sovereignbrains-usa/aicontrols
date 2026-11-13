@@ -57,7 +57,7 @@ void Inline(std::wstring_view s, MdText& out) {
                 }
                 styled(inner, kMdCode, false);
                 const bool absolute = IsLocalPath(inner);
-                if ((absolute || IsRelativePath(inner)) && inner.find(L'\n') == std::wstring_view::npos) {
+                if ((absolute || IsRelativePath(inner) || IsFileName(inner)) && inner.find(L'\n') == std::wstring_view::npos) {
                     MdSpan link{out.text.size() - inner.size(), inner.size(), absolute ? kMdLink : kMdLink | kMdRelative, 1.f,
                                 false};
                     link.url = inner;
@@ -314,6 +314,20 @@ bool IsLocalPath(std::wstring_view text) {
         return true;
     }
     return text.size() >= 3 && text.starts_with(L"\\\\") && IsWordChar(text[2]);
+}
+
+bool IsFileName(std::wstring_view text) {
+    if (text.size() < 3 || text.size() > 260 || text.find_first_of(L"\\/:<>\"|*?=()[]{}`'\t\n") != std::wstring_view::npos ||
+        text.front() == L' ' || text.front() == L'-' || text.front() == L'.' || text.back() == L' ') {
+        return false;
+    }
+    const size_t dot = text.find_last_of(L'.');
+    if (dot == std::wstring_view::npos || dot == 0 || dot + 1 >= text.size() || text.size() - dot - 1 > 10) {
+        return false;
+    }
+    const std::wstring_view extension = text.substr(dot + 1);
+    return std::ranges::all_of(extension, [](wchar_t c) { return std::iswalnum(c) != 0; }) &&
+           std::ranges::any_of(extension, [](wchar_t c) { return std::iswalpha(c) != 0; });
 }
 
 bool IsRelativePath(std::wstring_view text) {
