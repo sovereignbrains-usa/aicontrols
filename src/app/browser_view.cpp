@@ -643,6 +643,7 @@ void BrowserView::Shutdown() {
         page.controller.reset();
         page.view.reset();
     }
+    titles_.clear();
     if (controller_) {
         controller_->Close();  // the browser processes go with it; the host goes after
     }
@@ -1827,6 +1828,7 @@ void BrowserView::ClosePage(int slot) {
     if (page.controller) {
         page.controller->Close();
     }
+    titles_.erase(page.view.get());  // keyed by the pointer: a later page may get the same address
     page.controller.reset();
     page.view.reset();
     // Leave page_ on this slot. The next ShowPage sees the change and rewrites the address;

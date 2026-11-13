@@ -1602,6 +1602,12 @@ private:
     std::atomic<bool> titleCancel_ = false;
     std::atomic<bool> titling_ = false;
     std::set<std::string> titled_;  // asked once a run: a chat Haiku could not name keeps its first line
+    // Chats that answered in the background and went from parked_ (their CLI ended): a steady dot in the list
+    // until each is opened. By session id.
+    std::set<std::string> unseen_;
+    bool Unseen(const SessionInfo& session) const {
+        return std::ranges::any_of(unseen_, [&](const std::string& id) { return SameChat(session, id); });
+    }
     void NameChat();
     bool updatePending_ = false;  // asked while Claude was answering: done when the turn ends
     bool previewWide_ = false;
@@ -8427,7 +8433,8 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
         const bool grok = session.parts.empty() ? session.grok : session.parts.back().grok;
         const bool both = std::ranges::any_of(session.parts, [&](const SessionPart& part) { return part.grok != grok; });
         agent(chat, grok, both ? std::optional<bool>(!grok) : std::nullopt, raised ? kRaised : kPanel);
-        float titleRight = chat.right - (parked != nullptr ? 24.f : 8.f);
+        const bool unseen = parked == nullptr && Unseen(session);  // answered aside, its CLI gone, not opened yet
+        float titleRight = chat.right - (parked != nullptr || unseen ? 24.f : 8.f);
         if (hovered) {  // in the age's place: the chat's menu, for those who do not right-click
             const D2D1_RECT_F more = ChatMoreRect(row, r);
             const bool on = hover_.target == Target::ChatMore;
@@ -8485,6 +8492,10 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
                                                                  std::numbers::pi_v<float>));
             }
             brush_->SetColor(Color(waiting ? kWaiting : kAccent, alpha));
+            target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(chat.right - 14.f, (chat.top + chat.bottom) / 2), 3.5f, 3.5f),
+                                 brush_.get());
+        } else if (unseen) {
+            brush_->SetColor(Color(kAccent));
             target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(chat.right - 14.f, (chat.top + chat.bottom) / 2), 3.5f, 3.5f),
                                  brush_.get());
         }
@@ -12489,6 +12500,7 @@ void ChatWindow::OpenChat(std::wstring folder, SessionInfo session) {
     if (IsOpenChat(folder, session)) {
         return;
     }
+    std::erase_if(unseen_, [&](const std::string& id) { return SameChat(session, id); });
     LeaveChat();
     if (const auto found = std::ranges::find_if(parked_, [&](const std::unique_ptr<Parked>& chat) {
             return chat->workspace == folder && SameChat(session, ParkedKey(*chat));
@@ -13358,10 +13370,25 @@ void ChatWindow::OnParked(Parked& chat, const std::function<void()>& handle) {
     inBackground_ = false;
     SwapChat(chat);
     feedSelecting_ = selecting;
-    if (done || asks || renamed) {
+    const std::wstring name = chat.title.empty() ? std::wstring(L"чат в фоне") : L"«" + chat.title + L"»";
+    // Answered and asking nothing: its CLI ends (13.11.2026: each such chat kept a claude.exe of ~0.5 GB until
+    // it was opened again). The transcript is on disk, and opening the chat resumes it like any other; the list
+    // shows a steady dot till then. One whose CLI died keeps its feed here: the error is in no transcript.
+    const bool settled = chat.running && !chat.busy && !chat.sessionId.empty() && chat.handoff.empty() &&
+                         std::ranges::none_of(chat.feed, [](const FeedItem& item) {
+                             return item.kind == Kind::Approval && item.verdict == Verdict::Pending;
+                         });
+    if (settled) {
+        if (done) {
+            unseen_.insert(chat.sessionId);
+        }
+        chat.runner->host.CancelAll();
+        chat.runner->agent->Stop();
+        std::erase_if(parked_, [&](const std::unique_ptr<Parked>& parked) { return parked.get() == &chat; });
+    }
+    if (done || asks || renamed || settled) {
         ListChanged();
     }
-    const std::wstring name = chat.title.empty() ? std::wstring(L"чат в фоне") : L"«" + chat.title + L"»";
     if (asks) {
         Flash(L"Ждёт разрешения: " + name, 6000);
     } else if (done) {
