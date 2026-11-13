@@ -91,6 +91,7 @@ private:
     void SetHot(int hot);
     void OnBarClick(POINT point, bool middle);
     void OnBarMenu(POINT point);
+    void ScrollMarks(int pixels);  // the bookmarks row by that many px (positive: further right)
     void ToggleStar();
     void OpenMark(size_t index, bool newTab);
     void SaveMarks();
@@ -143,16 +144,17 @@ private:
     std::map<ICoreWebView2*, std::wstring> titles_;  // what each page is called, by view (UI thread)
 
     // UI thread only: the bookmarks row.
-    static constexpr int kHitNone = -1, kHitStar = -2, kHitMore = -3, kHitBack = -4;
+    static constexpr int kHitNone = -1, kHitStar = -2, kHitBack = -4;
     struct Chip {
         RECT rect{};
         size_t index = 0;
     };
     std::vector<Bookmark> marks_;
     bool marksLoaded_ = false;
-    std::vector<Chip> chips_;          // the ones that fit, left to right
-    std::vector<size_t> hidden_;       // the rest, behind the "»"
-    RECT more_{};                      // the "»", empty when all fit
+    std::vector<Chip> chips_;          // the ones in view (a part of one at an edge too), left to right
+    RECT markView_{};                  // where the chips show; they are cut at its edges
+    int markScroll_ = 0;               // px the row is scrolled left (the wheel over it)
+    int markMax_ = 0;                  // the most it scrolls: what does not fit
     RECT star_{};
     RECT back_{};                      // the "back" arrow, left of the address
     int hot_ = kHitNone;

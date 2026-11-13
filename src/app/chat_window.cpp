@@ -1259,7 +1259,10 @@ private:
     const Project* RowProject(size_t row) const;
     std::optional<size_t> RevealChat(const std::wstring& folder, const std::string& id);  // its row, made visible
     void SetSidebarOpen(bool open);
-    void ToggleSidebar();  // the toggle and Ctrl+B: with the terminal in the column, they bring the chats back
+    void ShowSidebarBesideTerminal(bool show);
+    void ToggleSidebar();  // the toggle and Ctrl+B: with the terminal or browser open, the sidebar comes up beside it
+    // The terminal takes the sidebar's place when it opens; the sidebar is shown with it only once asked for.
+    bool SidebarShown() const { return sidebarOpen_ && (!terminalOpen_ || sidebarWithTerm_); }
     void FocusSearch();
     void RefreshSessions();
     void OnSearchKey(WPARAM key);
@@ -1645,6 +1648,7 @@ private:
     bool panEndedByPress_ = false;       // the press that ended it: its release does nothing else
     float panRemainder_ = 0;             // the part of a row or a line not scrolled yet
     bool sidebarOpen_ = true;
+    bool sidebarWithTerm_ = false;  // the sidebar was brought up beside an open terminal or browser, not in its place
     bool searchFocus_ = false;  // typing goes to the sidebar's search (drawn here, no caret)
     bool secretsOpen_ = false;  // the sidebar shows the secrets instead of the chats
     std::string editingSecret_;  // the secret the form holds (its old name: renaming replaces it); empty: a new one
@@ -2441,11 +2445,11 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
             // Whole pixels: a fractional edge antialiased a seam just left of the boundary, and the text jumped
             // on its own grid (02.11.2026, his: holes left of the edge, the picture steps as it moves left).
             if (dragging_ == Target::SplitSidebar) {
-                const float most = std::max(kMinSidebar, g.width - MinChat());
+                const float most = std::max(kMinSidebar, g.width - MinChat() - (terminalOpen_ ? kMinTerminal : 0.f));
                 sidebarWidth_ = SnapDip(std::clamp(at.x, kMinSidebar, std::min(kMaxSidebar, most)));
-            } else {
-                const float most = std::max(kMinTerminal, g.width - MinChat());
-                terminalWidth_ = SnapDip(std::clamp(at.x, kMinTerminal, most));
+            } else {  // the terminal's width is its own: from its left edge, which a sidebar beside it pushes right
+                const float most = std::max(kMinTerminal, g.width - MinChat() - g.term.left);
+                terminalWidth_ = SnapDip(std::clamp(at.x - g.term.left, kMinTerminal, most));
             }
             PlaceChildren();
             Refresh();
@@ -3581,18 +3585,20 @@ Geometry ChatWindow::Layout() const {
     g.width = ToDip(client.right);
     g.height = ToDip(client.bottom);
     // The sidebar docks at the left and the chat takes what is left, as in Claude's app.
-    // The terminal takes the sidebar's place (the same left column, the same toggle); the chats come back when it closes.
+    // The terminal or browser takes the sidebar's place when it opens (the same left column, the same toggle); the
+    // chats come back when it closes. Asked for with the terminal open, the sidebar stands left of it and the
+    // terminal keeps its width, moved right (the chat gives way, down to its least).
+    const float sidebarRoom = std::max(0.f, g.width - MinChat() - (terminalOpen_ && sidebarWithTerm_ ? kMinTerminal : 0.f));
+    const float sidebarWidth = SidebarShown() ? SnapDip(std::min(sidebarWidth_, sidebarRoom)) : 0.f;
     const float termWidth =
-        terminalOpen_ ? SnapDip(std::min(terminalWidth_, std::max(0.f, g.width - MinChat()))) : 0.f;
-    const float sidebarWidth = sidebarOpen_ && !terminalOpen_
-                                   ? SnapDip(std::min(sidebarWidth_, std::max(0.f, g.width - MinChat())))
-                                   : 0.f;
-    g.areaLeft = std::max(sidebarWidth, termWidth);
+        terminalOpen_ ? SnapDip(std::min(terminalWidth_, std::max(0.f, g.width - MinChat() - sidebarWidth))) : 0.f;
+    const float termRight = sidebarWidth + termWidth;
+    g.areaLeft = termRight;
     if (sidebarWidth > 0) {
         g.splitSidebar = D2D1::RectF(sidebarWidth - 3, kHeader, sidebarWidth + 4, g.height);
     }
     if (termWidth > 0) {
-        g.splitTerminal = D2D1::RectF(termWidth - 3, kHeader, termWidth + 4, g.height);
+        g.splitTerminal = D2D1::RectF(termRight - 3, kHeader, termRight + 4, g.height);
     }
     g.area = g.width;
     g.column = std::max(0.f, std::min(g.area - g.areaLeft - 2 * kSide, kColumnMax));
@@ -3707,12 +3713,12 @@ Geometry ChatWindow::Layout() const {
         }
     }
     if (termWidth > 0) {
-        g.term = D2D1::RectF(0, kHeader, termWidth, g.height);
+        g.term = D2D1::RectF(sidebarWidth, kHeader, termRight, g.height);
         g.termScreen = D2D1::RectF(g.term.left + 14, g.term.top + 8, g.term.right - 8, g.term.bottom - 12);
         // The tabs sit in the header, in the row of the panel's buttons, right after them.
         const float stripTop = buttonTop;
         const float stripBottom = buttonTop + kButton;
-        const float stripLeft = g.browserBtn.right + 12.f;
+        const float stripLeft = std::max(g.browserBtn.right + 12.f, g.term.left + 12.f);  // right of a sidebar beside it
         const bool wide = (PreviewShown() || BrowserShown() || previewWide_) && !PreviewOwnsControls();
         // Not under the header's buttons at the right (a panel widened over the window reaches them).
         const float headerLimit =
@@ -4914,7 +4920,7 @@ void ChatWindow::Paint() {
     PaintTerminal(g);
     for (const Target split : {Target::SplitSidebar, Target::SplitTerminal}) {  // the edge lights up to be dragged
         if ((hover_.target == split && edgeLit_) || dragging_ == split) {
-            const float x = g.areaLeft;  // both are the left column's right edge, on a pixel
+            const float x = split == Target::SplitSidebar ? g.sidebar.right : g.term.right;  // on a pixel
             const float pixel = Pixel();
             // Two device pixels, aliased: a DIP-wide antialiased stroke left a bright seam beside the panel.
             Solid(D2D1::RectF(x - pixel, kHeader, x + pixel, g.height), kAccent);
@@ -5355,8 +5361,7 @@ void ChatWindow::PaintHeader(const Geometry& g) {
             continue;
         }
         Fill(D2D1::RectF(column.left, 0, column.right, kHeader), 0.f, kPanel);
-        const float edge = column.left == 0.f ? column.right : column.left;
-        Line({edge, 0}, {edge, kHeader}, kLine, 1.f);
+        Line({column.right, 0}, {column.right, kHeader}, kLine, 1.f);
     }
 
     if (update_ && g.sidebar.right <= g.sidebar.left) {  // the header's, only while the sidebar is hidden
@@ -5392,7 +5397,7 @@ void ChatWindow::PaintHeader(const Geometry& g) {
             target_->DrawRoundedRectangle(D2D1::RoundedRect(frame, 2.2f, 2.2f), brush_.get(), 1.35f, round_.get());
             // The column stops short of the frame: a round cap on the stroke itself read as a broken corner.
             Line({col, frame.top + 2.35f}, {col, frame.bottom - 2.35f}, color, 1.35f);
-            if (sidebarOpen_ && !terminalOpen_) {
+            if (SidebarShown()) {
                 wil::com_ptr<ID2D1PathGeometry> pane;
                 wil::com_ptr<ID2D1GeometrySink> sink;
                 if (SUCCEEDED(d2d_->CreatePathGeometry(pane.put())) && SUCCEEDED(pane->Open(sink.put()))) {
@@ -5882,10 +5887,8 @@ void ChatWindow::SetSecretsOpen(bool open) {
     ClosePopup();
     searchFocus_ = false;
     if (open) {
-        sidebarOpen_ = true;  // the secrets live in the sidebar, in the column the terminal would hold
-        if (terminalOpen_) {
-            SetTerminalOpen(false);
-        }
+        sidebarOpen_ = true;  // the secrets live in the sidebar, beside a terminal or browser that stays open
+        ShowSidebarBesideTerminal(true);
     }
     secretsOpen_ = open;
     hover_ = {};
@@ -6367,6 +6370,7 @@ void ChatWindow::SetTerminalOpen(bool open) {
     }
     ClosePopup();
     terminalOpen_ = open;
+    sidebarWithTerm_ = false;  // it opens in the sidebar's place and gives it back when it closes
     hover_ = {};
     PlaceChildren();  // the chat's column moves
     if (open) {
@@ -9197,20 +9201,37 @@ void ChatWindow::SetSidebarOpen(bool open) {
 }
 
 void ChatWindow::ToggleSidebar() {
-    if (terminalOpen_) {
-        SetTerminalOpen(false);
-        SetSidebarOpen(true);
+    if (terminalOpen_) {  // beside the terminal or browser, which stays open
+        ShowSidebarBesideTerminal(!SidebarShown());
         return;
     }
     SetSidebarOpen(!sidebarOpen_);
 }
 
+void ChatWindow::ShowSidebarBesideTerminal(bool show) {
+    if (!terminalOpen_ || SidebarShown() == show) {
+        return;
+    }
+    sidebarWithTerm_ = show;
+    if (show) {
+        sidebarOpen_ = true;
+        RefreshSessions();
+    } else {
+        if (secretsOpen_) {
+            SetSecretsOpen(false);
+        }
+        searchFocus_ = false;
+    }
+    hover_ = {};
+    PlaceChildren();  // the terminal's column moves
+    PlaceBrowser();
+    Refresh();
+}
+
 // Ctrl+H or a click on the search: the keys go to it until Esc, Enter or a click elsewhere.
 void ChatWindow::FocusSearch() {
     ClosePopup();
-    if (terminalOpen_) {
-        SetTerminalOpen(false);
-    }
+    ShowSidebarBesideTerminal(true);
     SetSidebarOpen(true);
     if (secretsOpen_) {
         SetSecretsOpen(false);
@@ -11122,10 +11143,7 @@ void ChatWindow::OpenFile(const std::wstring& path) {
 std::wstring ChatWindow::TooltipText() {
     switch (hover_.target) {
     case Target::SidebarToggle:
-        if (terminalOpen_) {
-            return L"Показать чаты (Ctrl+B)";
-        }
-        return sidebarOpen_ ? L"Скрыть боковую панель (Ctrl+B)" : L"Показать боковую панель (Ctrl+B)";
+        return SidebarShown() ? L"Скрыть боковую панель (Ctrl+B)" : L"Показать боковую панель (Ctrl+B)";
     case Target::TerminalToggle:
         return ShellShown() ? L"Скрыть терминал" : L"Показать терминал";
     case Target::BrowserToggle:

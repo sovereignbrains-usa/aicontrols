@@ -395,6 +395,16 @@ LRESULT CALLBACK BrowserView::HostProc(HWND hwnd, UINT message, WPARAM wParam, L
         EndPaint(hwnd, &paint);
         return 0;
     }
+    if ((message == WM_MOUSEWHEEL || message == WM_MOUSEHWHEEL) && self != nullptr && self->markMax_ > 0) {
+        POINT at{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};  // a wheel's point is the screen's
+        ScreenToClient(hwnd, &at);
+        if (at.y < self->BarHeight()) {  // over the bookmarks row: it scrolls sideways, the wheel up goes back
+            const int step = MulDiv(GET_WHEEL_DELTA_WPARAM(wParam), self->Dip(80), WHEEL_DELTA);
+            self->ScrollMarks(message == WM_MOUSEHWHEEL ? step : -step);
+            self->SetHot(self->HitBar(at));
+            return 0;
+        }
+    }
     if (self != nullptr) {
         const POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
         switch (message) {
@@ -959,8 +969,8 @@ void BrowserView::SaveMarks() {
 
 void BrowserView::LayoutBar() {
     chips_.clear();
-    hidden_.clear();
-    more_ = {};
+    markView_ = {};
+    markMax_ = 0;
     star_ = {};
     back_ = {};
     if (host_ == nullptr) {
@@ -993,23 +1003,31 @@ void BrowserView::LayoutBar() {
     SelectObject(dc, old);
     ReleaseDC(host_, dc);
     // The first icon stands under the magnifier.
-    int x = static_cast<int>(field.left) + Dip(4);
+    const int first = static_cast<int>(field.left) + Dip(4);
     const int top = Dip(46);
     const int bottom = top + Dip(24);
     const int limit = static_cast<int>(field.right);
-    const bool all = x + total - gap <= limit;
-    const int stop = all ? limit : limit - Dip(28) - gap;
+    // Too many to fit: the row scrolls under the wheel, and what sticks out at an edge is cut there.
+    markView_ = RECT{first, top, limit, bottom};
+    markMax_ = std::max(0, total - gap - (limit - first));
+    markScroll_ = std::clamp(markScroll_, 0, markMax_);
+    int x = first - markScroll_;
     for (size_t i = 0; i < marks_.size(); ++i) {
-        if (hidden_.empty() && x + widths[i] <= stop) {
+        if (x + widths[i] > first && x < limit) {
             chips_.push_back({RECT{x, top, x + widths[i], bottom}, i});
-            x += widths[i] + gap;
-        } else {
-            hidden_.push_back(i);
         }
+        x += widths[i] + gap;
     }
-    if (!hidden_.empty()) {
-        more_ = RECT{limit - Dip(28), top, limit, bottom};
+}
+
+void BrowserView::ScrollMarks(int pixels) {
+    const int moved = std::clamp(markScroll_ + pixels, 0, markMax_);
+    if (moved == markScroll_) {
+        return;
     }
+    markScroll_ = moved;
+    LayoutBar();
+    InvalidateBar();
 }
 
 int BrowserView::HitBar(POINT point) const {
@@ -1019,11 +1037,8 @@ int BrowserView::HitBar(POINT point) const {
     if (PtInRect(&star_, point) && !BookmarkHost(ActiveSource()).empty()) {
         return kHitStar;
     }
-    if (PtInRect(&more_, point)) {
-        return kHitMore;
-    }
     for (const Chip& chip : chips_) {
-        if (PtInRect(&chip.rect, point)) {
+        if (PtInRect(&chip.rect, point) && PtInRect(&markView_, point)) {  // not the cut-off part
             return static_cast<int>(chip.index);
         }
     }
@@ -1111,20 +1126,6 @@ void BrowserView::OnBarClick(POINT point, bool middle) {
         }
     } else if (hit == kHitStar && !middle) {
         ToggleStar();
-    } else if (hit == kHitMore) {
-        if (!menu_ || host_ == nullptr) {
-            return;
-        }
-        wil::unique_hmenu menu(CreatePopupMenu());
-        for (const size_t index : hidden_) {
-            AppendMenuW(menu.get(), MF_STRING, index + 1, marks_[index].name.c_str());
-        }
-        POINT at{more_.right, more_.bottom + Dip(2)};
-        ClientToScreen(host_, &at);
-        const int chosen = menu_(menu.get(), at);
-        if (chosen > 0) {
-            OpenMark(static_cast<size_t>(chosen - 1), middle || (GetKeyState(VK_CONTROL) & 0x8000) != 0);
-        }
     } else if (hit >= 0) {
         OpenMark(static_cast<size_t>(hit), middle || (GetKeyState(VK_CONTROL) & 0x8000) != 0);
     }
@@ -1238,9 +1239,13 @@ void BrowserView::PaintBar(HDC dc, const RECT& client) {
         path.AddArc(l, b - d, d, d, 90.f, 90.f);
         path.CloseFigure();
     };
+    // A row that scrolls is cut at its edges: the icons, the names and the hover all stay inside.
+    const int savedDc = SaveDC(memory);
+    IntersectClipRect(memory, markView_.left, markView_.top, markView_.right, markView_.bottom);
     std::vector<bool> lettered(chips_.size(), false);
     if (gdip_ != 0) {
         Gdiplus::Graphics canvas(memory);
+        canvas.SetClip(Gdiplus::Rect(markView_.left, markView_.top, markView_.right - markView_.left, markView_.bottom - markView_.top));
         canvas.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
         canvas.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
         canvas.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
@@ -1288,28 +1293,6 @@ void BrowserView::PaintBar(HDC dc, const RECT& client) {
                 canvas.FillPath(&lit, &line);
             }
         }
-        if (more_.right > more_.left) {  // "»": the ones that did not fit
-            if (hot_ == kHitMore) {
-                Gdiplus::GraphicsPath back;
-                rounded(back, static_cast<float>(more_.left), static_cast<float>(more_.top),
-                        static_cast<float>(more_.right), static_cast<float>(more_.bottom), DipF(6.f));
-                const Gdiplus::SolidBrush hover(Gdiplus::Color(255, 0x23, 0x23, 0x27));
-                canvas.FillPath(&hover, &back);
-            }
-            const BYTE shade = hot_ == kHitMore ? 0xf2 : 0x9c;
-            Gdiplus::Pen pen(Gdiplus::Color(255, shade, shade, shade), std::max(1.f, DipF(1.3f)));
-            pen.SetStartCap(Gdiplus::LineCapRound);
-            pen.SetEndCap(Gdiplus::LineCapRound);
-            pen.SetLineJoin(Gdiplus::LineJoinRound);
-            const float mx = (more_.left + more_.right) / 2.f;
-            const float my = (more_.top + more_.bottom) / 2.f;
-            for (const float shift : {-DipF(2.5f), DipF(1.5f)}) {
-                const Gdiplus::PointF chevron[3] = {{mx + shift - DipF(1.5f), my - DipF(3.5f)},
-                                                    {mx + shift + DipF(1.5f), my},
-                                                    {mx + shift - DipF(1.5f), my + DipF(3.5f)}};
-                canvas.DrawLines(&pen, chevron, 3);
-            }
-        }
     }
     SetBkMode(memory, TRANSPARENT);
     const HGDIOBJ chipFont = chipFont_ != nullptr ? static_cast<HGDIOBJ>(chipFont_) : GetStockObject(DEFAULT_GUI_FONT);
@@ -1333,6 +1316,7 @@ void BrowserView::PaintBar(HDC dc, const RECT& client) {
                   DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
     }
     SelectObject(memory, oldFont);
+    RestoreDC(memory, savedDc);
     BitBlt(dc, 0, 0, client.right, bar, memory, 0, 0, SRCCOPY);
     SelectObject(memory, oldBitmap);
     DeleteObject(bitmap);
