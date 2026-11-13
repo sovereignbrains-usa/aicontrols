@@ -236,7 +236,7 @@ constexpr float kTextMax = 220.f;
 constexpr float kButton = 26.f;
 constexpr float kTerminal = 480.f;  // the right column: PowerShell (as wide by default)
 constexpr float kMinTerminal = 300.f;
-constexpr float kMinSidebar = 180.f;
+constexpr float kMinSidebar = 230.f;  // narrower, the tabs, the account and the chat titles are cut to "…"
 constexpr float kMaxSidebar = 480.f;
 constexpr uint32_t kTermFg = 0xd4d4d8;
 constexpr float kSidebar = 252.f;  // the left column: search, secrets, the chats
@@ -245,7 +245,7 @@ constexpr const wchar_t* kArchiveFolder = L"::archive";  // the sidebar's archiv
 constexpr float kProjectIndent = 14.f;  // a project's chats under its head
 constexpr float kNavRow = 34.f;
 constexpr float kMinChat = 420.f;  // the chat never gets narrower than this: side panels give way first
-constexpr float kMinChatPreview = 340.f;  // ... but beside a preview it may be a strip
+constexpr float kMinChatPreview = 400.f;  // ... but beside a preview it may be a strip
 constexpr float kCodeSize = 13.5f;  // code and tables in a message; the terminal's cell is measured at 12.5
 
 // Put into every page the preview loads: Ctrl shows the element under the pointer, Ctrl+click tells the window
@@ -3662,16 +3662,29 @@ Geometry ChatWindow::Layout() const {
     g.usage = D2D1::RectF(right - 6 - kRing, ringTop, right - 6, ringTop + kRing);
     const float chipTop = chipsTop + 2;
     const float chipBottom = chipsBottom - 2;
-    float chipsRight = g.usage.left - 6;
-    if (!EffortLevels().empty()) {
-        const float width = TextWidth(EffortName(settings_.effort), ui_.get()) + 18;
-        g.effort = D2D1::RectF(chipsRight - width, chipTop, chipsRight, chipBottom);
-        chipsRight = g.effort.left - 2;
-    }
-    const float modelWidth = kChipMark + TextWidth(ModelName(), ui_.get()) + 18;
-    g.model = D2D1::RectF(chipsRight - modelWidth, chipTop, chipsRight, chipBottom);
+    // The chips stand right-aligned: in a narrow chat they must not reach past the box's left edge (the permission's
+    // label sat on the browser's border, 13.11.2026, his). The effort goes first, then the model's name is cut short.
     const float permissionWidth = TextWidth(PermissionName(), ui_.get()) + 18;
-    g.permission = D2D1::RectF(g.model.left - 2 - permissionWidth, chipTop, g.model.left - 2, chipBottom);
+    const float modelFull = kChipMark + TextWidth(ModelName(), ui_.get()) + 18;
+    const float chipsLeast = left + 4.f;
+    for (const bool withEffort : {true, false}) {
+        float chipsRight = g.usage.left - 6;
+        g.effort = {};
+        if (withEffort && !EffortLevels().empty()) {
+            const float width = TextWidth(EffortName(settings_.effort), ui_.get()) + 18;
+            g.effort = D2D1::RectF(chipsRight - width, chipTop, chipsRight, chipBottom);
+            chipsRight = g.effort.left - 2;
+        }
+        float modelWidth = modelFull;
+        if (!withEffort) {  // the last try: the model gives what the permission needs
+            modelWidth = std::clamp(chipsRight - 2 - permissionWidth - chipsLeast, kChipMark + 30.f, modelFull);
+        }
+        g.model = D2D1::RectF(chipsRight - modelWidth, chipTop, chipsRight, chipBottom);
+        g.permission = D2D1::RectF(g.model.left - 2 - permissionWidth, chipTop, g.model.left - 2, chipBottom);
+        if (g.permission.left >= chipsLeast) {
+            break;
+        }
+    }
     g.project = D2D1::RectF(left + 4, chipsTop, std::max(left + 4, g.permission.left - 8), chipsBottom);
     g.feed = D2D1::RectF(g.areaLeft, kHeader, g.area, boxTop - 8);
     {
@@ -5260,7 +5273,7 @@ D2D1_RECT_F ChatWindow::CancelCallRect(const Geometry& g, const FeedItem& item) 
     if (!CallRunning(item) || item.ranFrom == 0 || GetTickCount64() - item.ranFrom < kCancelAfter) {
         return {};
     }
-    const float right = g.left + g.column - kCardPad - 110.f - 6.f;  // left of the "Идёт 12 с" label
+    const float right = g.left + g.column - kCardPad;  // the card's right end; the "Идёт 12 с" label stands left of it
     const float top = item.top + kCardPad;
     return D2D1::RectF(right - 78.f, top, right, top + kCardTitle);
 }
@@ -5295,7 +5308,9 @@ void ChatWindow::PaintApproval(const Geometry& g, const FeedItem& item, float le
     const float inner = left + kCardPad;
     const float top = item.top + kCardPad;
     const bool onItem = hover_.row < feed_.size() && &feed_[hover_.row] == &item;
-    const float titleRight = card.right - kCardPad - 110.f;
+    const D2D1_RECT_F stop = CancelCallRect(g, item);  // empty unless a call has run a while
+    const float stopRoom = stop.right > stop.left ? (stop.right - stop.left) + 6.f : 0.f;
+    const float titleRight = card.right - kCardPad - 110.f - stopRoom;
     Text(item.title, uiBold_.get(), D2D1::RectF(inner, top, titleRight, top + kCardTitle), kPrimary);
     if (!pending) {
         std::wstring label;
@@ -5309,7 +5324,7 @@ void ChatWindow::PaintApproval(const Geometry& g, const FeedItem& item, float le
                     label = seconds < 60 ? std::format(L"Идёт {} с", seconds)
                                          : std::format(L"Идёт {}:{:02}", seconds / 60, seconds % 60);
                 }
-                if (const D2D1_RECT_F stop = CancelCallRect(g, item); stop.right > stop.left) {
+                if (stop.right > stop.left) {
                     const bool hot = onItem && hover_.target == Target::CardCancel;
                     Fill(stop, 6.f, hot ? kLine : kRaised);
                     Text(L"Прервать", cardButton_.get(), stop, hot ? kPrimary : kSecondary);
@@ -5318,7 +5333,8 @@ void ChatWindow::PaintApproval(const Geometry& g, const FeedItem& item, float le
         } else {
             label = item.verdict == Verdict::Denied ? L"Отклонено" : L"Отменено";
         }
-        Text(label, uiRight_.get(), D2D1::RectF(card.right - kCardPad - 110.f, top, card.right - kCardPad, top + kCardTitle),
+        Text(label, uiRight_.get(),
+             D2D1::RectF(card.right - kCardPad - 110.f - stopRoom, top, card.right - kCardPad - stopRoom, top + kCardTitle),
              labelColor);
     }
     if (!item.output.empty() && item.layout) {  // the output under the call, in the terminal's colour (red if it failed)
@@ -7029,7 +7045,9 @@ void ChatWindow::SignOut() {
     if (exe.empty()) {
         return;
     }
-    if (MessageBoxW(hwnd_, L"Выйти из аккаунта?\nЧтобы снова пользоваться Claude, придётся войти заново.", L"AIControls",
+    const std::wstring ask = L"Выйти из Claude" + (auth_.email.empty() ? std::wstring() : L" (" + ToWide(auth_.email) + L")") +
+                             L"?\nЧтобы снова пользоваться Claude, придётся войти заново. Grok и GitHub это не затронет.";
+    if (MessageBoxW(hwnd_, ask.c_str(), L"AIControls",
                     MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES) {
         return;
     }
@@ -7077,7 +7095,7 @@ void ChatWindow::ShowAccountMenu() {
                 ClaudeUpdateAvailable() ? update.c_str() : L"Проверить обновления Claude");
     AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu.get(), MF_STRING, 6, L"Подключения: Claude, Grok, GitHub…");
-    AppendMenuW(menu.get(), MF_STRING, 2, L"Выйти из аккаунта");
+    AppendMenuW(menu.get(), MF_STRING, 2, L"Выйти из Claude");  // only Claude's: Grok and GitHub stay connected
     switch (Menu(menu.get(), screen, true)) {
     case 2:
         SignOut();
