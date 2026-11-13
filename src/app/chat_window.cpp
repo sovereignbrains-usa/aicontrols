@@ -228,7 +228,10 @@ constexpr float kTabIcon = 1.1f;    // its marks' scale over the list's own (big
 constexpr float kSecretsNote = 40.f;
 constexpr float kUsageRow = 58.f;
 constexpr float kUsageNote = 24.f;  // Grok's popup: a line under its one bar
-constexpr float kTextMin = 16.f;  // the input hugs its line: the row centres it (taller, it sat high)
+constexpr float kUsageSpend = 44.f;  // the chat's own spend: two lines
+// The input hugs its line, and the row centres it. An empty RichEdit asks for a 1 px line, so this is the line's
+// height as RichEdit lays this font out (19 px at 96 dpi): with 16, the text jumped 3 px up at the first letter.
+constexpr float kTextMin = 19.f;
 constexpr float kTextMax = 220.f;
 constexpr float kButton = 26.f;
 constexpr float kTerminal = 480.f;  // the right column: PowerShell (as wide by default)
@@ -1692,6 +1695,7 @@ wil::com_ptr<ID2D1PathGeometry> githubMark_;  // the projects' mark, made when f
     POINT caretSet_{-1, -1};  // where FitCaret last put its caret
     LONG caretTop_ = -1;      // below the line's top, px (the font's internal leading)
     LONG caretHeight_ = 0;
+    LONG inputShift_ = 0;     // RichEdit's baseline against GDI's for the same font, px (the placeholder follows it)
     float textHeight_ = kTextMin;  // the input's text area, grows with what is typed
     int inputLinePx_ = 0;          // one of its lines, as RichEdit lays it out: its scrollbar counts in them
     float inputWheel_ = 0;         // the part of a line the wheel has not moved it by yet
@@ -2105,6 +2109,7 @@ LRESULT CALLBACK ChatWindow::InputProc(HWND hwnd, UINT message, WPARAM wParam, L
         RECT area{};
         SendMessageW(hwnd, EM_GETRECT, 0, reinterpret_cast<LPARAM>(&area));
         area.left += MulDiv(3, static_cast<int>(GetDpiForWindow(hwnd)), 96);  // clear of the caret standing at its start
+        area.top += window->inputShift_;  // on RichEdit's line: where what is typed will stand
         const HGDIOBJ old = SelectObject(dc, window->uiFont_.get());
         SetTextColor(dc, ToColorRef(kSecondary));
         SetBkMode(dc, TRANSPARENT);
@@ -2119,30 +2124,45 @@ LRESULT CALLBACK ChatWindow::InputProc(HWND hwnd, UINT message, WPARAM wParam, L
     return result;
 }
 
-// RichEdit's caret is the font's whole line: the text font keeps room above its capitals (for Й, Ё), so it started
-// well above the letters and stopped at their baseline, and stood crooked. Whenever RichEdit has put its own,
-// it is replaced by one from the capitals' top to the descenders' bottom, at the same place.
+// RichEdit's own caret is its whole line, from the top: that is 19 px of the 20 that GDI measures for the same font,
+// and the letters stand by RichEdit's line, not GDI's (measured on pixels: capitals from 4, baseline at 15, tails to
+// 16). The caret was cut by GDI's numbers and stood 1-2 px low, with 2-3 px hanging under the tails. Whenever
+// RichEdit has put its own, it is replaced by one from a pixel above the capitals to a pixel under the tails, at
+// the same place; the line's height is read off RichEdit's caret, and the placeholder is drawn by the same line.
 void ChatWindow::FitCaret(HWND input) {
     POINT at{};
     if (!GetCaretPos(&at) || (at.x == caretSet_.x && at.y == caretSet_.y)) {
         return;  // ours, where we put it
     }
     if (caretTop_ < 0) {
+        GUITHREADINFO info{sizeof(info)};
+        const LONG line = GetGUIThreadInfo(GetCurrentThreadId(), &info) && info.hwndCaret == input
+                              ? info.rcCaret.bottom - info.rcCaret.top
+                              : 0;
+        if (line <= 0) {
+            return;  // RichEdit has not made its caret yet: its own stays until the next paint
+        }
         HDC dc = GetDC(input);
         const HGDIOBJ old = SelectObject(dc, uiFont_.get());
         TEXTMETRICW metrics{};
         GetTextMetricsW(dc, &metrics);
         SelectObject(dc, old);
         ReleaseDC(input, dc);
-        caretTop_ = metrics.tmInternalLeading;
-        caretHeight_ = std::max(4L, metrics.tmHeight - metrics.tmInternalLeading - 1);  // down to just above the tails' end: lower, it looked low
+        const LONG capitals = metrics.tmAscent - metrics.tmInternalLeading;
+        const LONG baseline = line - metrics.tmDescent;  // RichEdit's ascent: the line's tail is the font's descent
+        const LONG margin = std::max(1, ToPx(1.f));
+        inputShift_ = baseline - metrics.tmAscent;
+        caretTop_ = std::max(0L, baseline - capitals - margin);
+        caretHeight_ = capitals + metrics.tmDescent / 2 + 2 * margin;
+        if (inputShift_ != 0 && GetWindowTextLengthW(input) == 0) {
+            InvalidateRect(input, nullptr, FALSE);  // the placeholder moves to the same line
+        }
     }
     CreateCaret(input, nullptr, std::max(1, ToPx(1.5f)), caretHeight_);
     caretSet_ = POINT{at.x, at.y + caretTop_};
     SetCaretPos(caretSet_.x, caretSet_.y);
     ShowCaret(input);
 }
-
 LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
     case WM_CREATE: {
@@ -3623,8 +3643,10 @@ Geometry ChatWindow::Layout() const {
     g.mic = D2D1::RectF(right - 8 - kInputButton, rowBottom - kInputButton, right - 8, rowBottom);
     g.send = D2D1::RectF(g.mic.left - 4 - kInputButton, rowBottom - kInputButton, g.mic.left - 4, rowBottom);
     // The font keeps room above its capitals: centred by its box, the letters sat 2-3 DIPs low (measured on a
-    // screenshot against "+" and the box's middle).
-    constexpr float kTextNudge = 2.5f;
+    // screenshot against "+" and the box's middle). Measured again on pixels, empty and typed, at 96 dpi: with
+    // 2.5 the capitals' middle stood 2.5 px above the "+" and the lowercase 1 px above; 1 leaves the capitals
+    // 1 px above and the lowercase on it, which is how the eye centres a line of words.
+    constexpr float kTextNudge = 1.f;
     constexpr float kDescentRoom = 4.f;  // RichEdit insets its line a little: without it "р" and "у" lost their tails
     const float textTop = rowTop + (rowHeight - textHeight_) / 2 - kTextNudge;
     // Beside the text stands its scrollbar's strip, for when it holds more than it shows (Bar, Scroller::Input).
@@ -3778,7 +3800,7 @@ Geometry ChatWindow::Layout() const {
     case Popup::Usage: {
         const float popupRight = ClampTo(g.usage.right + 4, 10.f + kUsageWidth, g.area - 10);
         const float height = (GrokRunning() ? 14 + 24 + kUsageRow + kUsageNote + 4 : 14 + 24 + 2 * kUsageRow + 4) +
-                             (spend_.turns > 0 ? kUsageNote : 0.f);
+                             (spend_.turns > 0 ? kUsageSpend : 0.f);
         // Above the box, like the other panels: the input's own window would hide whatever lay over it.
         g.popup = D2D1::RectF(popupRight - kUsageWidth, g.box.top - 6 - height, popupRight, g.box.top - 6);
         break;
@@ -4086,6 +4108,8 @@ void ChatWindow::CreateFonts() {
     font.lfQuality = CLEARTYPE_QUALITY;
     wcscpy_s(font.lfFaceName, kTextFont);
     uiFont_.reset(CreateFontIndirectW(&font));
+    caretTop_ = -1;  // the caret and the placeholder are measured again, for this size
+    inputShift_ = 0;
 }
 
 void ChatWindow::CreateInput() {
@@ -5784,10 +5808,11 @@ void ChatWindow::PaintUsage(const Geometry& g) {
              kSecondary);
         note += kUsageNote;
     }
-    if (spend_.turns > 0) {  // this chat's own, since the window opened it
-        Text(std::format(L"Этот чат: {} тыс. токенов в лимит, {} тыс. из кэша · {} ход.", std::max(1LL, spend_.fresh / 1000),
-                         spend_.cached / 1000, spend_.turns),
-             ui_.get(), D2D1::RectF(left, note, right, note + 22), kSecondary);
+    if (spend_.turns > 0) {  // this chat's own, since the window opened it: two lines, one was cut off at the edge
+        Text(std::format(L"Этот чат: {} тыс. токенов в лимит", std::max(1LL, spend_.fresh / 1000)), ui_.get(),
+             D2D1::RectF(left, note, right, note + 22), kSecondary);
+        Text(std::format(L"{} тыс. из кэша · {} ход.", spend_.cached / 1000, spend_.turns), ui_.get(),
+             D2D1::RectF(left, note + 20, right, note + 42), kSecondary);
     }
 }
 
@@ -10048,6 +10073,7 @@ void ChatWindow::FinishDelete() {
         RefreshSessions();
         return;
     }
+    std::erase_if(unseen_, [&](const std::string& id) { return SameChat(doomed_->session, id); });  // no dot for a chat that is gone
     doomed_->gone = true;
     ListChanged();
 }
@@ -12984,6 +13010,7 @@ void ChatWindow::ArchiveReviewed(const std::wstring& folder) {
             continue;
         }
         drafts_.erase(DraftKey(session));
+        std::erase_if(unseen_, [&](const std::string& id) { return SameChat(session, id); });
         ++moved;
     }
     if (closedOpen) {

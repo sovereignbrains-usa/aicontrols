@@ -87,6 +87,14 @@ int main() {
                "a generated title is kept once and read");
         Expect(aic::RenameSession(a, "chat-sentence", L"Моё") && aic::SessionTitle(a, "chat-sentence") == L"Моё",
                "a rename is above the generated title");
+        // Every chat has a record (its last message, for the order): that is not a title, the chat is still to be named.
+        std::ofstream(historyA / L"chat-recorded.jsonl")
+            << R"({"type":"user","message":{"role":"user","content":"hello there"}})" << "\n";
+        aic::NoteChatActive("chat-recorded", 134390000000000000ULL);
+        Expect(!aic::HasOwnTitle(a, "chat-recorded") && aic::SetGeneratedTitle(a, "chat-recorded", L"Привет") &&
+                   aic::HasOwnTitle(a, "chat-recorded"),
+               "a chat with a record and no title is named");
+        fs::remove(historyA / L"chat-recorded.jsonl", error);
     }
     Expect(aic::CleanTitle("«Прокрутка списка чатов».\n\nПояснение") == L"Прокрутка списка чатов" &&
                aic::CleanTitle("Название: Сборка установщика") == L"Сборка установщика" &&
@@ -178,6 +186,37 @@ int main() {
         << R"({"type":"user","message":{"role":"user","content":"again"}})" << "\n";
     const std::vector<aic::TranscriptEntry> stopped = aic::LoadTranscript(a, "chat-3", 100, truncated);
     Expect(stopped.size() == 2 && stopped[1].text == L"again", "the CLI's note after a Stop is not a user's message");
+    // A long file: opening it reads the end, and what is shown is what the whole file would give. 6 MB here, three of
+    // the end's pieces; a line of filler (the CLI's request copies) between the messages, and a call with its result.
+    {
+        const std::string filler = R"({"type":"api-request-blob","data":")" + std::string(1000, 'x') + R"("})";
+        std::ofstream long_(historyA / L"chat-long.jsonl", std::ios::binary);
+        for (int i = 0; i < 3000; ++i) {
+            long_ << R"({"type":"user","message":{"role":"user","content":"q)" << i << R"("}})" << "\n" << filler << "\n";
+            if (i == 2998) {
+                long_ << R"({"type":"assistant","message":{"id":"m1","content":[{"type":"tool_use","id":"t1","name":"Read","input":{}}]}})"
+                      << "\n"
+                      << R"({"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"result"}]}})"
+                      << "\n";
+            }
+            long_ << R"({"type":"assistant","message":{"id":"m)" << i << R"(","content":[{"type":"text","text":"a)" << i
+                  << R"("}]}})" << "\n"
+                  << filler << "\n";
+        }
+        long_.close();
+        const std::vector<aic::TranscriptEntry> latest = aic::LoadTranscript(a, "chat-long", 100, truncated);
+        Expect(latest.size() == 100 && truncated && latest.back().text == L"a2999" && latest[0].text == L"a2950",
+               "a long chat: its last 100 entries");
+        Expect(std::ranges::any_of(latest, [](const aic::TranscriptEntry& e) { return e.kind == aic::EntryKind::Tool && e.toolOutput == L"result"; }),
+               "a long chat: a call keeps its result");
+        const std::vector<aic::TranscriptEntry> all = aic::LoadTranscript(a, "chat-long", SIZE_MAX, truncated);
+        Expect(all.size() == 6001 && !truncated && all[0].text == L"q0" && all.back().text == L"a2999",
+               "a long chat, all of it");
+        const std::vector<aic::TranscriptEntry> wide = aic::LoadTranscript(a, "chat-long", 5000, truncated);
+        Expect(wide.size() == 5000 && truncated && wide.back().text == L"a2999", "a long chat, the end of 5000");
+        const std::vector<aic::TranscriptEntry> few = aic::LoadTranscript(a, "chat-long", 6001, truncated);
+        Expect(few.size() == 6001 && !truncated && few[0].text == L"q0", "a long chat, as many as it has");
+    }
     // A switch after it: the summary and what came after, not what it sums up; each part's words by its CLI.
     const std::wstring handoff = aic::ChatSoFar({{false, entries}, {true, {{aic::EntryKind::Assistant, L"pelican"}}}}, 100);
     Expect(handoff.find(L"remember pelican") == std::wstring::npos && handoff.find(L"the word is pelican") != std::wstring::npos &&

@@ -1517,9 +1517,14 @@ bool HasOwnTitle(const std::wstring& workspace, const std::string& id) {
         return true;  // nothing to name
     }
     {
+        // Every chat has a record (its last message, for the order), so a record alone says nothing: the title the
+        // user gave in the sidebar does, and a later part of a chat in parts, which shows its first part's.
+        // (Before 13.11.2026 any record counted, and no chat was ever named.)
         const std::lock_guard lock(g_chatsMutex);
-        if (RecordOf(Chats(), id) != nullptr) {
-            return true;  // a chat in parts: its record's title or its first part's
+        if (const ChatRecord* record = RecordOf(Chats(), id)) {
+            if (!record->title.empty() || (record->sessions.size() > 1 && record->sessions.front() != id)) {
+                return true;
+            }
         }
     }
     const fs::path file = SessionFile(workspace, id);
@@ -1583,17 +1588,16 @@ std::wstring GrokHistoryFolder(const std::wstring& workspace) {
     return GrokProjectDir(workspace).wstring();
 }
 
-// A Claude transcript file, wherever it sits (the live history, or a copy in the archive).
-std::vector<TranscriptEntry> LoadClaudeFile(const fs::path& file, size_t limit, bool& truncated) {
+namespace {
+
+// The entries in Claude's lines: a whole file, or the end of one that starts at a line.
+std::vector<TranscriptEntry> ParseClaudeLines(std::string_view text) {
     std::vector<TranscriptEntry> entries;
-    std::error_code error;
-    const uint64_t size = fs::file_size(file, error);
-    if (error) {
-        KeepLatest(entries, limit, truncated);
-        return entries;
-    }
     std::string lastAssistant;  // one API message arrives as a line per content block
-    ForEachLine(ReadRange(file, 0, size), [&](std::string_view line) {
+    ForEachLine(text, [&](std::string_view line) {
+        if (line.starts_with(R"({"type":"api-request)")) {  // the CLI's copies of its requests: a quarter of a long file
+            return;
+        }
         const Json entry = Json::parse(line, nullptr, false);
         if (entry.is_discarded() || IsTrue(JsonAt(entry, "isSidechain")) || IsTrue(JsonAt(entry, "isMeta"))) {
             return;
@@ -1683,6 +1687,41 @@ std::vector<TranscriptEntry> LoadClaudeFile(const fs::path& file, size_t limit, 
             }
         }
     });
+    return entries;
+}
+
+}  // namespace
+
+// A Claude transcript file, wherever it sits (the live history, or a copy in the archive). Opening a chat shows its
+// last `limit` entries, and a long file (63 MB on 13.11.2026: 0.5 s on the window's thread, parsing every line) is
+// mostly older than that: the end is read in growing pieces until it holds more entries than wanted. The few extra
+// absorb what a cut at a piece's start loses (an answer's first block, a call whose result came before it); they are
+// the first ones and KeepLatest drops them.
+std::vector<TranscriptEntry> LoadClaudeFile(const fs::path& file, size_t limit, bool& truncated) {
+    constexpr uint64_t kFirstPiece = 2 << 20;
+    constexpr size_t kExtra = 20;
+    std::vector<TranscriptEntry> entries;
+    std::error_code error;
+    const uint64_t size = fs::file_size(file, error);
+    if (error) {
+        KeepLatest(entries, limit, truncated);
+        return entries;
+    }
+    uint64_t piece = limit > SIZE_MAX / 2 ? size : kFirstPiece;  // all of them wanted: all of it
+    for (;;) {
+        const uint64_t start = size > piece ? size - piece : 0;
+        const std::string text = ReadRange(file, start, size - start);
+        std::string_view lines = text;
+        if (start > 0) {  // it begins inside a line: from the next
+            const size_t cut = lines.find('\n');
+            lines = cut == std::string_view::npos ? std::string_view() : lines.substr(cut + 1);
+        }
+        entries = ParseClaudeLines(lines);
+        if (start == 0 || (entries.size() > kExtra && entries.size() - kExtra > limit)) {
+            break;
+        }
+        piece *= 4;
+    }
     KeepLatest(entries, limit, truncated);
     return entries;
 }

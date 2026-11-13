@@ -9,7 +9,9 @@ namespace aic {
 // over the first exchange, after its first answer. Stored as the CLI's own generated title would be, so a
 // title the user gave stays above it.
 
-constexpr size_t kTitleLongest = 48;  // characters; the answer is asked for 40
+// Characters; the answer is asked for 30. The title stands in the row under the input, beside the chips: in a
+// narrow window that is about 290 px, which is some 36 letters of the text font.
+constexpr size_t kTitleLongest = 36;
 
 // The model's answer as a title: its first line, no quotes, no closing full stop, no "Название:", shortened on
 // a word. Empty if nothing usable came.
