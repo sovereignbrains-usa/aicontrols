@@ -235,14 +235,20 @@ std::mutex g_titlesMutex;
 
 std::wstring CachedReadTitle(const fs::path& file, const WIN32_FILE_ATTRIBUTE_DATA& data) {
     static std::map<std::wstring, CachedTitle> cache;
-    const std::lock_guard lock(g_titlesMutex);
     const uint64_t modified = ToTicks(data.ftLastWriteTime);
     const uint64_t size = (static_cast<uint64_t>(data.nFileSizeHigh) << 32) | data.nFileSizeLow;
-    CachedTitle& entry = cache[file.wstring()];
-    if (entry.modified != modified || entry.size != size) {
-        entry = {modified, size, ReadTitle(file, size)};
+    {
+        const std::lock_guard lock(g_titlesMutex);
+        if (const auto it = cache.find(file.wstring());
+            it != cache.end() && it->second.modified == modified && it->second.size == size) {
+            return it->second.title;
+        }
     }
-    return entry.title;
+    // Read outside the lock: listing many chats must not hold the other threads (list_chats / the window).
+    std::wstring title = ReadTitle(file, size);
+    const std::lock_guard lock(g_titlesMutex);
+    cache[file.wstring()] = {modified, size, title};
+    return title;
 }
 
 std::wstring TextOf(const Json& content, bool images) {
@@ -534,27 +540,20 @@ std::vector<TranscriptEntry> ReadGrokSegment(const fs::path& file, bool firstOnl
     return entries;
 }
 
-// A Grok chat is named after its first message (Grok's own titles come in English); after a compaction that is in
-// its first segment. nullopt: nothing was sent, the session is a start of grok.exe and no chat. The lines before it
-// are Grok's rules, a few.
-std::optional<std::wstring> ReadGrokTitle(const fs::path& folder) {
-    const std::vector<fs::path> segments = GrokSegments(folder);
-    if (!segments.empty()) {
-        for (const TranscriptEntry& entry : ReadGrokSegment(segments.front(), true)) {
-            if (entry.kind == EntryKind::User) {
-                return PromptTitle(entry.text);
-            }
+// One prompt line from a Grok history chunk: the words of the first real user query, if any.
+std::optional<std::wstring> TitleFromGrokChunk(std::string_view text) {
+    std::optional<std::wstring> found;
+    ForEachLine(text, [&](std::string_view line) {
+        if (found) {
+            return;
         }
-    }
-    std::ifstream in(folder / kGrokHistory, std::ios::binary);
-    std::string line;
-    while (std::getline(in, line)) {
-        if (line.find("\"prompt_index\"") == std::string::npos && line.find("<user_query>") == std::string::npos) {
-            continue;
+        if (line.find("\"prompt_index\"") == std::string_view::npos &&
+            line.find("<user_query>") == std::string_view::npos) {
+            return;
         }
-        const Json entry = Json::parse(line, nullptr, false);
+        const Json entry = Json::parse(std::string(line), nullptr, false);
         if (!IsGrokPrompt(entry)) {
-            continue;
+            return;
         }
         const Json& content = JsonAt(entry, "content");
         std::wstring words = GrokPromptText(content);
@@ -564,7 +563,40 @@ std::optional<std::wstring> ReadGrokTitle(const fs::path& folder) {
         if (pictures) {
             words += (words.empty() ? L"" : L"\n\n") + std::wstring(L"📎 фото");
         }
-        return PromptTitle(words);
+        found = PromptTitle(words);
+    });
+    return found;
+}
+
+// A Grok chat is named after its first message (Grok's own titles come in English); after a compaction that is in
+// its first segment. nullopt: nothing was sent, the session is a start of grok.exe and no chat. The lines before it
+// are Grok's rules, a few. Only the head (and, if needed, the tail) of chat_history is read: listing every project
+// on the window's thread used to scan whole multi‑MB histories and freeze the empty «Чаты» tab (14.11.2026).
+std::optional<std::wstring> ReadGrokTitle(const fs::path& folder) {
+    const std::vector<fs::path> segments = GrokSegments(folder);
+    if (!segments.empty()) {
+        for (const TranscriptEntry& entry : ReadGrokSegment(segments.front(), true)) {
+            if (entry.kind == EntryKind::User) {
+                return PromptTitle(entry.text);
+            }
+        }
+    }
+    constexpr uint64_t kChunk = 512 * 1024;
+    std::error_code error;
+    const fs::path history = folder / kGrokHistory;
+    const uint64_t size = fs::file_size(history, error);
+    if (error || size == 0) {
+        return std::nullopt;
+    }
+    if (std::optional<std::wstring> fromHead = TitleFromGrokChunk(ReadRange(history, 0, std::min(size, kChunk)))) {
+        return fromHead;
+    }
+    if (size > kChunk) {
+        // A cut mid-line at the head, or a kept prompt after a long compaction_meta block: try the end too.
+        if (std::optional<std::wstring> fromTail =
+                TitleFromGrokChunk(ReadRange(history, size - kChunk, kChunk))) {
+            return fromTail;
+        }
     }
     if (!segments.empty()) {
         return std::wstring(L"Чат Grok");  // compacted, so a chat, though its words were not found
@@ -581,14 +613,19 @@ struct CachedGrokTitle {
 // data: the history's; a compaction rewrites it too.
 std::optional<std::wstring> GrokTitle(const fs::path& folder, const WIN32_FILE_ATTRIBUTE_DATA& data) {
     static std::map<std::wstring, CachedGrokTitle> cache;
-    const std::lock_guard lock(g_titlesMutex);
     const uint64_t modified = ToTicks(data.ftLastWriteTime);
     const uint64_t size = (static_cast<uint64_t>(data.nFileSizeHigh) << 32) | data.nFileSizeLow;
-    CachedGrokTitle& entry = cache[folder.wstring()];
-    if (entry.modified != modified || entry.size != size) {
-        entry = {modified, size, ReadGrokTitle(folder)};
+    {
+        const std::lock_guard lock(g_titlesMutex);
+        if (const auto it = cache.find(folder.wstring());
+            it != cache.end() && it->second.modified == modified && it->second.size == size) {
+            return it->second.title;
+        }
     }
-    return entry.title;
+    std::optional<std::wstring> title = ReadGrokTitle(folder);
+    const std::lock_guard lock(g_titlesMutex);
+    cache[folder.wstring()] = {modified, size, title};
+    return title;
 }
 
 // The title given in the sidebar, if one was.
@@ -613,9 +650,9 @@ void MarkGrokCompaction(std::vector<TranscriptEntry>& entries, std::wstring& rep
     entries.push_back({EntryKind::Compacted});
 }
 
-std::vector<TranscriptEntry> LoadGrokTranscript(const fs::path& folder) {
-    std::vector<TranscriptEntry> entries;
-    std::wstring repeated;  // the first prompt after a compaction, if it is the one before it
+// Append what one chat_history.jsonl chunk holds into `entries` (same rules as a full read).
+void AppendGrokHistoryLines(std::vector<TranscriptEntry>& entries, std::wstring& repeated, bool& compacted,
+                            std::string_view text) {
     const auto add = [&](TranscriptEntry said) {
         if (!repeated.empty() && said.kind == EntryKind::User) {
             // A segment marks pictures in the words ("📎 фото"); the history keeps them apart.
@@ -627,19 +664,8 @@ std::vector<TranscriptEntry> LoadGrokTranscript(const fs::path& folder) {
         }
         entries.push_back(std::move(said));
     };
-    for (const fs::path& segment : GrokSegments(folder)) {
-        if (!entries.empty()) {
-            MarkGrokCompaction(entries, repeated);
-        }
-        for (TranscriptEntry& said : ReadGrokSegment(segment, false)) {
-            add(std::move(said));
-        }
-    }
-    bool compacted = false;  // the history's own mark: its rules come back with synthetic_reason "compaction_meta"
-    std::ifstream in(folder / kGrokHistory, std::ios::binary);
-    std::string line;
-    while (std::getline(in, line)) {
-        const Json entry = Json::parse(line, nullptr, false);
+    ForEachLine(text, [&](std::string_view line) {
+        const Json entry = Json::parse(std::string(line), nullptr, false);
         const std::string type = JsonStr(entry, "type");
         if (JsonStr(entry, "synthetic_reason") == "compaction_meta") {
             if (!compacted) {
@@ -647,10 +673,10 @@ std::vector<TranscriptEntry> LoadGrokTranscript(const fs::path& folder) {
                 MarkGrokCompaction(entries, repeated);
             }
             // Its rules come in tags (<user_info>, <rules>); its summary is words.
-            const std::wstring text = TextOf(JsonAt(entry, "content"), false);
-            if (const size_t first = text.find_first_not_of(L" \t\r\n");
-                first != std::wstring::npos && text[first] != L'<') {
-                KeepSummary(entries, text);
+            const std::wstring words = TextOf(JsonAt(entry, "content"), false);
+            if (const size_t first = words.find_first_not_of(L" \t\r\n");
+                first != std::wstring::npos && words[first] != L'<') {
+                KeepSummary(entries, words);
             }
         } else if (type == "user" && IsGrokPrompt(entry)) {
             const Json& content = JsonAt(entry, "content");
@@ -659,12 +685,12 @@ std::vector<TranscriptEntry> LoadGrokTranscript(const fs::path& folder) {
                 add(std::move(said));
             }
         } else if (type == "assistant") {
-            if (std::wstring text = ToWide(JsonStr(entry, "content")); !text.empty()) {
-                entries.push_back({EntryKind::Assistant, std::move(text)});
+            if (std::wstring body = ToWide(JsonStr(entry, "content")); !body.empty()) {
+                entries.push_back({EntryKind::Assistant, std::move(body)});
             }
             const Json& calls = JsonAt(entry, "tool_calls");
             if (!calls.is_array()) {
-                continue;
+                return;
             }
             for (const Json& call : calls) {
                 std::string name = JsonStr(call, "name");
@@ -710,7 +736,72 @@ std::vector<TranscriptEntry> LoadGrokTranscript(const fs::path& folder) {
                 entries.push_back(std::move(search));
             }
         }
+    });
+}
+
+// Opening a chat shows its last `limit` entries. A long chat_history was read whole on the window's thread
+// (same hang as Claude's before 0.1.117): when only the end is needed, the file is read from its tail in
+// growing pieces. Compaction segments still come first, as before.
+std::vector<TranscriptEntry> LoadGrokTranscript(const fs::path& folder, size_t limit, bool& truncated) {
+    constexpr uint64_t kFirstPiece = 2 << 20;
+    constexpr size_t kExtra = 20;
+    std::vector<TranscriptEntry> entries;
+    std::wstring repeated;  // the first prompt after a compaction, if it is the one before it
+    const auto add = [&](TranscriptEntry said) {
+        if (!repeated.empty() && said.kind == EntryKind::User) {
+            // A segment marks pictures in the words ("📎 фото"); the history keeps them apart.
+            const bool again = !said.text.empty() && repeated.starts_with(said.text);
+            repeated.clear();
+            if (again) {
+                return;
+            }
+        }
+        entries.push_back(std::move(said));
+    };
+    for (const fs::path& segment : GrokSegments(folder)) {
+        if (!entries.empty()) {
+            MarkGrokCompaction(entries, repeated);
+        }
+        for (TranscriptEntry& said : ReadGrokSegment(segment, false)) {
+            add(std::move(said));
+        }
     }
+    bool compacted = false;  // the history's own mark: its rules come back with synthetic_reason "compaction_meta"
+    std::error_code error;
+    const fs::path history = folder / kGrokHistory;
+    const uint64_t size = fs::file_size(history, error);
+    const bool wantAll = limit > SIZE_MAX / 2;
+    if (error || size == 0) {
+        KeepLatest(entries, limit, truncated);
+        return entries;
+    }
+    if (wantAll || size <= kFirstPiece) {
+        AppendGrokHistoryLines(entries, repeated, compacted, ReadRange(history, 0, size));
+        KeepLatest(entries, limit, truncated);
+        return entries;
+    }
+    // Segments already hold the older turns; the live file's tail is enough for the last `limit` when it is long.
+    const size_t beforeHistory = entries.size();
+    uint64_t piece = kFirstPiece;
+    for (;;) {
+        const uint64_t start = size > piece ? size - piece : 0;
+        std::string text = ReadRange(history, start, size - start);
+        std::string_view lines = text;
+        if (start > 0) {
+            const size_t cut = lines.find('\n');
+            lines = cut == std::string_view::npos ? std::string_view() : lines.substr(cut + 1);
+        }
+        entries.resize(beforeHistory);
+        repeated.clear();
+        compacted = false;
+        AppendGrokHistoryLines(entries, repeated, compacted, lines);
+        const size_t fromHistory = entries.size() - beforeHistory;
+        if (start == 0 || (fromHistory > kExtra && fromHistory - kExtra > limit)) {
+            break;
+        }
+        piece *= 4;
+    }
+    KeepLatest(entries, limit, truncated);
     return entries;
 }
 
@@ -1450,9 +1541,7 @@ std::vector<TranscriptEntry> LoadArchivedPart(const std::string& archiveId, cons
     const fs::path dir = ArchiveDir(archiveId) / L"parts" / ToWide(partId);
     std::error_code error;
     if (grok && fs::is_directory(dir / L"grok", error)) {
-        std::vector<TranscriptEntry> entries = LoadGrokTranscript(dir / L"grok");
-        KeepLatest(entries, limit, truncated);
-        return entries;
+        return LoadGrokTranscript(dir / L"grok", limit, truncated);
     }
     return LoadClaudeFile(dir / L"session.jsonl", limit, truncated);
 }
@@ -1731,12 +1820,11 @@ std::vector<TranscriptEntry> LoadTranscript(const std::wstring& workspace, const
     std::error_code error;
     const fs::path file = SessionFile(workspace, id);
     if (!fs::is_regular_file(file, error)) {
-        std::vector<TranscriptEntry> entries;
         if (const fs::path grok = GrokSessionDir(workspace, id); !grok.empty() && fs::is_directory(grok, error)) {
-            entries = LoadGrokTranscript(grok);
+            return LoadGrokTranscript(grok, limit, truncated);
         }
-        KeepLatest(entries, limit, truncated);
-        return entries;
+        truncated = false;
+        return {};
     }
     return LoadClaudeFile(file, limit, truncated);
 }

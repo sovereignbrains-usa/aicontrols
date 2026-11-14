@@ -113,6 +113,7 @@ constexpr UINT kMemorySaved = WM_APP + 14;  // MemorySave*: the memory committed
 constexpr UINT kGithubDone = WM_APP + 17;   // GithubDone*: the token checked, or the browser's sign-in ended
 constexpr UINT kBrowserTask = WM_APP + 18;  // std::function<void()>*: the browser tool's work for this thread
 constexpr UINT kChatTitled = WM_APP + 19;   // Haiku named a chat: the list reads its title again
+constexpr UINT kJournalImported = WM_APP + 20;  // ImportCrashReports finished on a worker thread
 
 struct GithubDone {
     bool check = false;     // the saved token asked of the API, not a sign-in
@@ -1927,9 +1928,15 @@ int ChatWindow::Run(int show) {
         Add(Kind::Error, L"Встроенные шрифты не загрузились — показываю системным.");
     }
     RefreshSessions();
-    if (!gallery_) {  // crashes Windows saw since the last start go into the journal; the bug lights for them
-        ImportCrashReports();
+    if (!gallery_) {
+        // WER folders can be huge: scanning them on this thread froze the window as «Не отвечает» right after
+        // the empty «Чаты» paint (14.11.2026). The bug's red dot updates when the worker finishes.
         journalUnseen_ = JournalUnseen();
+        const HWND hwnd = hwnd_;
+        std::thread([hwnd] {
+            ImportCrashReports();
+            PostMessageW(hwnd, kJournalImported, 0, 0);
+        }).detach();
     }
     if (gallery_) {  // samples only: no CLI, no network, nothing written
         FillGallery();
@@ -2217,6 +2224,10 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
             }
         }
         ListChanged();
+        return 0;
+    case kJournalImported:
+        journalUnseen_ = JournalUnseen();
+        Refresh();
         return 0;
     case WM_NCCALCSIZE:
         // No system caption: the header is the title bar. The side and bottom frames stay (they are the
