@@ -336,6 +336,29 @@ This session is being continued
            "a compacted grok chat: listed, named after its first message in the first segment");
     const auto lost = std::ranges::find(listed, std::string("g-4"), &aic::SessionInfo::id);
     Expect(lost != listed.end() && lost->title == L"дальше", "a compacted grok chat without segments: the prompt it kept");
+    // A multi‑MB history must not be scanned whole for the title (14.11.2026: listing froze the window).
+    fs::create_directories(grokA / L"g-huge", error);
+    {
+        std::ofstream huge(grokA / L"g-huge" / L"chat_history.jsonl", std::ios::binary);
+        huge << R"({"type":"user","content":[{"type":"text","text":"<user_query>\nогромный чат\n</user_query>"}],"prompt_index":0})"
+             << "\n";
+        const std::string pad(64 * 1024, 'x');
+        for (int i = 0; i < 40; ++i) {  // ~2.5 MB of noise after the prompt
+            huge << "{\"type\":\"assistant\",\"content\":\"" << pad << "\"}\n";
+        }
+        huge << R"({"type":"user","content":[{"type":"text","text":"<user_query>\nв хвосте\n</user_query>"}],"prompt_index":1})"
+             << "\n";
+        huge << R"({"type":"assistant","content":"ok"})" << "\n";
+    }
+    listed = aic::ListSessions(a);
+    const auto hugeChat = std::ranges::find(listed, std::string("g-huge"), &aic::SessionInfo::id);
+    Expect(hugeChat != listed.end() && hugeChat->title == L"огромный чат",
+           "a long grok history is titled from its head, not by reading the whole file");
+    truncated = false;
+    const std::vector<aic::TranscriptEntry> hugeTail = aic::LoadTranscript(a, "g-huge", 3, truncated);
+    Expect(truncated && hugeTail.size() == 3 && hugeTail.back().text == L"ok" &&
+               hugeTail[hugeTail.size() - 2].text == L"в хвосте",
+           "opening a long grok chat loads its tail, not every assistant pad");
     const std::vector<aic::TranscriptEntry> whole = aic::LoadTranscript(a, "g-3", 100, truncated);
     const std::vector<aic::EntryKind> kinds = {aic::EntryKind::User,      aic::EntryKind::Assistant, aic::EntryKind::User,
                                                aic::EntryKind::Compacted, aic::EntryKind::Assistant, aic::EntryKind::User,
