@@ -1975,7 +1975,7 @@ int ChatWindow::Run(int show) {
     CheckLinks();
     LoadRepos();
     CheckClaudeVersions();
-    StartClaude();  // warm up: the first answer does not wait for the CLI to start
+    bool opened = false;
     if (!settings_.reopen.empty()) {  // back from an update: the chat it was in
         const std::string id = std::exchange(settings_.reopen, std::string());
         SaveSettings(settings_);
@@ -1983,6 +1983,7 @@ int ChatWindow::Run(int show) {
             const auto found = std::ranges::find_if(project.sessions, [&](const SessionInfo& s) { return SameChat(s, id); });
             if (project.folder == workspace_ && found != project.sessions.end()) {
                 OpenChat(project.folder, *found);
+                opened = true;
                 break;
             }
         }
@@ -1997,8 +1998,14 @@ int ChatWindow::Run(int show) {
                 return FileTicks(s.modified);
             });
             OpenChat(project.folder, *latest);
+            opened = true;
             break;
         }
+    }
+    // Warm up only when nothing was opened: OpenChat already starts the CLI, and a warm-up here was
+    // Stop()'d first (Wait + join ~1.5 s on this thread) before starting again (14.11.2026).
+    if (!opened) {
+        StartClaude();
     }
     CheckAppUpdate();
     SetTimer(hwnd_, kUpdateTimer, kUpdateCheck, nullptr);
