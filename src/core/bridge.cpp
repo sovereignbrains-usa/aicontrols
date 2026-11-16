@@ -231,9 +231,9 @@ bool ListenerOwnedBy(uint16_t port, DWORD pid) {
     }
     const DWORD wantPort = static_cast<DWORD>(htons(port));
     const DWORD wantAddr = htonl(INADDR_LOOPBACK);
-    DWORD size = 0;
+    DWORD size = sizeof(MIB_TCPTABLE_OWNER_PID);  // the size /analyze wants for the sizing call; the call returns the real one
     if (GetExtendedTcpTable(nullptr, &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_LISTENER, 0) != ERROR_INSUFFICIENT_BUFFER ||
-        size == 0) {
+        size < sizeof(MIB_TCPTABLE_OWNER_PID)) {
         return false;
     }
     std::vector<unsigned char> buffer(size);

@@ -1107,10 +1107,11 @@ std::string Tools::SystemPrompt() {
 
 std::string Tools::GrokSystemPrompt() {
     return "You are running inside AIControls, a native Windows chat client, on the user's computer. "
-           "Your own tools are on: search_replace, write, and run_terminal_command (PowerShell 5.1, "
+           "Your own tools are on: write and run_terminal_command (PowerShell 5.1, "
            "non-interactive; a fresh shell each call, so use cwd or chain with &&). "
-           "Native read_file, grep, list_dir and web_search are off. "
-           "To read or list files, search_tool then use_tool for mcp__aic__read_file and mcp__aic__list_directory. "
+           "Native read_file, grep, list_dir, web_search and search_replace are off. "
+           "To read or list files, search_tool then use_tool for mcp__aic__read_file and mcp__aic__list_directory; "
+           "to change part of a file, the same way for mcp__aic__edit_file. "
            "A read inside this chat's folder runs at once. A path outside it asks. "
            "search_tool then use_tool is also how you reach browser, ask, screenshot, drive_search, "
            "drive_read, list_chats and read_chat, and run_command when the command needs a stored secret or `on` "

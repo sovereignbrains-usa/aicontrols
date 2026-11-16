@@ -38,6 +38,11 @@ std::string RandomToken() {
 // mode and ask_user_question. disallowedTools strips those even if the allowlist is not applied.
 // Native read_file, grep, list_dir and web_search run inside grok.exe before can_use_tool, so they are disallowed
 // too: file reads go through mcp__aic__read_file and mcp__aic__list_directory, and the web through web_fetch.
+// search_replace is disallowed with them. Without a Read tool in the toolset grok 1.0.77 refuses to build the agent
+// ("skip_read_before_edit=false requires a Read tool"): session/new answers a bare "Internal error" and every chat
+// on 0.1.120 failed at its first message (16.11.2026, journal; reproduced with grok agent stdio). It is not enough to
+// leave it out of the allowlist: the allowlist is not applied, only disallowedTools removes it. Edits go through
+// mcp__aic__edit_file, which stays inside the chat's project.
 // A helper (02.11.2026, his: "субагента себе сделай") is the only type spawn_subagent can name, from the plugin
 // written beside this profile. The hand has no shell and cannot start another agent.
 constexpr const char* kProfile =
@@ -45,7 +50,6 @@ constexpr const char* kProfile =
     "name: aic\n"
     "description: AIControls chat\n"
     "tools:\n"
-    "  - search_replace\n"
     "  - write\n"
     "  - run_terminal_command\n"
     "  - web_fetch\n"
@@ -69,6 +73,7 @@ constexpr const char* kProfile =
     "  - enter_plan_mode\n"
     "  - exit_plan_mode\n"
     "  - ask_user_question\n"
+    "  - search_replace\n"
     "  - read_file\n"
     "  - grep\n"
     "  - list_dir\n"
@@ -202,6 +207,22 @@ Json NativeReadInput(const Json& update) {
     return input;
 }
 
+// A JSON-RPC error's message with its data. grok answers a failed session/new with the bare message "Internal error"
+// and puts the reason in data ("session initialization failed: tool error: Requirements unsatisfied: ..."): on
+// 16.11.2026 the journal said only "Grok: Internal error" seven times and the cause was found by running grok by hand.
+std::string ErrorText(const Json& error) {
+    std::string text = JsonStr(error, "message");
+    const Json& data = JsonAt(error, "data");
+    std::string detail = data.is_string() ? data.get<std::string>()
+                         : data.is_null() ? std::string()
+                                          : data.dump(-1, ' ', false, Json::error_handler_t::replace);
+    if (detail.size() > 600) {
+        detail.resize(600);
+        detail += "...";
+    }
+    return detail.empty() || detail == text ? text : text + ": " + detail;
+}
+
 long long Number(const Json& object, const char* key) {
     const Json& value = JsonAt(object, key);
     return value.is_number() ? value.get<long long>() : 0;
@@ -299,7 +320,7 @@ void GrokProcess::Start(const ClaudeOptions& options, MessageHandler onMessage, 
                  Emit(Json{{"type", "result"},
                            {"subtype", "error_during_execution"},
                            {"is_error", true},
-                           {"result", "Grok: " + JsonStr(error, "message")}});
+                           {"result", "Grok: " + ErrorText(error)}});
                  return;
              }
              OpenSession(result);
@@ -830,7 +851,7 @@ void GrokProcess::OpenSession(const Json& initResult) {
                      Emit(Json{{"type", "result"},
                                {"subtype", "error_during_execution"},
                                {"is_error", true},
-                               {"result", "Grok: " + (error.is_null() ? std::string("no session") : JsonStr(error, "message"))}});
+                               {"result", "Grok: " + (error.is_null() ? std::string("no session") : ErrorText(error))}});
                      return;
                  }
                  opened(JsonStr(result, "sessionId"));
@@ -907,7 +928,7 @@ void GrokProcess::FinishTurn(const Json& result, const Json& error) {
     if (!error.is_null()) {
         out["subtype"] = "error_during_execution";
         out["is_error"] = true;
-        out["result"] = apiError.empty() ? JsonStr(error, "message") : "Grok: " + apiError;
+        out["result"] = apiError.empty() ? ErrorText(error) : "Grok: " + apiError;
     } else {
         // The last request of the turn is the chat's size now ("Auto" and the context ring read it).
         const Json& meta = JsonAt(result, "_meta");
