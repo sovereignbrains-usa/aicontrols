@@ -13,6 +13,13 @@ if not exist build\dist\aicontrols.exe (
   echo build\dist\aicontrols.exe is missing
   exit /b 1
 )
-"C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /Qp /DAppVersion=%~1 /DSourceDir="%CD%\build\dist" /DOutputDir="%CD%\build\installer" installer\aicontrols.iss || exit /b 1
+rem Per-user installs land in LocalAppData. Program Files remains the first guess.
+set "ISCC=%ProgramFiles(x86)%\Inno Setup 6\ISCC.exe"
+if not exist "%ISCC%" set "ISCC=%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe"
+if not exist "%ISCC%" (
+  echo Inno Setup 6 was not found
+  exit /b 1
+)
+"%ISCC%" /Qp /DAppVersion=%~1 /DSourceDir="%CD%\build\dist" /DOutputDir="%CD%\build\installer" installer\aicontrols.iss || exit /b 1
 echo.
 echo build\installer\AIControls-Setup-%~1.exe
