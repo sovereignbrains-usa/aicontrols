@@ -24,4 +24,7 @@ std::optional<AppUpdate> FindAppUpdate(const std::vector<std::wstring>& folders,
 // Where builds of AIControls land: %USERPROFILE%\projects\aicontrols\build\installer.
 std::vector<std::wstring> AppUpdateFolders();
 
+// True when Windows trusts the installer's Authenticode signature. An unsigned file is not trusted.
+bool InstallerSignatureValid(const std::wstring& path);
+
 }  // namespace aic

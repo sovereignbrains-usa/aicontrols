@@ -59,6 +59,7 @@
 #include "core/model_router.h"
 #include "core/pty.h"
 #include "core/secrets.h"
+#include "core/secret_guard.h"
 #include "core/store.h"
 #include "core/usage.h"
 #include "core/voice.h"
@@ -1292,6 +1293,7 @@ private:
     // The secrets view: names and masked values, delete, and a form to add or replace one.
     static LRESULT CALLBACK SecretEditProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam, UINT_PTR id,
                                            DWORD_PTR self);
+    static LRESULT CALLBACK RevealProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
     HWND CreateSecretField(bool password, const wchar_t* hint);
     void SetSecretsOpen(bool open);
     void PlaceSecretFields();
@@ -1299,6 +1301,8 @@ private:
     void EditSecret(const std::string& name);
     void CancelSecretEdit();
     void SetShowValue(bool show);
+    void SyncReveal();    // the popup that paints the revealed value, kept out of screenshots
+    void PaintReveal(HDC dc);
     void DeleteSecret(const std::string& name);
     void PaintSecrets(const Geometry& g);
     static D2D1_RECT_F SecretRowRect(const Geometry& g, size_t index);
@@ -1652,13 +1656,16 @@ private:
     bool searchFocus_ = false;  // typing goes to the sidebar's search (drawn here, no caret)
     bool secretsOpen_ = false;  // the sidebar shows the secrets instead of the chats
     std::string editingSecret_;  // the secret the form holds (its old name: renaming replaces it); empty: a new one
-    bool showValue_ = false;     // the value field shows its text instead of dots
-    HWND nameEdit_ = nullptr;   // the panel's two fields; hidden while it is closed
-    HWND valueEdit_ = nullptr;  // (a password field: the value never shows)
+    bool showValue_ = false;  // the eye is open: the letters are in the capture-excluded popup, the field stays dots
+    HWND nameEdit_ = nullptr;  // the panel's two fields; hidden while it is closed
+    HWND valueEdit_ = nullptr;  // password field: its own paint is always dots, a cross-thread read gets nothing
+    HWND reveal_ = nullptr;    // owned popup over the value field while the eye is open
+    bool revealExcluded_ = false;  // that popup accepted WDA_EXCLUDEFROMCAPTURE
+    bool ownerExcluded_ = false;   // the whole window was excluded, because the popup could not be
     wil::unique_hbrush fieldBrush_;
 
     wil::com_ptr<ID2D1Factory> d2d_;
-wil::com_ptr<ID2D1PathGeometry> githubMark_;  // the projects' mark, made when first drawn
+    wil::com_ptr<ID2D1PathGeometry> githubMark_;  // the projects' mark, made when first drawn
     wil::com_ptr<ID2D1PathGeometry> folderClosed_;  // a folder, filled, its tab one path with the body
     wil::com_ptr<ID2D1PathGeometry> folderBack_;    // an open folder: the back sheet, then the pocket in front
     wil::com_ptr<ID2D1PathGeometry> folderFront_;
@@ -2377,7 +2384,13 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         if (browserView_) {
             browserView_->ParentMoved();
         }
+        SyncReveal();  // the reveal popup is owned, not a child: a move of this window does not take it along
         return 0;
+    case WM_SHOWWINDOW: {
+        const LRESULT shown = DefWindowProcW(hwnd_, message, wParam, lParam);
+        SyncReveal();
+        return shown;
+    }
     case WM_SIZE:
         if (target_) {
             target_->Resize(D2D1::SizeU(LOWORD(lParam), HIWORD(lParam)));
@@ -3044,6 +3057,14 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         return 0;
     }
     case WM_DESTROY:
+        if (ownerExcluded_) {
+            ExcludeFromCapture(hwnd_, false);
+            ownerExcluded_ = false;
+        }
+        if (reveal_ != nullptr) {
+            DestroyWindow(reveal_);
+            reveal_ = nullptr;
+        }
         if (doomed_ && !doomed_->gone) {  // a chat deleted just before: for good, no "Вернуть" after a restart
             for (const SessionPart& part : doomed_->session.parts) {
                 DeleteSession(doomed_->folder, part.id);
@@ -3469,6 +3490,9 @@ void ChatWindow::OnCommand(WPARAM wParam, LPARAM lParam) {
     if (const auto from = reinterpret_cast<HWND>(lParam); from == nameEdit_ || from == valueEdit_) {
         if (HIWORD(wParam) == EN_CHANGE) {
             Refresh();  // the button says "add" or "update" by the name
+            if (from == valueEdit_) {
+                SyncReveal();  // typing with the eye open: the popup shows the new letters
+            }
         }
         return;
     }
@@ -5840,6 +5864,12 @@ void ChatWindow::PaintUsage(const Geometry& g) {
 LRESULT CALLBACK ChatWindow::SecretEditProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam, UINT_PTR,
                                             DWORD_PTR self) {
     auto* window = reinterpret_cast<ChatWindow*>(self);
+    if (hwnd == window->valueEdit_) {
+        LRESULT guarded = 0;
+        if (GuardSecretField(hwnd, message, wParam, lParam, guarded)) {
+            return guarded;
+        }
+    }
     if (message == WM_KEYDOWN && (wParam == VK_RETURN || wParam == VK_ESCAPE || wParam == VK_TAB)) {
         PostMessageW(window->hwnd_, kSecretKey, wParam, reinterpret_cast<LPARAM>(hwnd));
         return 0;
@@ -5847,7 +5877,14 @@ LRESULT CALLBACK ChatWindow::SecretEditProc(HWND hwnd, UINT message, WPARAM wPar
     if (message == WM_CHAR && (wParam == L'\r' || wParam == L'\t' || wParam == 0x1b)) {
         return 0;  // no beep for the keys handled above
     }
-    return DefSubclassProc(hwnd, message, wParam, lParam);
+    const LRESULT result = DefSubclassProc(hwnd, message, wParam, lParam);
+    // The caret and the scroll of the revealed text follow the field. Text changes also arrive as EN_CHANGE.
+    const bool follow = message == WM_KEYDOWN || message == WM_CHAR || message == WM_LBUTTONUP ||
+                        (message == WM_MOUSEMOVE && (wParam & MK_LBUTTON) != 0);
+    if (hwnd == window->valueEdit_ && window->showValue_ && follow) {
+        window->SyncReveal();
+    }
+    return result;
 }
 
 HWND ChatWindow::CreateSecretField(bool password, const wchar_t* hint) {
@@ -5856,6 +5893,10 @@ HWND ChatWindow::CreateSecretField(bool password, const wchar_t* hint) {
     THROW_LAST_ERROR_IF_NULL(field);
     SendMessageW(field, EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(hint));
     SendMessageW(field, EM_SETLIMITTEXT, 8192, 0);
+    if (password) {
+        // Always the dot. The eye never clears it: the letters are painted by the reveal popup, not by this field.
+        SendMessageW(field, EM_SETPASSWORDCHAR, 0x25CF, 0);
+    }
     SetWindowSubclass(field, &ChatWindow::SecretEditProc, kSubclassId, reinterpret_cast<DWORD_PTR>(this));
     return field;
 }
@@ -5894,6 +5935,7 @@ void ChatWindow::PlaceSecretFields() {
     }
     ShowWindow(nameEdit_, secretsOpen_ ? SW_SHOW : SW_HIDE);
     ShowWindow(valueEdit_, secretsOpen_ ? SW_SHOW : SW_HIDE);
+    SyncReveal();
 }
 
 void ChatWindow::SetSecretsOpen(bool open) {
@@ -6007,10 +6049,167 @@ void ChatWindow::CancelSecretEdit() {
 void ChatWindow::SetShowValue(bool show) {
     showValue_ = show;
     if (valueEdit_ != nullptr) {
-        SendMessageW(valueEdit_, EM_SETPASSWORDCHAR, show ? 0 : 0x25CF, 0);
+        // Never 0. Clearing the mask would paint the letters into this window, which a screenshot of it includes.
+        SendMessageW(valueEdit_, EM_SETPASSWORDCHAR, 0x25CF, 0);
         InvalidateRect(valueEdit_, nullptr, TRUE);
     }
+    SyncReveal();
     Refresh();
+}
+
+// The revealed letters live in an owned popup exactly over the value field, so the field itself keeps drawing
+// dots. The popup is excluded from screen capture. A print of it draws bands, not the letters. Clicks fall
+// through to the field (the caret and the keys stay there). The eye sits beside the field and stays reachable.
+void ChatWindow::SyncReveal() {
+    const bool want = showValue_ && secretsOpen_ && valueEdit_ != nullptr && hwnd_ != nullptr &&
+                      IsWindowVisible(hwnd_) && !IsIconic(hwnd_) && IsWindowVisible(valueEdit_) &&
+                      GetWindowTextLengthW(valueEdit_) > 0;
+    const auto hide = [&] {
+        if (reveal_ != nullptr) {
+            ShowWindow(reveal_, SW_HIDE);
+        }
+        if (ownerExcluded_) {
+            ExcludeFromCapture(hwnd_, false);
+            ownerExcluded_ = false;
+        }
+    };
+    if (!want) {
+        hide();
+        return;
+    }
+    if (reveal_ == nullptr) {
+        WNDCLASSEXW revealClass{};
+        revealClass.cbSize = sizeof(revealClass);
+        revealClass.lpfnWndProc = &ChatWindow::RevealProc;
+        revealClass.hInstance = instance_;
+        revealClass.hCursor = LoadCursorW(nullptr, IDC_IBEAM);
+        revealClass.lpszClassName = kSecretRevealClass;
+        RegisterClassExW(&revealClass);  // already registered: the call fails and the existing class stays
+        // No layered style and no transparent style: the letters have to be on the monitor, sharp. An empty
+        // title, so a screenshot that matches "AIControls" does not prefer this window.
+        reveal_ = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, kSecretRevealClass, L"", WS_POPUP, 0, 0, 0, 0,
+                                  hwnd_, nullptr, instance_, this);
+        if (reveal_ != nullptr && ExcludeFromCapture(reveal_, true)) {
+            revealExcluded_ = true;
+        }
+    }
+    if (reveal_ == nullptr) {
+        // No popup to exclude on its own. The whole window leaves captures until the eye closes, and the field
+        // stays dots, so the letters are still not painted into it.
+        if (!ownerExcluded_) {
+            ownerExcluded_ = ExcludeFromCapture(hwnd_, true);
+        }
+        return;
+    }
+    RECT rect{};
+    GetWindowRect(valueEdit_, &rect);
+    if (rect.right <= rect.left || rect.bottom <= rect.top) {
+        hide();
+        return;
+    }
+    SetWindowPos(reveal_, HWND_TOP, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top,
+                 SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOCOPYBITS);
+    if (!revealExcluded_ && !ownerExcluded_) {
+        ownerExcluded_ = ExcludeFromCapture(hwnd_, true);
+    }
+    InvalidateRect(reveal_, nullptr, FALSE);
+    UpdateWindow(reveal_);
+}
+
+void ChatWindow::PaintReveal(HDC dc) {
+    RECT client{};
+    GetClientRect(reveal_, &client);
+    if (fieldBrush_ != nullptr) {
+        FillRect(dc, &client, fieldBrush_.get());
+    }
+    if (valueEdit_ == nullptr || uiFont_ == nullptr) {
+        return;
+    }
+    std::wstring text = FieldText(valueEdit_);
+    if (text.empty()) {
+        return;
+    }
+    const HGDIOBJ old = SelectObject(dc, uiFont_.get());
+    SetTextColor(dc, ToColorRef(kPrimary));
+    SetBkMode(dc, TRANSPARENT);
+    RECT format = client;
+    SendMessageW(valueEdit_, EM_GETRECT, 0, reinterpret_cast<LPARAM>(&format));
+    DWORD start = 0;
+    DWORD end = 0;
+    SendMessageW(valueEdit_, EM_GETSEL, reinterpret_cast<WPARAM>(&start), reinterpret_cast<LPARAM>(&end));
+    const int caret = std::min(static_cast<int>(end), static_cast<int>(text.size()));
+    SIZE extent{};
+    GetTextExtentPoint32W(dc, text.c_str(), caret, &extent);
+    const int view = std::max(1L, format.right - format.left);
+    const int scroll = extent.cx > view - 4 ? extent.cx - (view - 4) : 0;
+    TEXTMETRICW metrics{};
+    GetTextMetricsW(dc, &metrics);
+    const int box = std::max(0L, format.bottom - format.top);
+    const int top = format.top + (box > metrics.tmHeight ? (box - metrics.tmHeight) / 2 : 0);
+    ExtTextOutW(dc, format.left - scroll, top, ETO_CLIPPED, &format, text.c_str(), static_cast<UINT>(text.size()),
+                nullptr);
+    if (GetFocus() == valueEdit_) {
+        const int x = format.left - scroll + extent.cx;
+        if (x >= format.left && x < format.right) {
+            RECT bar{x, top, x + std::max(1, GetSystemMetrics(SM_CXBORDER)), top + metrics.tmHeight};
+            const wil::unique_hbrush brush(CreateSolidBrush(ToColorRef(kPrimary)));
+            if (brush) {
+                FillRect(dc, &bar, brush.get());
+            }
+        }
+    }
+    SelectObject(dc, old);
+    SecureZeroMemory(text.data(), text.size() * sizeof(wchar_t));
+}
+
+LRESULT CALLBACK ChatWindow::RevealProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
+    if (message == WM_NCCREATE) {
+        const auto* created = reinterpret_cast<const CREATESTRUCTW*>(lParam);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(created->lpCreateParams));
+        return DefWindowProcW(hwnd, message, wParam, lParam);
+    }
+    auto* window = reinterpret_cast<ChatWindow*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    switch (message) {
+    case WM_MOUSEACTIVATE:
+        return MA_NOACTIVATE;
+    case WM_NCHITTEST:
+        return HTTRANSPARENT;  // the press lands on the field underneath: the caret and the keys stay there
+    case WM_ERASEBKGND:
+        if (window != nullptr && window->fieldBrush_ != nullptr) {
+            RECT client{};
+            GetClientRect(hwnd, &client);
+            FillRect(reinterpret_cast<HDC>(wParam), &client, window->fieldBrush_.get());
+        }
+        return 1;
+    case WM_PAINT: {
+        PAINTSTRUCT paint{};
+        const HDC dc = BeginPaint(hwnd, &paint);
+        if (window != nullptr) {
+            window->PaintReveal(dc);
+        }
+        EndPaint(hwnd, &paint);
+        return 0;
+    }
+    case WM_PRINT:
+    case WM_PRINTCLIENT:
+        // Not DefWindowProc: that would paint the letters. A print gets bands.
+        if (wParam != 0) {
+            RECT client{};
+            GetClientRect(hwnd, &client);
+            PaintSecretSmear(reinterpret_cast<HDC>(wParam), client);
+        }
+        return 0;
+    case WM_GETTEXT:
+        if (lParam != 0 && wParam != 0) {
+            reinterpret_cast<wchar_t*>(lParam)[0] = L'\0';
+        }
+        return 0;
+    case WM_GETTEXTLENGTH:
+    case WM_GETOBJECT:
+        return 0;  // the letters are not the window text, and no accessibility provider reads them off
+    default:
+        return DefWindowProcW(hwnd, message, wParam, lParam);
+    }
 }
 
 void ChatWindow::DeleteSecret(const std::string& name) {
@@ -6297,23 +6496,26 @@ void ChatWindow::StartShell(TermTab& tab) {
     GetEnvironmentVariableW(L"USERPROFILE", profile, MAX_PATH);
     std::wstring command = L"powershell.exe -NoLogo";
     std::vector<wchar_t> environment;
-    if (!tab.server.empty()) {  // just connect: a new host is not asked about, nothing is written to known_hosts
+    if (!tab.server.empty()) {  // a new host's key is remembered; a changed key is refused
         std::string host = tab.server;
         std::string port;
         if (const size_t colon = host.rfind(':'); colon != std::string::npos) {
             port = host.substr(colon + 1);
             host.resize(colon);
         }
-        command = L"ssh.exe -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL -o LogLevel=ERROR "
+        command = L"ssh.exe -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR "
                   L"-o ServerAliveInterval=15 -o NumberOfPasswordPrompts=1";
         if (!port.empty()) {
             command += L" -p " + ToWide(port);
         }
         command += L" " + ToWide(host);
         if (const auto password = secrets_.Get("ssh " + tab.server); password && !password->empty()) {  // goes to ssh through SSH_ASKPASS, never typed
-            environment = MakeEnvironmentBlock({{L"SSH_ASKPASS", OwnExe()},
-                                                {L"SSH_ASKPASS_REQUIRE", L"force"},
-                                                {L"AIC_ASKPASS", ToWide("ssh " + tab.server)}});
+            std::vector<std::pair<std::wstring, std::wstring>> env = {{L"SSH_ASKPASS", OwnExe()},
+                                                                      {L"SSH_ASKPASS_REQUIRE", L"force"}};
+            if (const std::wstring ticket = ArmAskPass("ssh " + tab.server); !ticket.empty()) {
+                env.emplace_back(L"AIC_ASKPASS", ticket);
+            }
+            environment = MakeEnvironmentBlock(env);
         }
     }
     try {
@@ -8152,11 +8354,11 @@ bool ChatWindow::AllowedUnasked(const std::string& tool, const Json& input) cons
         return true;
     }
     if (mode == "auto") {
-        return AutoAllows(tool, input);
+        return AutoAllows(tool, input, workspace_);
     }
     return mode == "edits" &&
            (tool == "write_file" || tool == "edit_file" || tool == "search_replace" || tool == "write") &&
-           JsonStr(input, "on").empty();
+           WriteStaysInside(input, workspace_);
 }
 
 void ChatWindow::ShowPermissionMenu() {
@@ -10625,6 +10827,8 @@ void ChatWindow::OnPreviewMessage(const std::wstring& message) {
             previewControls_ = true;
             hover_ = {};
             Refresh();
+        } else if ((GetAsyncKeyState(VK_LBUTTON) & 0x8001) == 0) {
+            return;  // a page can post these; only a real click is acted on
         } else if (command == "close") {
             for (size_t i = 0; i < tabs_.size(); ++i) {
                 if (tabs_[i].get() == tab) {
@@ -10650,6 +10854,9 @@ void ChatWindow::OnPreviewMessage(const std::wstring& message) {
     }
     if (JsonStr(pick, "selector").empty()) {
         return;  // not a pick: no empty "[mockup.html: ]" in the message
+    }
+    if ((GetAsyncKeyState(VK_CONTROL) & 0x8001) == 0) {
+        return;  // the page's script cannot invent a Ctrl+click
     }
     // "[mockup.html: div.card > button.edit «Изменить»] ": enough for the model to find it in the file.
     std::wstring reference = L"[" + std::filesystem::path(tab->preview).filename().wstring() + L": " +
@@ -10920,6 +11127,10 @@ void ChatWindow::StartUpdate() {
         updatePending_ = true;
         Flash(busy_ ? L"Обновлю, как только " + AgentName() + L" закончит ответ"
                     : std::wstring(L"Обновлю, как только закончатся ответы в фоне"), 4000);
+        return;
+    }
+    if (!InstallerSignatureValid(update_->installer)) {
+        Flash(L"Установщик без подписи, не запускаю: " + update_->installer, 5000);
         return;
     }
     updatePending_ = false;
@@ -14033,8 +14244,8 @@ void ChatWindow::OnClaude(const Json& message) {
     Refresh();
 }
 
-// The model wants to call a tool. Reading runs at once (a note in the feed); anything that changes
-// something waits on a card for the user's word, unless the permission mode lets it through.
+// The model wants to call a tool. Reading inside the project runs at once (a note in the feed); anything
+// outside it, and anything that changes something, waits on a card unless the permission mode lets it through.
 void ChatWindow::AskApproval(const std::string& requestId, const Json& request) {
     const std::string full = JsonStr(request, "tool_name");
     const std::string name = OwnToolName(full).empty() ? GrokToolName(full) : OwnToolName(full);
@@ -14052,7 +14263,7 @@ void ChatWindow::AskApproval(const std::string& requestId, const Json& request) 
                                                     "carry it out."}});
         return;
     }
-    if (!ToolNeedsApproval(name, input)) {
+    if (!ToolNeedsApproval(name, input, workspace_)) {
         Add(Kind::Notice, summary.title + L": " + summary.detail, true);
         runner_->agent->Respond(requestId, Json{{"behavior", "allow"}, {"updatedInput", input}});
         return;

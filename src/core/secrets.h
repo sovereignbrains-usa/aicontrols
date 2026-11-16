@@ -45,4 +45,10 @@ private:
     std::map<std::string, std::string> values_;  // guarded by mutex_
 };
 
+// A one-shot ticket so SSH_ASKPASS can name a secret without putting that name in the environment.
+// The ticket file holds the name only. Empty when the name is not an ssh secret or the ticket cannot be written.
+std::wstring ArmAskPass(const std::string& name);
+// Reads and deletes the ticket. Empty unless the token is 32 hex digits and the stored name starts with "ssh ".
+std::optional<std::string> ClaimAskPass(std::wstring_view token);
+
 }  // namespace aic

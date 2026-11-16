@@ -45,12 +45,16 @@ bool GrokClientTool(const std::string& name);
 bool GrokNativeRead(const std::string& name);
 // The tools that change nothing: reading and listing files, and this client's chats.
 bool ReadOnlyTool(const std::string& name);
-// Reading and listing run without asking; commands and writes wait for the user.
-// Anything aimed at a server (`on`) waits too.
-bool ToolNeedsApproval(const std::string& name, const Json& input = Json::object());
-// The "Auto" permission mode: file edits here, Grok's pictures and commands that look harmless go without asking;
-// deleting, installing, the network, secrets, the system, videos and anything aimed at a server still wait.
-bool AutoAllows(const std::string& name, const Json& input);
+// Reads and lists inside the chat's folder do not ask. A path outside that folder, another project's chats,
+// Google Drive, commands and writes wait. Anything aimed at a server (`on`) waits too. An empty workspace asks.
+bool ToolNeedsApproval(const std::string& name, const Json& input = Json::object(),
+                       std::wstring_view workspace = {});
+// The "Auto" permission mode: edits inside the chat's folder, Grok's pictures, and commands that look harmless
+// and stay in that folder go without asking. Deleting, installing, the network, secrets, the system, videos,
+// a path outside the folder and anything aimed at a server still wait.
+bool AutoAllows(const std::string& name, const Json& input, std::wstring_view workspace = {});
+// True when a write names at least one path and every one of them stays inside the chat's folder. `on` is not.
+bool WriteStaysInside(const Json& input, std::wstring_view workspace);
 ToolSummary SummarizeTool(const std::string& name, const Json& input);
 // The name of the secret that holds a server's password, "ssh user@host[:port]", for what the user typed as a
 // secret's name ("ssh root@1.2.3.4", or "root@1.2.3.4" alone); empty when it names no server. `on` with that
@@ -68,7 +72,8 @@ public:
     Json Definitions() const;  // the MCP tools/list payload; run_command names the stored secrets
     // What the model is told about this client, appended to the CLI's system prompt.
     static std::string SystemPrompt();
-    // The same for Grok. Its own file, search and shell tools are on; MCP is only for what those cannot do.
+    // The same for Grok. Native file reads and web search are off; those go through search_tool then use_tool,
+    // or through run_terminal_command. MCP is how reads, Drive and chats reach this client.
     static std::string GrokSystemPrompt();
     // Blocks until done; `cancel` stops a running command. Output is scrubbed of secret values.
     ToolResult Execute(const std::string& name, const Json& input, const std::atomic<bool>& cancel) const;
@@ -96,7 +101,7 @@ private:
     ToolResult Browser(const Json& input, const std::atomic<bool>& cancel) const;  // Edge with its own profile
     ToolResult ListChats(const Json& input) const;
     ToolResult ReadChat(const Json& input) const;
-    std::vector<std::wstring> Projects(const std::string& project) const;  // the given one, else all known
+    std::vector<std::wstring> Projects(const std::string& project) const;  // the given one, else this chat's folder
     std::wstring Resolve(const std::string& path) const;
 
     SecretStore& secrets_;

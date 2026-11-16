@@ -466,6 +466,21 @@ LRESULT CALLBACK BrowserView::EditProc(HWND hwnd, UINT message, WPARAM wParam, L
     return DefSubclassProc(hwnd, message, wParam, lParam);
 }
 
+void BrowserView::NoteUserFailure(const std::string& why, HRESULT code) {
+    std::string text = why;
+    if (FAILED(code)) {
+        text += std::format(" (0x{:08X})", static_cast<unsigned>(code));
+    }
+    {
+        std::lock_guard lock(mutex_);
+        userFailure_ = text;
+    }
+    JournalWrite("браузер", ToWide(text));
+    if (host_ != nullptr) {
+        InvalidateRect(host_, nullptr, FALSE);
+    }
+}
+
 void BrowserView::Create() {
     if (controller_ || creating_) {
         return;
@@ -485,39 +500,73 @@ void BrowserView::Create() {
         }
     }
     // AIC_BROWSER_PROFILE lets a gallery check use its own folder while the installed client holds the real one.
-    std::filesystem::path folder = std::filesystem::path(local) / L"AIControls" / L"browser-view";
+    // The tool's page is a second folder, so a page it opens never shares the person's cookies.
+    std::filesystem::path userFolder = std::filesystem::path(local) / L"AIControls" / L"browser-view";
+    std::filesystem::path toolFolder = std::filesystem::path(local) / L"AIControls" / L"browser-tool";
     wchar_t profileOverride[MAX_PATH]{};
     if (const DWORD over = GetEnvironmentVariableW(L"AIC_BROWSER_PROFILE", profileOverride, MAX_PATH);
         over > 0 && over < MAX_PATH) {
-        folder = profileOverride;
+        userFolder = profileOverride;
+        toolFolder = std::wstring(profileOverride) + L"-tool";
     }
-    std::error_code error;
-    std::filesystem::create_directories(folder, error);
-    if (error) {
+    std::error_code userError;
+    std::error_code toolError;
+    std::filesystem::create_directories(userFolder, userError);
+    std::filesystem::create_directories(toolFolder, toolError);
+    const bool userOk = !userError;
+    const bool toolOk = !toolError;
+    const std::wstring userData = userFolder.wstring();
+    const std::wstring toolData = toolFolder.wstring();
+    if (!userOk) {
+        NoteUserFailure("Не удалось создать папку браузера",
+                        HRESULT_FROM_WIN32(static_cast<unsigned long>(userError.value())));
+    }
+    if (!toolOk) {
         Fail("Не удалось создать папку браузера",
-             HRESULT_FROM_WIN32(static_cast<unsigned long>(error.value())));
+             HRESULT_FROM_WIN32(static_cast<unsigned long>(toolError.value())));
+        if (userOk) {
+            BeginEnvironment(userData, false);
+        }
         return;
     }
     {
         std::lock_guard lock(mutex_);
         failure_.clear();
+        if (userOk) {
+            userFailure_.clear();
+        }
     }
-    const std::wstring data = folder.wstring();
+    BeginEnvironment(toolData, true);
+    if (userOk) {
+        BeginEnvironment(userData, false);
+    }
+}
+
+void BrowserView::BeginEnvironment(const std::wstring& data, bool tool) {
     const HRESULT started = CreateCoreWebView2EnvironmentWithOptions(
         nullptr, data.c_str(), nullptr,
         Microsoft::WRL::Callback<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler>(
-            [this](HRESULT result, ICoreWebView2Environment* environment) -> HRESULT {
+            [this, tool](HRESULT result, ICoreWebView2Environment* environment) -> HRESULT {
                 if (shutdown_) {
                     return S_OK;
                 }
                 if (FAILED(result) || environment == nullptr) {
-                    Fail("Нужен WebView2 (Microsoft Edge): среда не создалась", FAILED(result) ? result : E_FAIL);
+                    const HRESULT code = FAILED(result) ? result : E_FAIL;
+                    if (tool) {
+                        Fail("Нужен WebView2 (Microsoft Edge): среда не создалась", code);
+                    } else {
+                        NoteUserFailure("Нужен WebView2 (Microsoft Edge): среда не создалась", code);
+                    }
                     return S_OK;
                 }
-                environment_ = environment;
-                for (size_t i = 0; i < extras_.size(); ++i) {  // a tab opened while this was still starting
-                    CreateExtra(i);
+                if (!tool) {
+                    environment_ = environment;
+                    for (size_t i = 0; i < extras_.size(); ++i) {  // a tab opened while this was still starting
+                        CreateExtra(i);
+                    }
+                    return S_OK;
                 }
+                toolEnvironment_ = environment;  // before the controller: its callback can run at once
                 const HRESULT creating = environment->CreateCoreWebView2Controller(
                     host_, Microsoft::WRL::Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
                                  [this](HRESULT created, ICoreWebView2Controller* controller) -> HRESULT {
@@ -546,7 +595,7 @@ void BrowserView::Create() {
                                      if (SUCCEEDED(view_->get_Settings(settings.put()))) {
                                          settings->put_IsStatusBarEnabled(FALSE);
                                      }
-                                     Arm(view_.get());
+                                     Arm(view_.get(), toolEnvironment_.get());
                                      WatchAddress(view_.get());
                                      EventRegistrationToken token{};
                                      if (SUCCEEDED(view_->GetDevToolsProtocolEventReceiver(L"Page.loadEventFired",
@@ -604,7 +653,11 @@ void BrowserView::Create() {
             })
             .Get());
     if (FAILED(started)) {
-        Fail("Нужен WebView2 (Microsoft Edge)", started);
+        if (tool) {
+            Fail("Нужен WebView2 (Microsoft Edge)", started);
+        } else {
+            NoteUserFailure("Нужен WebView2 (Microsoft Edge)", started);
+        }
     }
 }
 
@@ -831,8 +884,8 @@ BrowserView::Status BrowserView::State() {
             return {true, {}};
         }
         std::lock_guard lock(mutex_);
-        if (!environment_ && !failure_.empty()) {  // the tool's page never started: this one cannot either
-            return {false, failure_};
+        if (!environment_ && !userFailure_.empty()) {  // the person's folder failed; the tool's page is separate
+            return {false, userFailure_};
         }
         return {false, {}};
     }
@@ -1461,7 +1514,7 @@ void BrowserView::WatchAddress(ICoreWebView2* view) {
     WatchIcon(view);
 }
 
-void BrowserView::Arm(ICoreWebView2* view) {
+void BrowserView::Arm(ICoreWebView2* view, ICoreWebView2Environment* opener) {
     if (view == nullptr) {
         return;
     }
@@ -1480,16 +1533,16 @@ void BrowserView::Arm(ICoreWebView2* view) {
         &token);
     view->add_NewWindowRequested(
         Microsoft::WRL::Callback<ICoreWebView2NewWindowRequestedEventHandler>(
-            [this, view](ICoreWebView2*, ICoreWebView2NewWindowRequestedEventArgs* args) {
+            [this, view, opener = wil::com_ptr<ICoreWebView2Environment>(opener)](
+                ICoreWebView2*, ICoreWebView2NewWindowRequestedEventArgs* args) {
                 wil::unique_cotaskmem_string uri;
                 const bool allowed = SUCCEEDED(args->get_Uri(&uri)) && uri && MayNavigate(ToUtf8(uri.get()));
                 if (!allowed) {
                     args->put_Handled(TRUE);
-                } else if (environment_ && host_ != nullptr && !shutdown_) {
-                    // A real window tied to the page that opened it: a sign-in (Google, Kimi) answers
-                    // that page through window.opener and then closes itself. Navigating this very page
-                    // would throw the opener away and leave the sign-in blank.
-                    OpenPopup(args);
+                } else if (opener && host_ != nullptr && !shutdown_) {
+                    // A real window tied to the page that opened it, on that page's own profile: a sign-in
+                    // answers through window.opener. The tool's popup stays out of the person's cookies.
+                    OpenPopup(args, opener.get());
                 } else {
                     args->put_Handled(TRUE);
                     view->Navigate(uri.get());
@@ -1580,7 +1633,7 @@ void BrowserView::CreateExtra(size_t index) {
                        if (SUCCEEDED(arrived.view->get_Settings(settings.put()))) {
                            settings->put_IsStatusBarEnabled(FALSE);
                        }
-                       Arm(arrived.view.get());
+                       Arm(arrived.view.get(), environment_.get());
                        WatchAddress(arrived.view.get());
                        if (page_ == slot && !pending_.empty()) {
                            arrived.view->Navigate(pending_.c_str());
@@ -1667,20 +1720,25 @@ std::wstring BrowserView::TitleOf(ICoreWebView2* view) {
 
 // The page asked for a new window. It gets a page of its own (a slot after the person's tabs) that
 // the engine builds as that window, so that window.opener and postMessage keep working.
-void BrowserView::OpenPopup(ICoreWebView2NewWindowRequestedEventArgs* args) {
+void BrowserView::OpenPopup(ICoreWebView2NewWindowRequestedEventArgs* args, ICoreWebView2Environment* opener) {
+    if (opener == nullptr) {
+        args->put_Handled(TRUE);
+        return;
+    }
     wil::com_ptr<ICoreWebView2Deferral> deferral;
     if (FAILED(args->GetDeferral(deferral.put()))) {
         args->put_Handled(TRUE);
         return;
     }
     wil::com_ptr<ICoreWebView2NewWindowRequestedEventArgs> request(args);
+    wil::com_ptr<ICoreWebView2Environment> environment(opener);
     extras_.push_back({});
     const size_t index = extras_.size() - 1;
     const int slot = static_cast<int>(index) + 1;
     extras_[index].opening = true;
-    const HRESULT creating = environment_->CreateCoreWebView2Controller(
+    const HRESULT creating = environment->CreateCoreWebView2Controller(
         host_, Microsoft::WRL::Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
-                   [this, index, slot, deferral, request](HRESULT created, ICoreWebView2Controller* controller) -> HRESULT {
+                   [this, index, slot, deferral, request, environment](HRESULT created, ICoreWebView2Controller* controller) -> HRESULT {
                        auto giveUp = [&] {
                            request->put_Handled(TRUE);
                            deferral->Complete();
@@ -1716,7 +1774,7 @@ void BrowserView::OpenPopup(ICoreWebView2NewWindowRequestedEventArgs* args) {
                        if (SUCCEEDED(arrived.view->get_Settings(settings.put()))) {
                            settings->put_IsStatusBarEnabled(FALSE);
                        }
-                       Arm(arrived.view.get());
+                       Arm(arrived.view.get(), environment.get());
                        WatchAddress(arrived.view.get());
                        request->put_NewWindow(arrived.view.get());
                        request->put_Handled(TRUE);

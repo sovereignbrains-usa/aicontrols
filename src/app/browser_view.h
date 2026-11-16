@@ -24,9 +24,10 @@ class Bitmap;
 
 namespace aic {
 
-// The browser tool's page inside the client: a WebView2 of its own (profile %LOCALAPPDATA%\AIControls\browser-view)
-// in the left column, driven over the DevTools Protocol. The tool's calls come from worker threads; everything that
-// touches the WebView runs on the window's thread (a task posted as `message`, run by RunTask).
+// The browser tool's page inside the client: a WebView2 of its own (profile %LOCALAPPDATA%\AIControls\browser-tool)
+// in the left column, driven over the DevTools Protocol. The person's tabs stay on browser-view. The tool's calls
+// come from worker threads; everything that touches the WebView runs on the window's thread (a task posted as
+// `message`, run by RunTask).
 class BrowserView final : public BrowserPage {
 public:
     // `show` makes the column's browser tab appear and places the page (UI thread); `hide` removes the tab.
@@ -79,6 +80,8 @@ private:
     bool Post(std::function<void()> task);
     void Create();  // UI thread
     void Fail(const std::string& why, HRESULT code = S_OK);
+    void NoteUserFailure(const std::string& why, HRESULT code = S_OK);  // the person's tabs; does not fail the tool
+    void BeginEnvironment(const std::wstring& data, bool tool);
     void EnsureHost();   // the page's own window: the client's Direct2D present paints over child windows
     void ApplyPlace();
     void LayoutPage();
@@ -115,9 +118,9 @@ private:
     ICoreWebView2* ActiveView() const;
     ICoreWebView2Controller* ActiveController() const;
     void WatchAddress(ICoreWebView2* view);
-    void Arm(ICoreWebView2* view);
+    void Arm(ICoreWebView2* view, ICoreWebView2Environment* opener);
     void CreateExtra(size_t index);
-    void OpenPopup(ICoreWebView2NewWindowRequestedEventArgs* args);
+    void OpenPopup(ICoreWebView2NewWindowRequestedEventArgs* args, ICoreWebView2Environment* opener);
     void CloseRequested(ICoreWebView2* view);
     static LRESULT CALLBACK HostProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
     static LRESULT CALLBACK EditProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam, UINT_PTR id, DWORD_PTR self);
@@ -164,7 +167,8 @@ private:
     std::atomic<bool> shutdown_{false};
 
     // UI thread only.
-    wil::com_ptr<ICoreWebView2Environment> environment_;
+    wil::com_ptr<ICoreWebView2Environment> environment_;      // the person's tabs: browser-view
+    wil::com_ptr<ICoreWebView2Environment> toolEnvironment_;  // the tool's page: browser-tool
     wil::com_ptr<ICoreWebView2Controller> controller_;
     wil::com_ptr<ICoreWebView2> view_;
     wil::com_ptr<ICoreWebView2DevToolsProtocolEventReceiver> loadReceiver_;
@@ -185,7 +189,8 @@ private:
     std::condition_variable changed_;
     bool ready_ = false;           // guarded by mutex_
     bool fresh_ = false;           // just made: nothing set on it yet
-    std::string failure_;          // why it could not start
+    std::string failure_;          // why the tool's page could not start
+    std::string userFailure_;      // why the person's tabs could not start
     std::map<std::string, int> events_;
 };
 

@@ -1,9 +1,11 @@
 #include <windows.h>
 
 #include <shellapi.h>
+#include <tlhelp32.h>
 
 #include <algorithm>
 #include <cwctype>
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <sstream>
@@ -67,17 +69,58 @@ int RunSecretsCommand(const std::wstring& command, const std::wstring& argument)
     return 0;
 }
 
-// ssh's SSH_ASKPASS when a tool logs in to a server by password (RunSsh in core/tools.cpp): AIC_ASKPASS names
-// the secret, "ssh user@host", and its value goes to ssh's pipe. Only a password prompt is answered, and only
-// with a server's secret, so this is no way to read the others.
-int AskPass(const std::wstring& name, std::wstring prompt) {
+// The parent must be ssh.exe. A same-user process with another name gets nothing, and a failed lookup refuses.
+bool ParentIsSsh() {
+    const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    PROCESSENTRY32W entry{};
+    entry.dwSize = sizeof(entry);
+    DWORD parent = 0;
+    const DWORD self = GetCurrentProcessId();
+    if (Process32FirstW(snapshot, &entry)) {
+        do {
+            if (entry.th32ProcessID == self) {
+                parent = entry.th32ParentProcessID;
+                break;
+            }
+        } while (Process32NextW(snapshot, &entry));
+    }
+    CloseHandle(snapshot);
+    if (parent == 0) {
+        return false;
+    }
+    const HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, parent);
+    if (process == nullptr) {
+        return false;
+    }
+    wchar_t image[1024]{};
+    DWORD size = static_cast<DWORD>(std::size(image));
+    const BOOL named = QueryFullProcessImageNameW(process, 0, image, &size);
+    CloseHandle(process);
+    if (!named || size == 0) {
+        return false;
+    }
+    const wchar_t* slash = wcsrchr(image, L'\\');
+    const wchar_t* file = slash != nullptr ? slash + 1 : image;
+    return CompareStringOrdinal(file, -1, L"ssh.exe", -1, TRUE) == CSTR_EQUAL;
+}
+
+// ssh's SSH_ASKPASS. AIC_ASKPASS is a one-shot ticket, not the secret's name. Answered only when the parent
+// process is ssh.exe and the prompt asks for a password.
+int AskPass(const std::wstring& token, std::wstring prompt) {
     std::ranges::transform(prompt, prompt.begin(), [](wchar_t c) { return static_cast<wchar_t>(std::towlower(c)); });
-    if (!name.starts_with(L"ssh ") || prompt.find(L"password") == std::wstring::npos) {
+    if (prompt.find(L"password") == std::wstring::npos || !ParentIsSsh()) {
+        return 1;
+    }
+    const std::optional<std::string> name = aic::ClaimAskPass(token);
+    if (!name) {
         return 1;
     }
     aic::SecretStore store(aic::SecretStore::DefaultPath());
     store.Load();
-    std::optional<std::string> value = store.Get(aic::ToUtf8(name));
+    std::optional<std::string> value = store.Get(*name);
     if (!value) {
         return 1;
     }

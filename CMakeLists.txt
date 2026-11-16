@@ -43,6 +43,7 @@ add_library(aic_core STATIC
   src/core/model_router.cpp
   src/core/oauth.cpp
   src/core/pty.cpp
+  src/core/secret_guard.cpp
   src/core/secrets.cpp
   src/core/store.cpp
   src/core/title_writer.cpp
@@ -70,7 +71,7 @@ inline constexpr const char* kBuiltGithubClientSecret = \"@AIC_GITHUB_OAUTH_SECR
 " @ONLY)
 endif()
 target_include_directories(aic_core PRIVATE ${AIC_GENERATED})
-target_link_libraries(aic_core PUBLIC WIL::WIL nlohmann_json::nlohmann_json ws2_32 shell32 ole32 crypt32 wintrust windowscodecs winhttp bcrypt winmm)
+target_link_libraries(aic_core PUBLIC WIL::WIL nlohmann_json::nlohmann_json ws2_32 shell32 ole32 crypt32 wintrust windowscodecs winhttp bcrypt winmm iphlpapi)
 
 add_executable(aicontrols WIN32
   src/app/main.cpp

@@ -455,23 +455,25 @@ ToolResult Describe(const ProcessResult& run, int timeout, bool clixml) {
 }
 
 // Runs `script` on a server through the system ssh.exe, with no prompts: by key, or by the password stored
-// for it (target.secret), which ssh gets from this program through SSH_ASKPASS, so it never passes through
-// the chat or a command line. A new host's key is remembered, stdin is `input`. The script travels as base64
-// in the remote command line, so no quoting can break it and a command that reads its stdin cannot eat the
-// rest of the script.
+// for it (target.secret). ssh gets that password through SSH_ASKPASS. AIC_ASKPASS is a one-shot ticket, not
+// the secret's name. A new host's key is remembered. When scriptOnStdin is set, the script is ssh's stdin, so
+// a command's values never sit on ssh's command line. Otherwise the script travels as base64 in the remote
+// command and stdin is `input` (a file's bytes).
 ProcessResult RunSsh(const Target& target, const std::string& script, const std::string& input, int timeout,
-                     const std::atomic<bool>& cancel) {
+                     const std::atomic<bool>& cancel, bool scriptOnStdin = false) {
     const std::string remote =
-        "B=$(command -v bash || echo sh); $B -c \"$(printf %s " + Base64Bytes(script) + " | base64 -d)\"";
+        scriptOnStdin ? "B=$(command -v bash || echo sh); exec $B -s"
+                      : "B=$(command -v bash || echo sh); $B -c \"$(printf %s " + Base64Bytes(script) + " | base64 -d)\"";
     std::wstring line = L"ssh.exe -T -o ConnectTimeout=15 -o ServerAliveInterval=15 -o StrictHostKeyChecking=accept-new";
     std::vector<std::pair<std::wstring, std::wstring>> environment;
     if (target.secret.empty()) {
         line += L" -o BatchMode=yes";
     } else {  // keys first, then the password once: a wrong one must not use up the server's tries
         line += L" -o NumberOfPasswordPrompts=1";
-        environment = {{L"SSH_ASKPASS", OwnExe()},
-                       {L"SSH_ASKPASS_REQUIRE", L"force"},
-                       {L"AIC_ASKPASS", ToWide(target.secret)}};
+        environment = {{L"SSH_ASKPASS", OwnExe()}, {L"SSH_ASKPASS_REQUIRE", L"force"}};
+        if (const std::wstring ticket = ArmAskPass(target.secret); !ticket.empty()) {
+            environment.emplace_back(L"AIC_ASKPASS", ticket);
+        }
     }
     if (!target.port.empty()) {
         line += L" -p " + ToWide(target.port);
@@ -489,7 +491,8 @@ ProcessResult RunSsh(const Target& target, const std::string& script, const std:
         too.error = "The command is too long for ssh's command line; put it in a file with write_file and run that";
         return too;
     }
-    return RunProcess(std::move(line), MakeEnvironmentBlock(environment), L"", timeout, input, cancel);
+    return RunProcess(std::move(line), MakeEnvironmentBlock(environment), L"", timeout, scriptOnStdin ? script : input,
+                      cancel);
 }
 
 // What an edit_file call does to `text`; false with `error` when it cannot be done.
@@ -525,16 +528,54 @@ bool PlainName(std::string_view name) {
            name.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_") == std::string_view::npos;
 }
 
+// {{secret:NAME}} becomes $env:AIC_Sn (PowerShell) or $AIC_Sn (a remote shell). The value goes into `overrides`
+// and never into the script. The same name reuses its slot. An unknown name is listed and left in place.
+void BindSecretSlots(const SecretStore& secrets, bool powershell, std::string& command,
+                     std::vector<std::pair<std::wstring, std::wstring>>& overrides, std::vector<std::string>& missing) {
+    constexpr std::string_view open = "{{secret:";
+    std::vector<std::string> slots;
+    std::string out;
+    out.reserve(command.size());
+    size_t pos = 0;
+    while (pos < command.size()) {
+        const size_t start = command.find(open, pos);
+        const size_t end = start == std::string::npos ? start : command.find("}}", start + open.size());
+        if (end == std::string::npos) {
+            out.append(command, pos);
+            break;
+        }
+        out.append(command, pos, start - pos);
+        const std::string name = command.substr(start + open.size(), end - start - open.size());
+        const auto found = std::ranges::find(slots, name);
+        if (found != slots.end()) {
+            const size_t index = static_cast<size_t>(found - slots.begin());
+            out += powershell ? "$env:AIC_S" : "$AIC_S";
+            out += std::to_string(index);
+        } else if (const std::optional<std::string> value = secrets.Get(name)) {
+            const size_t index = slots.size();
+            slots.push_back(name);
+            overrides.emplace_back(ToWide("AIC_S" + std::to_string(index)), ToWide(*value));
+            out += powershell ? "$env:AIC_S" : "$AIC_S";
+            out += std::to_string(index);
+        } else {
+            missing.push_back(name);
+            out.append(command, start, end + 2 - start);
+        }
+        pos = end + 2;
+    }
+    command = std::move(out);
+}
+
 // The command, the secrets and the timeout of a run_command call; false with `error` when it cannot run.
+// `powershell` binds placeholders to $env:AIC_Sn; a remote shell binds them to $AIC_Sn.
 bool PrepareCommand(const SecretStore& secrets, const Json& input, std::string& command,
-                    std::vector<std::pair<std::wstring, std::wstring>>& overrides, int& timeout, ToolResult& error) {
-    const std::string raw = StringArg(input, "command");
-    if (raw.empty()) {
+                    std::vector<std::pair<std::wstring, std::wstring>>& overrides, int& timeout, bool powershell,
+                    ToolResult& error) {
+    command = StringArg(input, "command");
+    if (command.empty()) {
         error = Error("command is required");
         return false;
     }
-    std::vector<std::string> missing;
-    command = secrets.Substitute(raw, missing);
     std::vector<std::string> names;
     if (const Json& list = JsonAt(input, "env_secrets"); list.is_array()) {
         for (const Json& item : list) {
@@ -550,7 +591,9 @@ bool PrepareCommand(const SecretStore& secrets, const Json& input, std::string& 
             return false;
         }
     }
+    std::vector<std::string> missing;
     overrides = secrets.Environment(names, missing);
+    BindSecretSlots(secrets, powershell, command, overrides, missing);
     if (!missing.empty()) {
         std::string text = "Unknown secret(s):";
         for (const std::string& name : missing) {
@@ -564,6 +607,122 @@ bool PrepareCommand(const SecretStore& secrets, const Json& input, std::string& 
         timeout = std::clamp(value.get<int>(), 1, kMaxTimeout);
     }
     return true;
+}
+
+// \\?\ and \\?\UNC\ come off, slashes become backslashes, and a trailing separator stays only on a drive root.
+std::wstring StripExtended(std::wstring path) {
+    if (path.starts_with(L"\\\\?\\UNC\\")) {
+        path.replace(0, 8, L"\\\\");
+    } else if (path.starts_with(L"\\\\?\\")) {
+        path.erase(0, 4);
+    }
+    for (wchar_t& c : path) {
+        if (c == L'/') {
+            c = L'\\';
+        }
+    }
+    while (path.size() > 3 && (path.back() == L'\\' || path.back() == L'/')) {
+        path.pop_back();
+    }
+    return path;
+}
+
+// `root` contains `full`: the same path, or a longer one that continues with a separator. C:\work\proj does not
+// contain C:\work\proj2. A drive root (C:\) does contain C:\work.
+bool SamePrefix(std::wstring full, std::wstring root) {
+    full = StripExtended(std::move(full));
+    root = StripExtended(std::move(root));
+    if (root.empty() || full.size() < root.size()) {
+        return false;
+    }
+    if (CompareStringOrdinal(full.c_str(), static_cast<int>(root.size()), root.c_str(), static_cast<int>(root.size()),
+                             TRUE) != CSTR_EQUAL) {
+        return false;
+    }
+    if (full.size() == root.size() || root.back() == L'\\' || root.back() == L'/') {
+        return true;
+    }
+    const wchar_t next = full[root.size()];
+    return next == L'\\' || next == L'/';
+}
+
+// The path with an existing symlink in an ancestor followed. A file that is not there yet still resolves: walk
+// up to an ancestor that exists, canonicalise that, and put the missing tail back.
+std::wstring Canonical(const fs::path& input) {
+    std::vector<fs::path> tail;
+    fs::path cursor = input.lexically_normal();
+    std::error_code error;
+    while (!cursor.empty()) {
+        error.clear();
+        if (fs::exists(cursor, error) && !error) {
+            break;
+        }
+        const fs::path name = cursor.filename();
+        if (!name.empty() && name != L"." && name != L"..") {
+            tail.push_back(name);
+        }
+        const fs::path parent = cursor.parent_path();
+        if (parent.empty() || parent == cursor) {
+            break;
+        }
+        cursor = parent;
+    }
+    fs::path base = cursor;
+    error.clear();
+    if (!cursor.empty() && fs::exists(cursor, error) && !error) {
+        error.clear();
+        const fs::path canon = fs::weakly_canonical(cursor, error);
+        if (!error) {
+            base = canon;
+        }
+    }
+    for (auto it = tail.rbegin(); it != tail.rend(); ++it) {
+        base /= *it;
+    }
+    return base.lexically_normal().wstring();
+}
+
+// A path stays in the chat's folder. Empty inputs do not. A drive-relative path (C:foo) does not. `..` that
+// leaves the folder does not. A symlink that points out does not. A relative path is resolved against `workspace`.
+bool PathInsideWorkspace(std::wstring_view raw, std::wstring_view workspace) {
+    if (workspace.empty() || raw.empty()) {
+        return false;
+    }
+    const fs::path path{std::wstring(raw)};
+    if (path.has_root_name() && !path.is_absolute()) {
+        return false;
+    }
+    fs::path joined = path.is_absolute() ? path : fs::path(workspace) / path;
+    joined = joined.lexically_normal();
+    for (const fs::path& part : joined) {
+        if (part == L"..") {
+            return false;
+        }
+    }
+    return SamePrefix(Canonical(joined), Canonical(fs::path(workspace)));
+}
+
+// Every path the call names stays in the folder. An empty field is this folder. An empty workspace does not.
+bool ReadStaysInside(const Json& input, std::wstring_view workspace) {
+    if (workspace.empty()) {
+        return false;
+    }
+    for (const char* key : {"path", "file_path", "target_file", "directory", "target_directory"}) {
+        const std::string value = StringArg(input, key);
+        if (!value.empty() && !PathInsideWorkspace(ToWide(value), workspace)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// A command's cwd, when it names one, stays in the folder. No cwd means the folder itself.
+bool CommandStaysInside(const Json& input, std::wstring_view workspace) {
+    if (workspace.empty()) {
+        return false;
+    }
+    const std::string cwd = StringArg(input, "cwd");
+    return cwd.empty() || PathInsideWorkspace(ToWide(cwd), workspace);
 }
 
 }  // namespace
@@ -612,11 +771,24 @@ bool ReadOnlyTool(const std::string& name) {
            name == "list_chats" || name == "read_chat" || name == "drive_search" || name == "drive_read";
 }
 
-bool ToolNeedsApproval(const std::string& name, const Json& input) {
+bool ToolNeedsApproval(const std::string& name, const Json& input, std::wstring_view workspace) {
     if (!StringArg(input, "on").empty()) {  // a server is not ours to look around in unasked
         return true;
     }
-    return !ReadOnlyTool(name);
+    if (name == "drive_search" || name == "drive_read") {
+        return true;
+    }
+    if (name == "list_chats" || name == "read_chat") {
+        if (workspace.empty()) {
+            return true;
+        }
+        const std::string project = StringArg(input, "project");
+        return !project.empty() && !PathInsideWorkspace(ToWide(project), workspace);
+    }
+    if (name == "read_file" || name == "grep" || name == "list_directory" || name == "list_dir") {
+        return !ReadStaysInside(input, workspace);
+    }
+    return true;
 }
 
 namespace {
@@ -645,10 +817,14 @@ bool RiskyCommand(std::string command) {
         "iex", "invoke-expression", "ssh", "scp", "sftp", "reg", "sc", "net", "schtasks", "setx", "winget", "choco",
         "msiexec", "set-executionpolicy", "set-itemproperty", "new-itemproperty", "remove-itemproperty",
         "start-process", "runas", "cipher", "icacls", "takeown", "bcdedit", "sudo", "--force", "-force", "-recurse",
-        "/s", "/f"};
+        "/s", "/f", "python", "python3", "py", "node", "nodejs", "pwsh", "powershell", "certutil", "bitsadmin",
+        "copy-item", "mshta", "rundll32", "wscript", "cscript", "wsl", "bash", "invoke-command", "add-type",
+        "start-bitstransfer"};
     static constexpr std::array kPhrases = {"git push", "git reset", "git clean", "git rebase", "git checkout --",
                                             "git branch -d", "git stash drop", "npm publish", "npm install", "npm i ",
-                                            "pip install", "pip uninstall", "cargo install", "vcpkg install"};
+                                            "pip install", "pip uninstall", "cargo install", "vcpkg install", "cmd /c",
+                                            "cmd.exe", "secrets.bin", ".claude\\.credentials.json", ".grok\\auth.json",
+                                            "\\startup\\", ".claude/.credentials.json", ".grok/auth.json", "/startup/"};
     for (const char* word : kWords) {
         if (HasWord(command, word)) {
             return true;
@@ -659,25 +835,45 @@ bool RiskyCommand(std::string command) {
 
 }  // namespace
 
-bool AutoAllows(const std::string& name, const Json& input) {
+bool WriteStaysInside(const Json& input, std::wstring_view workspace) {
+    if (!StringArg(input, "on").empty() || workspace.empty()) {
+        return false;
+    }
+    bool named = false;
+    for (const char* key : {"path", "file_path", "target_file"}) {
+        const std::string value = StringArg(input, key);
+        if (value.empty()) {
+            continue;
+        }
+        named = true;
+        if (!PathInsideWorkspace(ToWide(value), workspace)) {
+            return false;
+        }
+    }
+    return named;
+}
+
+bool AutoAllows(const std::string& name, const Json& input, std::wstring_view workspace) {
     if (!StringArg(input, "on").empty()) {
         return false;
     }
-    if (name == "write_file" || name == "edit_file" || name == "search_replace" || name == "write" ||
-        name == "image_gen" || name == "image_edit") {
+    if (name == "image_gen" || name == "image_edit") {
         return true;
+    }
+    if (name == "write_file" || name == "edit_file" || name == "search_replace" || name == "write") {
+        return WriteStaysInside(input, workspace);
     }
     if (name == "run_terminal_command") {
         const std::string command = StringArg(input, "command");
-        return command.find("{{") == std::string::npos && !RiskyCommand(command);
+        return CommandStaysInside(input, workspace) && command.find("{{") == std::string::npos && !RiskyCommand(command);
     }
     if (name != "run_command") {
         return false;
     }
     const Json& secrets = JsonAt(input, "env_secrets");
     const std::string command = StringArg(input, "command");
-    return !(secrets.is_array() && !secrets.empty()) && command.find("{{secret:") == std::string::npos &&
-           !RiskyCommand(command);
+    return CommandStaysInside(input, workspace) && !(secrets.is_array() && !secrets.empty()) &&
+           command.find("{{secret:") == std::string::npos && !RiskyCommand(command);
 }
 
 namespace {
@@ -786,7 +982,7 @@ ToolSummary SummarizeHere(const std::string& name, const Json& input) {
         return {L"Снимок экрана", window.empty() ? L"весь экран" : L"окно «" + window + L"»"};
     }
     if (name == "list_chats") {
-        return {L"Список чатов", project.empty() ? L"все проекты" : project};
+        return {L"Список чатов", project.empty() ? L"этот проект" : project};
     }
     if (name == "drive_search") {
         return {L"Поиск на Google Диске", ToWide(StringArg(input, "text") + " " + StringArg(input, "q"))};
@@ -877,10 +1073,12 @@ std::string ShortMemoryIndex(const std::string& index) {
 std::string Tools::SystemPrompt() {
     return "You are running inside AIControls, a native Windows chat client, on the user's computer. Claude Code's "
            "own local tools are off: use only the mcp__aic__* tools run_command, read_file, list_directory, "
-           "write_file and edit_file, and list_chats and read_chat for this client's other chats (Claude's and "
-           "Grok's): when the user points to another chat, read it rather than guess. drive_search and drive_read "
-           "read the user's Google Drive: when they speak of a file there, search it rather than ask for a path. On this computer run_command is PowerShell 5.1 (non-interactive). Paths are "
-           "paths on this computer; relative ones resolve against the chat's working directory. Every run_command, "
+           "write_file and edit_file. list_chats and read_chat read this chat's project. Another project's folder "
+           "asks first; when the user points to a chat there, read it after they allow it. drive_search and drive_read "
+           "read the user's Google Drive and ask first: when they speak of a file there, search it rather than ask for a path. "
+           "On this computer run_command is PowerShell 5.1 (non-interactive). Paths are "
+           "paths on this computer; relative ones resolve against the chat's working directory. Reading and listing "
+           "inside that folder runs at once. A path outside it, Google Drive, another project's chats, every run_command, "
            "write_file and edit_file call, and anything aimed at a server, is shown to the user for approval, so "
            "keep commands focused and say briefly why you run them. "
            "Every tool accepts `on`: user@host[:port] makes it act on that server instead, through ssh by key, or "
@@ -909,15 +1107,16 @@ std::string Tools::SystemPrompt() {
 
 std::string Tools::GrokSystemPrompt() {
     return "You are running inside AIControls, a native Windows chat client, on the user's computer. "
-           "Your own tools are on. Use them directly: read_file, grep, list_dir, search_replace, write, "
-           "and run_terminal_command (PowerShell 5.1, non-interactive; a fresh shell each call, so use cwd or "
-           "chain with &&). Do not look those up with search_tool. "
-           "search_tool then use_tool is only for this client's tools you do not have: run_command when the "
-           "command needs a stored secret or `on` (a server), browser, ask, screenshot, drive_search, "
-           "drive_read, list_chats and read_chat. One search_tool is enough for a tool you already saw. "
-           "list_chats and read_chat are this client's other chats, Claude's and Grok's: when the user points "
-           "at one, read it rather than guess. drive_search and drive_read read the user's Google Drive: search "
-           "rather than ask for a path. "
+           "Your own tools are on: search_replace, write, and run_terminal_command (PowerShell 5.1, "
+           "non-interactive; a fresh shell each call, so use cwd or chain with &&). "
+           "Native read_file, grep, list_dir and web_search are off. "
+           "To read or list files, search_tool then use_tool for mcp__aic__read_file and mcp__aic__list_directory. "
+           "A read inside this chat's folder runs at once. A path outside it asks. "
+           "search_tool then use_tool is also how you reach browser, ask, screenshot, drive_search, "
+           "drive_read, list_chats and read_chat, and run_command when the command needs a stored secret or `on` "
+           "(a server). One search_tool is enough for a tool you already saw. "
+           "web_fetch asks before it opens a page. Drive asks. "
+           "list_chats and read_chat are this chat's project only. Another folder asks first. "
            "`on` is user@host[:port]. It acts on that server through ssh, by key or by the password stored as "
            "the secret `ssh user@host` (you never see it). Remote paths are the server's; its shell is bash or "
            "sh. Secrets go in env_secrets or as {{secret:NAME}}; their values are cut out of every output. "
@@ -930,8 +1129,8 @@ std::string Tools::GrokSystemPrompt() {
            "text, picture it, click or type. Each action asks first. "
            "ask hands a question to another model through its free API when that is cheaper; its answer is a "
            "guess, check it. "
-           "You may hand one self-contained task to a helper, type aicontrols:hand. It reads files itself, has "
-           "no shell, cannot spawn, and cannot message the user. Wait for it. "
+           "You may hand one self-contained task to a helper, type aicontrols:hand. It reaches files through "
+           "search_tool then use_tool, has no shell, cannot spawn, and cannot message the user. Wait for it. "
            "Reply in the language the user writes in.";
 }
 
@@ -957,7 +1156,8 @@ Json Tools::Definitions() const {
                    "key or by the server's stored password). Paths and commands are then the server's; its shell is "
                    "bash or sh, not PowerShell."}};
     const Json project{{"type", "string"},
-                       {"description", "A project's folder (default: this chat's project first, then the others)"}};
+                       {"description",
+                        "A project's folder. Empty means this chat's project; another folder asks first."}};
     return Json::array({
         Json{{"name", "run_command"},
              {"description",
@@ -1048,8 +1248,8 @@ Json Tools::Definitions() const {
                      Json::array({"provider"}))}},
         Json{{"name", "list_chats"},
              {"description",
-              "List this client's chats, Claude's and Grok's, newest first: id, who answers, last change, title. "
-              "Without project: every project the client knows, the newest 20 of each."},
+              "List this client's chats in this chat's project, Claude's and Grok's, newest first: id, who answers, "
+              "last change, title. Up to 200. Another folder asks first."},
              {"inputSchema", Schema({{"project", project}}, Json::array())}},
         Json{{"name", "read_chat"},
              {"description",
@@ -1119,7 +1319,7 @@ ToolResult Tools::Execute(const std::string& name, const Json& input, const std:
         result.text = secrets_.Redact(result.text);
         return result;
     } catch (const std::exception& e) {
-        return Error(std::string("Tool failed: ") + e.what());
+        return Error(secrets_.Redact(std::string("Tool failed: ") + e.what()));
     }
 }
 
@@ -1137,7 +1337,7 @@ ToolResult Tools::RunCommand(const Json& input, const std::atomic<bool>& cancel)
     std::vector<std::pair<std::wstring, std::wstring>> overrides;
     int timeout = 0;
     ToolResult error;
-    if (!PrepareCommand(secrets_, input, command, overrides, timeout, error)) {
+    if (!PrepareCommand(secrets_, input, command, overrides, timeout, true, error)) {
         return error;
     }
     const std::wstring dir = Resolve(StringArg(input, "cwd"));
@@ -1199,7 +1399,7 @@ ToolResult Tools::ExecuteOn(const std::string& on, const std::string& name, cons
         std::vector<std::pair<std::wstring, std::wstring>> overrides;
         int timeout = 0;
         ToolResult error;
-        if (!PrepareCommand(secrets_, input, command, overrides, timeout, error)) {
+        if (!PrepareCommand(secrets_, input, command, overrides, timeout, false, error)) {
             return error;
         }
         std::string script;
@@ -1215,7 +1415,7 @@ ToolResult Tools::ExecuteOn(const std::string& on, const std::string& name, cons
             script += "cd " + ShPath(dir) + " || exit 1\n";
         }
         script += command + "\n";
-        return Describe(RunSsh(*target, script, {}, timeout, cancel), timeout, false);
+        return Describe(RunSsh(*target, script, {}, timeout, cancel, true), timeout, false);
     }
     if (name == "read_file") {
         if (path.empty()) {
@@ -1304,26 +1504,13 @@ ToolResult Tools::ReadFile(const Json& input) const {
     return ReadWindow(bytes, input, "file");
 }
 
-// The projects this client knows: this chat's first, then the sidebar's, the general one last.
+// This chat's folder when no project is named. A named folder is that folder (approval already happened).
 std::vector<std::wstring> Tools::Projects(const std::string& project) const {
     if (!project.empty()) {
         return {Resolve(project)};
     }
-    std::vector<std::wstring> folders;
-    folders.push_back(Cwd());
-    for (std::wstring folder : LoadSettings().projects) {
-        folders.push_back(std::move(folder));
-    }
-    folders.push_back(DefaultWorkspace());
-    std::vector<std::wstring> unique;
-    for (std::wstring& folder : folders) {
-        if (!folder.empty() && std::ranges::none_of(unique, [&](const std::wstring& seen) {
-                return CompareStringOrdinal(seen.c_str(), -1, folder.c_str(), -1, TRUE) == CSTR_EQUAL;
-            })) {
-            unique.push_back(std::move(folder));
-        }
-    }
-    return unique;
+    const std::wstring cwd = Cwd();
+    return cwd.empty() ? std::vector<std::wstring>{} : std::vector<std::wstring>{cwd};
 }
 
 ToolResult Tools::Screenshot(const Json& input) const {
@@ -1359,7 +1546,7 @@ ToolResult Tools::Browser(const Json& input, const std::atomic<bool>& cancel) co
 
 ToolResult Tools::ListChats(const Json& input) const {
     const std::string project = StringArg(input, "project");
-    const size_t most = project.empty() ? 20 : 200;
+    const size_t most = 200;
     std::string out;
     const std::wstring cwd = Cwd();
     for (const std::wstring& folder : Projects(project)) {
@@ -1391,7 +1578,7 @@ ToolResult Tools::ReadChat(const Json& input) const {
             return ReadWindow(*markdown, input, "chat");
         }
     }
-    return Error("No chat " + id + (project.empty() ? " in any project" : " in " + project) +
+    return Error("No chat " + id + (project.empty() ? " in this project" : " in " + project) +
                  "; list_chats lists them");
 }
 

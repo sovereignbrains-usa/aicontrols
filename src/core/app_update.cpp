@@ -2,6 +2,9 @@
 
 #include <windows.h>
 
+#include <softpub.h>
+#include <wintrust.h>
+
 #include <filesystem>
 
 #include "core/claude_install.h"
@@ -65,6 +68,25 @@ std::vector<std::wstring> AppUpdateFolders() {
     wchar_t profile[MAX_PATH]{};
     GetEnvironmentVariableW(L"USERPROFILE", profile, MAX_PATH);
     return {(fs::path(profile) / L"projects" / L"aicontrols" / L"build" / L"installer").wstring()};
+}
+
+bool InstallerSignatureValid(const std::wstring& path) {
+    WINTRUST_FILE_INFO file{};
+    file.cbStruct = sizeof(file);
+    file.pcwszFilePath = path.c_str();
+    GUID action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+    WINTRUST_DATA data{};
+    data.cbStruct = sizeof(data);
+    data.dwUIChoice = WTD_UI_NONE;
+    data.fdwRevocationChecks = WTD_REVOKE_NONE;
+    data.dwUnionChoice = WTD_CHOICE_FILE;
+    data.pFile = &file;
+    data.dwStateAction = WTD_STATEACTION_VERIFY;
+    data.dwProvFlags = WTD_CACHE_ONLY_URL_RETRIEVAL;
+    const LONG status = WinVerifyTrust(nullptr, &action, &data);
+    data.dwStateAction = WTD_STATEACTION_CLOSE;
+    WinVerifyTrust(nullptr, &action, &data);
+    return status == ERROR_SUCCESS;
 }
 
 }  // namespace aic

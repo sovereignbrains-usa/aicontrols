@@ -2,9 +2,11 @@
 
 #include <windows.h>
 
+#include <bcrypt.h>
 #include <wincrypt.h>
 
 #include <algorithm>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -23,7 +25,145 @@ DATA_BLOB Blob(const std::string& bytes) {
     return DATA_BLOB{static_cast<DWORD>(bytes.size()), reinterpret_cast<BYTE*>(const_cast<char*>(bytes.data()))};
 }
 
+std::mutex gAskPass;
+
+std::filesystem::path AskPassDir() {
+    wchar_t buffer[MAX_PATH]{};
+    const DWORD length = GetEnvironmentVariableW(L"LOCALAPPDATA", buffer, MAX_PATH);
+    const std::filesystem::path root = length > 0 && length < MAX_PATH
+                                           ? std::filesystem::path(std::wstring(buffer, length))
+                                           : std::filesystem::temp_directory_path();
+    return root / L"AIControls" / L"askpass";
+}
+
+bool HexToken(std::wstring_view token) {
+    if (token.size() != 32) {
+        return false;
+    }
+    for (const wchar_t c : token) {
+        if (!((c >= L'0' && c <= L'9') || (c >= L'a' && c <= L'f'))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void SweepTickets(const std::filesystem::path& dir) {
+    const auto now = std::filesystem::file_time_type::clock::now();
+    std::vector<std::filesystem::path> stale;
+    std::error_code error;
+    for (std::filesystem::directory_iterator it(dir, error); !error && it != std::filesystem::directory_iterator();
+         it.increment(error)) {
+        std::error_code timeError;
+        const auto written = it->last_write_time(timeError);
+        if (timeError) {
+            continue;
+        }
+        const auto age = now - written;
+        if (age < decltype(age)::zero() || age <= std::chrono::minutes(2)) {
+            continue;
+        }
+        stale.push_back(it->path());
+    }
+    for (const std::filesystem::path& path : stale) {
+        std::error_code removeError;
+        std::filesystem::remove(path, removeError);
+    }
+}
+
+std::wstring NewToken() {
+    unsigned char bytes[16]{};
+    if (BCryptGenRandom(nullptr, bytes, sizeof(bytes), BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) {
+        return {};
+    }
+    static constexpr wchar_t kHex[] = L"0123456789abcdef";
+    std::wstring token(32, L'0');
+    for (int i = 0; i < 16; ++i) {
+        token[static_cast<size_t>(i) * 2] = kHex[bytes[i] >> 4];
+        token[static_cast<size_t>(i) * 2 + 1] = kHex[bytes[i] & 0x0F];
+    }
+    SecureZeroMemory(bytes, sizeof(bytes));
+    return token;
+}
+
 }  // namespace
+
+std::wstring ArmAskPass(const std::string& name) {
+    if (!name.starts_with("ssh ")) {
+        return {};
+    }
+    std::lock_guard lock(gAskPass);
+    const std::filesystem::path dir = AskPassDir();
+    std::error_code error;
+    std::filesystem::create_directories(dir, error);
+    if (error) {
+        return {};
+    }
+    SweepTickets(dir);
+    const std::wstring token = NewToken();
+    if (!HexToken(token)) {
+        return {};
+    }
+    const std::filesystem::path path = dir / token;
+    {
+        std::ofstream file(path, std::ios::binary | std::ios::trunc);
+        file << name;
+        if (!file) {
+            std::filesystem::remove(path, error);
+            return {};
+        }
+    }
+    return token;
+}
+
+std::optional<std::string> ClaimAskPass(std::wstring_view token) {
+    if (!HexToken(token)) {
+        return std::nullopt;
+    }
+    std::lock_guard lock(gAskPass);
+    const std::filesystem::path path = AskPassDir() / std::wstring(token);
+    const HANDLE opened = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr,
+                                      OPEN_EXISTING, FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+    if (opened == INVALID_HANDLE_VALUE) {
+        return std::nullopt;
+    }
+    struct CloseFile {
+        HANDLE handle;
+        ~CloseFile() {
+            if (handle != nullptr && handle != INVALID_HANDLE_VALUE) {
+                CloseHandle(handle);
+            }
+        }
+    } guard{opened};
+
+    FILETIME written{};
+    if (!GetFileTime(opened, nullptr, nullptr, &written)) {
+        return std::nullopt;
+    }
+    FILETIME now{};
+    GetSystemTimeAsFileTime(&now);
+    ULARGE_INTEGER writtenTicks{};
+    writtenTicks.LowPart = written.dwLowDateTime;
+    writtenTicks.HighPart = written.dwHighDateTime;
+    ULARGE_INTEGER nowTicks{};
+    nowTicks.LowPart = now.dwLowDateTime;
+    nowTicks.HighPart = now.dwHighDateTime;
+    constexpr ULONGLONG kTwoMinutes = 2ULL * 60 * 10000000ULL;
+    if (nowTicks.QuadPart >= writtenTicks.QuadPart && nowTicks.QuadPart - writtenTicks.QuadPart > kTwoMinutes) {
+        return std::nullopt;
+    }
+
+    char buffer[1024]{};
+    DWORD read = 0;
+    if (!ReadFile(opened, buffer, sizeof(buffer), &read, nullptr) || read == 0 || read >= sizeof(buffer)) {
+        return std::nullopt;
+    }
+    const std::string name(buffer, read);
+    if (!name.starts_with("ssh ")) {
+        return std::nullopt;
+    }
+    return name;
+}
 
 std::wstring SecretStore::DefaultPath() {
     wchar_t buffer[MAX_PATH]{};

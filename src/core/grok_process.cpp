@@ -36,6 +36,8 @@ std::string RandomToken() {
 // sends every built-in tool (measured 09.11.2026: 27 schemas, video and workflow the largest). The names are the
 // ones the model is shown. Left out: image_to_video, reference_to_video, workflow, the schedulers, monitor, plan
 // mode and ask_user_question. disallowedTools strips those even if the allowlist is not applied.
+// Native read_file, grep, list_dir and web_search run inside grok.exe before can_use_tool, so they are disallowed
+// too: file reads go through mcp__aic__read_file and mcp__aic__list_directory, and the web through web_fetch.
 // A helper (02.11.2026, his: "субагента себе сделай") is the only type spawn_subagent can name, from the plugin
 // written beside this profile. The hand has no shell and cannot start another agent.
 constexpr const char* kProfile =
@@ -43,13 +45,9 @@ constexpr const char* kProfile =
     "name: aic\n"
     "description: AIControls chat\n"
     "tools:\n"
-    "  - read_file\n"
-    "  - grep\n"
-    "  - list_dir\n"
     "  - search_replace\n"
     "  - write\n"
     "  - run_terminal_command\n"
-    "  - web_search\n"
     "  - web_fetch\n"
     "  - search_tool\n"
     "  - use_tool\n"
@@ -71,18 +69,19 @@ constexpr const char* kProfile =
     "  - enter_plan_mode\n"
     "  - exit_plan_mode\n"
     "  - ask_user_question\n"
+    "  - read_file\n"
+    "  - grep\n"
+    "  - list_dir\n"
+    "  - web_search\n"
     "---\n";
 
 constexpr const char* kHand =
     "---\n"
     "name: hand\n"
-    "description: Helper for this AIControls chat. It reads and searches files itself; commands and writes go through search_tool and use_tool.\n"
+    "description: Helper for this AIControls chat. Files, commands and writes go through search_tool and use_tool.\n"
     "tools:\n"
-    "  - read_file\n"
-    "  - grep\n"
     "  - search_tool\n"
     "  - use_tool\n"
-    "  - web_search\n"
     "  - web_fetch\n"
     "  - image_gen\n"
     "  - image_edit\n"
@@ -91,10 +90,14 @@ constexpr const char* kHand =
     "  - reference_to_video\n"
     "  - run_terminal_command\n"
     "  - spawn_subagent\n"
+    "  - read_file\n"
+    "  - grep\n"
+    "  - list_dir\n"
+    "  - web_search\n"
     "mcpInheritance: all\n"
     "---\n"
     "\n"
-    "You are a helper inside an AIControls chat. You may read files with read_file and search them with grep.\n"
+    "You are a helper inside an AIControls chat. To read or list files, search_tool then use_tool.\n"
     "Commands, writes and servers go through search_tool and use_tool only. Those calls wait for the user.\n"
     "Report a short result to the parent. Do not spawn agents.\n";
 

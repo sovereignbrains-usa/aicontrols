@@ -3,6 +3,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <iphlpapi.h>
 #include <winhttp.h>
 
 #include <algorithm>
@@ -223,9 +224,42 @@ bool Alive(const Tunnel& tunnel) {
     return tunnel.process && WaitForSingleObject(tunnel.process.get(), 0) == WAIT_TIMEOUT;
 }
 
-// ssh.exe -D for `server`, waited for until its SOCKS port answers: ssh opens its forwards only once logged in.
-// False when it exited or did not get there in time; nothing of it is left running then.
-bool StartTunnel(Tunnel& tunnel, const std::string& server) {
+// True only when 127.0.0.1:`port` is listening and that listener is `pid`. A table we cannot read is not ours.
+bool ListenerOwnedBy(uint16_t port, DWORD pid) {
+    if (port == 0 || pid == 0) {
+        return false;
+    }
+    const DWORD wantPort = static_cast<DWORD>(htons(port));
+    const DWORD wantAddr = htonl(INADDR_LOOPBACK);
+    DWORD size = 0;
+    if (GetExtendedTcpTable(nullptr, &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_LISTENER, 0) != ERROR_INSUFFICIENT_BUFFER ||
+        size == 0) {
+        return false;
+    }
+    std::vector<unsigned char> buffer(size);
+    DWORD code = GetExtendedTcpTable(buffer.data(), &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_LISTENER, 0);
+    if (code == ERROR_INSUFFICIENT_BUFFER) {
+        buffer.resize(size);
+        code = GetExtendedTcpTable(buffer.data(), &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_LISTENER, 0);
+    }
+    if (code != NO_ERROR || buffer.size() < sizeof(MIB_TCPTABLE_OWNER_PID)) {
+        return false;
+    }
+    const auto* table = reinterpret_cast<const MIB_TCPTABLE_OWNER_PID*>(buffer.data());
+    for (DWORD i = 0; i < table->dwNumEntries; ++i) {
+        const MIB_TCPROW_OWNER_PID& row = table->table[i];
+        if (row.dwOwningPid == pid && row.dwLocalAddr == wantAddr && row.dwLocalPort == wantPort) {
+            return true;
+        }
+    }
+    return false;
+}
+
+enum class TunnelStart { Up, Stolen, Failed };
+
+// One attempt. Stolen: something else answered on the port we just freed, so the caller may try another.
+// Failed: ssh exited or never logged in; do not try again (a password prompt must not be asked twice).
+TunnelStart StartTunnelOnce(Tunnel& tunnel, const std::string& server) {
     std::string host = server;
     std::string port;
     if (const size_t colon = server.rfind(':'); colon != std::string::npos) {
@@ -234,7 +268,7 @@ bool StartTunnel(Tunnel& tunnel, const std::string& server) {
     }
     const uint16_t socks = FreePort();
     if (socks == 0) {
-        return false;
+        return TunnelStart::Failed;
     }
     std::wstring line = L"ssh.exe -n -N -D 127.0.0.1:" + std::to_wstring(socks) +
                         L" -o ExitOnForwardFailure=yes -o ConnectTimeout=10 -o ServerAliveInterval=15"
@@ -243,12 +277,15 @@ bool StartTunnel(Tunnel& tunnel, const std::string& server) {
         line += L" -p " + ToWide(port);
     }
     line += L" " + ToWide(host);
-    std::vector<wchar_t> environment = MakeEnvironmentBlock({{L"SSH_ASKPASS", OwnExe()},
-                                                             {L"SSH_ASKPASS_REQUIRE", L"force"},
-                                                             {L"AIC_ASKPASS", ToWide("ssh " + server)}});
+    std::vector<std::pair<std::wstring, std::wstring>> env = {{L"SSH_ASKPASS", OwnExe()},
+                                                              {L"SSH_ASKPASS_REQUIRE", L"force"}};
+    if (const std::wstring ticket = ArmAskPass("ssh " + server); !ticket.empty()) {
+        env.emplace_back(L"AIC_ASKPASS", ticket);
+    }
+    std::vector<wchar_t> environment = MakeEnvironmentBlock(env);
     wil::unique_handle job(CreateJobObjectW(nullptr, nullptr));
     if (!job) {
-        return false;
+        return TunnelStart::Failed;
     }
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
     limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
@@ -259,20 +296,44 @@ bool StartTunnel(Tunnel& tunnel, const std::string& server) {
     if (!CreateProcessW(nullptr, line.data(), nullptr, nullptr, FALSE,
                         CREATE_SUSPENDED | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT, environment.data(), nullptr,
                         &startup, &info)) {
-        return false;
+        return TunnelStart::Failed;
     }
     wil::unique_handle process(info.hProcess);
     const wil::unique_handle thread(info.hThread);
+    const DWORD pid = info.dwProcessId;
     AssignProcessToJobObject(job.get(), process.get());
     ResumeThread(thread.get());
     for (const auto deadline = Clock::now() + 20s;
          Clock::now() < deadline && WaitForSingleObject(process.get(), 150) == WAIT_TIMEOUT;) {
         if (const SOCKET probe = Connect("127.0.0.1", socks, 200ms); probe != INVALID_SOCKET) {
             closesocket(probe);
+            if (!ListenerOwnedBy(socks, pid)) {
+                Sleep(50);  // the owner's row can lag the accept
+                if (!ListenerOwnedBy(socks, pid)) {
+                    TerminateProcess(process.get(), 1);
+                    return TunnelStart::Stolen;
+                }
+            }
             tunnel.job = std::move(job);
             tunnel.process = std::move(process);
             tunnel.port = socks;
+            return TunnelStart::Up;
+        }
+    }
+    return TunnelStart::Failed;
+}
+
+// ssh.exe -D for `server`, waited for until its SOCKS port answers and that listener is this ssh.
+// False when it exited, did not get there in time, or another process kept taking the port.
+bool StartTunnel(Tunnel& tunnel, const std::string& server) {
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        switch (StartTunnelOnce(tunnel, server)) {
+        case TunnelStart::Up:
             return true;
+        case TunnelStart::Failed:
+            return false;
+        case TunnelStart::Stolen:
+            break;
         }
     }
     return false;

@@ -1,5 +1,7 @@
 #include "core/attachment.h"
 
+#include "core/secret_guard.h"
+
 #include <wincrypt.h>
 
 #include <algorithm>
@@ -546,6 +548,11 @@ std::string CaptureScreenBase64(const std::wstring& window, std::wstring& error)
         }
         if (!ok) {
             ok = BitBlt(memory.get(), 0, 0, width, height, screen.get(), x, y, SRCCOPY | CAPTUREBLT) != FALSE;
+        }
+        if (ok) {
+            // While the bitmap is still selected: a revealed secret lives in its own window, and that window's
+            // rectangle is painted over here so the letters never reach the encoded picture.
+            ScrubSecretReveal(memory.get(), x, y, width, height);
         }
         SelectObject(memory.get(), old);
         if (!ok) {
