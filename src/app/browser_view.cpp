@@ -326,6 +326,26 @@ void BrowserView::NavigateBar() {
     Go(ResolveAddress(std::move(text)));
 }
 
+void BrowserView::Navigate(const std::wstring& url) {
+    Go(url);
+}
+
+void BrowserView::AllowReturn(const std::string& url) {
+    signInReturn_ = url;
+}
+
+// What a page may be sent to by itself: MayNavigate's addresses, and the one local address a sign-in waits at: that
+// exact listener (scheme, host, port and path), with a query or nothing after it.
+bool BrowserView::MayNavigateTo(const std::string& url) const {
+    if (MayNavigate(url)) {
+        return true;
+    }
+    if (signInReturn_.empty() || !url.starts_with(signInReturn_)) {
+        return false;
+    }
+    return url.size() == signInReturn_.size() || url[signInReturn_.size()] == '?' || url[signInReturn_.size()] == '#';
+}
+
 void BrowserView::Go(const std::wstring& url) {
     if (edit_ != nullptr && GetFocus() != edit_) {
         SetWindowTextW(edit_, url.c_str());
@@ -666,6 +686,10 @@ void BrowserView::Want(bool on) {
     if (on) {
         Post([this] { Create(); });
     }
+}
+
+void BrowserView::Start() {
+    Post([this] { Create(); });  // does nothing when it has started; `shown_` stays as it was, so no "Браузер" tab appears
 }
 
 void BrowserView::Place(const RECT& bounds, bool visible) {
@@ -1522,9 +1546,9 @@ void BrowserView::Arm(ICoreWebView2* view, ICoreWebView2Environment* opener) {
     // Nothing the page does on its own may land on this computer or the home network.
     view->add_NavigationStarting(
         Microsoft::WRL::Callback<ICoreWebView2NavigationStartingEventHandler>(
-            [](ICoreWebView2*, ICoreWebView2NavigationStartingEventArgs* args) {
+            [this](ICoreWebView2*, ICoreWebView2NavigationStartingEventArgs* args) {
                 wil::unique_cotaskmem_string uri;
-                if (FAILED(args->get_Uri(&uri)) || !uri || !MayNavigate(ToUtf8(uri.get()))) {
+                if (FAILED(args->get_Uri(&uri)) || !uri || !MayNavigateTo(ToUtf8(uri.get()))) {
                     args->put_Cancel(TRUE);
                 }
                 return S_OK;

@@ -11,6 +11,12 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 add_compile_options(/W4 /WX /permissive- /EHsc /utf-8)
 add_compile_definitions(UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 
+# __FILE__ (assert, wil) would carry the builder's folders into the exe, user name included. Cut the source root off.
+if(MSVC)
+  file(TO_NATIVE_PATH "${CMAKE_SOURCE_DIR}" AIC_SOURCE_NATIVE)
+  add_compile_options("/d1trimfile:${AIC_SOURCE_NATIVE}\\")
+endif()
+
 option(AIC_ENABLE_ANALYZE "Build with MSVC /analyze static analysis" OFF)
 if (AIC_ENABLE_ANALYZE)
   add_compile_options(/analyze /analyze:external-)

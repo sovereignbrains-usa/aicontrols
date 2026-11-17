@@ -212,7 +212,7 @@ std::string OAuthPage(std::string_view message, bool ok) {
 
 BrowserEnd BrowserSignIn(const std::string& authorize, const std::string& path, std::string_view service,
                          const std::function<std::string(const OAuthGrant&)>& exchange, const std::atomic<bool>& cancel,
-                         std::chrono::seconds wait, std::string& error) {
+                         std::chrono::seconds wait, std::string& error, const SignInOpener& open) {
     WSADATA data{};
     if (WSAStartup(MAKEWORD(2, 2), &data) != 0) {
         error = "WSAStartup failed";
@@ -244,7 +244,11 @@ BrowserEnd BrowserSignIn(const std::string& authorize, const std::string& path, 
                                       {"code_challenge", Sha256Url(grant.verifier)},
                                       {"code_challenge_method", "S256"},
                                       {"state", state}});
-    ShellExecuteW(nullptr, L"open", ToWide(url).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    if (open) {
+        open(url, grant.redirect);
+    } else {
+        ShellExecuteW(nullptr, L"open", ToWide(url).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    }
 
     const auto deadline = std::chrono::steady_clock::now() + wait;
     while (!cancel && std::chrono::steady_clock::now() < deadline) {

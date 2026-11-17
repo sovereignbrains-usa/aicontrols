@@ -66,7 +66,7 @@ GithubLogin WhoIsGithub(const std::string& token) {
     return who;
 }
 
-GithubSignIn SignInGithub(const GithubApp& app, const std::atomic<bool>& cancel) {
+GithubSignIn SignInGithub(const GithubApp& app, const std::atomic<bool>& cancel, const SignInOpener& open) {
     GithubSignIn result;
     if (app.clientId.empty() || app.clientSecret.empty()) {
         result.error = "this build has no GitHub app: set GITHUB_OAUTH_ID and GITHUB_OAUTH_SECRET in the secrets";
@@ -97,7 +97,7 @@ GithubSignIn SignInGithub(const GithubApp& app, const std::atomic<bool>& cancel)
                          true);
     };
     std::string error;
-    if (BrowserSignIn(authorize, "/callback", "GitHub", exchange, cancel, kGithubWait, error) != BrowserEnd::Answered) {
+    if (BrowserSignIn(authorize, "/callback", "GitHub", exchange, cancel, kGithubWait, error, open) != BrowserEnd::Answered) {
         result.error = error;
         result.cancelled = cancel;
     }

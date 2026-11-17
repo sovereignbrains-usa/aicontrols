@@ -46,12 +46,17 @@ enum class BrowserEnd {
     Broken,     // no port to listen on, no random numbers
 };
 
+// Where the sign-in page is shown, when the system's browser is not the place: `url` is the address to open and
+// `returnUrl` the one the site sends the person back to (http://127.0.0.1:<port><path>, no query). It runs on the
+// thread that waits, so it only hands the two over to whoever shows the page.
+using SignInOpener = std::function<void(const std::string& url, const std::string& returnUrl)>;
+
 // Opens the browser at `authorize` (its query so far, without redirect_uri, state and the PKCE challenge) and waits
 // up to `wait` for the redirect to http://127.0.0.1:<port><path>. With a code, `exchange` runs while the browser waits
 // and returns the page to show it (the token is had by then, so the page can say whose it is). Anything but Answered
-// sets `error`, in English, `service` naming the site.
+// sets `error`, in English, `service` naming the site. `open` empty: the system's browser opens the address.
 BrowserEnd BrowserSignIn(const std::string& authorize, const std::string& path, std::string_view service,
                          const std::function<std::string(const OAuthGrant&)>& exchange, const std::atomic<bool>& cancel,
-                         std::chrono::seconds wait, std::string& error);
+                         std::chrono::seconds wait, std::string& error, const SignInOpener& open = {});
 
 }  // namespace aic

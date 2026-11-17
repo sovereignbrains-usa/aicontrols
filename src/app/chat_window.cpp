@@ -114,11 +114,17 @@ constexpr UINT kMemorySaved = WM_APP + 14;  // MemorySave*: the memory committed
 constexpr UINT kGithubDone = WM_APP + 17;   // GithubDone*: the token checked, or the browser's sign-in ended
 constexpr UINT kBrowserTask = WM_APP + 18;  // std::function<void()>*: the browser tool's work for this thread
 constexpr UINT kChatTitled = WM_APP + 19;   // Haiku named a chat: the list reads its title again
+constexpr UINT kSignInOpen = WM_APP + 20;   // SignInOpen*: GitHub's sign-in page, for a tab of the client's own browser
 
 struct GithubDone {
     bool check = false;     // the saved token asked of the API, not a sign-in
     bool rejected = false;  // ... and turned down
     GithubSignIn result;
+};
+
+struct SignInOpen {
+    std::string url;        // the sign-in page
+    std::string returnUrl;  // where the site sends the person back: the client's own listener on 127.0.0.1
 };
 
 struct ReposResult {
@@ -1096,6 +1102,8 @@ private:
     void ConnectAll();
     void Connect(size_t row);
     void ConnectGithub();
+    void OpenSignInTab(const SignInOpen& page);  // GitHub's sign-in in a tab of the client's browser
+    void CloseSignInTab();                       // ... and away again when the sign-in is over
     void CancelConnect();
     void StepClaude();
     void FinishLink(size_t row, bool ok, std::wstring text);
@@ -1583,6 +1591,7 @@ private:
     std::thread githubThread_;       // the token's check, or the browser's sign-in
     bool githubBusy_ = false;        // ... runs
     std::atomic<bool> githubCancel_ = false;
+    int signInPage_ = 0;             // the browser page GitHub's sign-in shows in (0: none; the tool's own page is 0 too)
     bool claudeMissing_ = false;     // no claude.exe was found: the connect screen takes the empty chat
     bool setupBusy_ = false;         // the installer or the updater runs
     bool setupInstalling_ = false;   // ... and has the build already
@@ -2290,6 +2299,11 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
     case kGithubDone: {
         const std::unique_ptr<GithubDone> payload(reinterpret_cast<GithubDone*>(lParam));
         OnGithubDone(*payload);
+        return 0;
+    }
+    case kSignInOpen: {
+        const std::unique_ptr<SignInOpen> payload(reinterpret_cast<SignInOpen*>(lParam));
+        OpenSignInTab(*payload);
         return 0;
     }
     case kAuthUrl: {
@@ -7706,16 +7720,59 @@ void ChatWindow::ConnectGithub() {
     }
     githubBusy_ = true;
     githubCancel_ = false;
-    links_[kGithubLink].note = L"Жду вход в браузере";
+    links_[kGithubLink].note = L"Жду вход во вкладке браузера";
     const HWND hwnd = hwnd_;
     const std::atomic<bool>* cancel = &githubCancel_;
-    githubThread_ = std::thread([hwnd, app, cancel] {
+    // The sign-in page opens in a tab of the client's own browser, not in the system's: the window thread shows it.
+    const SignInOpener open = [hwnd](const std::string& url, const std::string& returnUrl) {
+        auto page = std::make_unique<SignInOpen>(SignInOpen{url, returnUrl});
+        if (PostMessageW(hwnd, kSignInOpen, 0, reinterpret_cast<LPARAM>(page.get()))) {
+            page.release();
+        }
+    };
+    githubThread_ = std::thread([hwnd, app, cancel, open] {
         auto done = std::make_unique<GithubDone>();
-        done->result = SignInGithub(app, *cancel);
+        done->result = SignInGithub(app, *cancel, open);
         if (PostMessageW(hwnd, kGithubDone, 0, reinterpret_cast<LPARAM>(done.get()))) {
             done.release();
         }
     });
+}
+
+// The sign-in page in a new tab of the client's browser (its own profile keeps the person signed in to GitHub). The
+// page may come back to the client's listener on 127.0.0.1, which the browser refuses otherwise.
+void ChatWindow::OpenSignInTab(const SignInOpen& page) {
+    if (!githubBusy_) {  // the sign-in is over already
+        return;
+    }
+    if (!browserView_) {
+        ShellExecuteW(hwnd_, L"open", ToWide(page.url).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        return;
+    }
+    CloseSignInTab();
+    browserView_->Start();  // the person's tabs need their profile; the tool's own tab stays away
+    const int slot = browserView_->AddPage();
+    signInPage_ = slot;
+    browserView_->AllowReturn(page.returnUrl);
+    AttachBrowserTab(slot, false);
+    browserView_->Navigate(ToWide(page.url));
+}
+
+// The sign-in is over (the token came, it was refused, cancelled or timed out): its tab goes, and so does the way back.
+void ChatWindow::CloseSignInTab() {
+    const int slot = std::exchange(signInPage_, 0);
+    if (browserView_) {
+        browserView_->AllowReturn({});
+    }
+    if (slot == 0) {
+        return;
+    }
+    for (const auto& tab : tabs_) {
+        if (tab->browser && tab->browserPage == slot) {  // still there: the person may have closed it already
+            ClosePopupTab(slot);
+            return;
+        }
+    }
 }
 
 // "Отмена": the row at work stops (its thread reports back), the rest of the chain is dropped.
@@ -7811,6 +7868,7 @@ void ChatWindow::OnGithubDone(const GithubDone& done) {
         Refresh();
         return;
     }
+    CloseSignInTab();
     if (result.token.empty()) {
         FinishLink(kGithubLink, false, ToWide(result.error));
         return;

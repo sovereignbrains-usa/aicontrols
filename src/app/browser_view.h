@@ -39,6 +39,8 @@ public:
     // UI thread: the user's button wants the page (starts it) or has put it away. The tool's own open and close
     // go through Ready and Close.
     void Want(bool on);
+    // UI thread: the pages start (the person's tabs wait for their profile), but the tool's own tab does not come up.
+    void Start();
     // UI thread: the window's own menu (its style) and its "another browser tab", for the bookmarks row.
     void SetHooks(std::function<int(HMENU, POINT)> menu, std::function<void()> newTab);
     void SetPopupHooks(std::function<void(int)> opened, std::function<void(int)> closed);
@@ -48,6 +50,11 @@ public:
     std::wstring PageTitle(int slot) const;
     // UI thread: the address field, so a person can type where to go. The tool does not call this.
     void FocusAddress();
+    // UI thread: the page on show goes to `url` (or will, once it exists). For the client's own sign-in tab.
+    void Navigate(const std::wstring& url);
+    // UI thread: the one local address a page may be sent to, while a sign-in waits for its answer: the client's
+    // own listener on 127.0.0.1 (`url` without a query). Everything else local stays refused. Empty: no exception.
+    void AllowReturn(const std::string& url);
     // UI thread: another page beside the tool's. 0 is the tool's page; the rest are the person's own tabs.
     // The number stays put after the page is closed, so a tab keeps pointing at it.
     int AddPage();
@@ -87,6 +94,7 @@ private:
     void LayoutPage();
     void NavigateBar();
     void Go(const std::wstring& url);  // the page on show goes there (or will, once it exists)
+    bool MayNavigateTo(const std::string& url) const;  // MayNavigate, and the sign-in's way back
     // The bookmarks row under the address, and the star at the address's right end.
     void LoadMarks();
     void LayoutBar();
@@ -182,6 +190,7 @@ private:
     std::vector<ExtraPage> extras_;
     int page_ = 0;             // which page the column is showing
     std::wstring pending_;     // typed before that page existed
+    std::string signInReturn_;  // the sign-in's way back to the client (AllowReturn); empty when none waits
     ULONG_PTR gdip_ = 0;
     bool creating_ = false;
 

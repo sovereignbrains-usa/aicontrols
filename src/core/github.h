@@ -5,6 +5,8 @@
 #include <utility>
 #include <vector>
 
+#include "core/oauth.h"
+
 namespace aic {
 
 struct GithubRepo {
@@ -35,14 +37,15 @@ GithubLogin WhoIsGithub(const std::string& token);
 
 // GitHub's sign-in in the user's browser (the web flow to 127.0.0.1, PKCE): a token for the repositories and
 // their workflows, and whose it is. Waits for the browser up to 3 minutes; `token` empty with `error` set when
-// it did not come (`cancelled` when `cancel` ended it).
+// it did not come (`cancelled` when `cancel` ended it). `open` shows the page where the caller wants it (the
+// client's own browser tab); empty, the system's browser does.
 struct GithubSignIn {
     std::string token;
     std::string login;
     std::string error;
     bool cancelled = false;
 };
-GithubSignIn SignInGithub(const GithubApp& app, const std::atomic<bool>& cancel);
+GithubSignIn SignInGithub(const GithubApp& app, const std::atomic<bool>& cancel, const SignInOpener& open = {});
 
 // The repositories the token can reach, the most recently pushed first (GitHub's REST API, up to 300).
 // On failure the list is empty and `error` says why.
