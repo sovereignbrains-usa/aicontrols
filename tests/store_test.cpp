@@ -618,6 +618,28 @@ This session is being continued
                    aic::AskModels::ParseModels(R"([{"name":"models/x"}])") == "models/x",
                "model ids listed from both shapes");
     }
+
+    // settings: a file of our own, so the user's settings.json is left alone.
+    {
+        const fs::path settings = temp / L"aic_store_test_settings.json";
+        fs::remove(settings, error);
+        aic::SetSettingsFile(settings.wstring());
+        const aic::Settings fresh = aic::LoadSettings();
+        Expect(fresh.notifyAway && !fresh.directTraffic, "missing settings: notifications on, traffic automatic");
+        aic::Settings saved = fresh;
+        saved.notifyAway = false;
+        saved.directTraffic = true;
+        saved.model = "grok-test";
+        aic::SaveSettings(saved);
+        const aic::Settings back = aic::LoadSettings();
+        Expect(!back.notifyAway && back.directTraffic && back.model == "grok-test",
+               "the two switches come back");
+        std::ofstream(settings, std::ios::binary | std::ios::trunc) << "{}\n";
+        const aic::Settings empty = aic::LoadSettings();
+        Expect(empty.notifyAway && !empty.directTraffic, "absent keys keep the defaults");
+        aic::SetSettingsFile({});
+        fs::remove(settings, error);
+    }
     if (failures == 0) {
         std::cout << "store: all passed\n";
     }

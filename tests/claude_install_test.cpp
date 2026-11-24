@@ -76,6 +76,9 @@ int main() {
     Expect(FileSha256((fs::temp_directory_path() / "aic-no-such-file").wstring()).empty(), "sha256 of a missing file");
     Expect(SignerOf(file.wstring()).empty(), "an unsigned file has no signer");
     fs::remove(file);
+    SetDirectTraffic(true);
+    Expect(PickProxy().empty(), "direct traffic skips the bridge and the local proxies");
+    SetDirectTraffic(false);
     char profile[MAX_PATH] = {};
     GetEnvironmentVariableA("USERPROFILE", profile, sizeof(profile));
     if (const fs::path grok = fs::path(profile) / ".grok" / "bin" / "grok.exe"; fs::exists(grok)) {

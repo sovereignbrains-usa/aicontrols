@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cwchar>
@@ -448,7 +449,16 @@ std::wstring OwnExe() {
     }
 }
 
+std::atomic<bool> g_directTraffic{false};
+
+void SetDirectTraffic(bool direct) {
+    g_directTraffic.store(direct, std::memory_order_relaxed);
+}
+
 std::wstring PickProxy() {
+    if (g_directTraffic.load(std::memory_order_relaxed)) {
+        return {};
+    }
     if (std::wstring bridge = BridgeUrl(); !bridge.empty()) {
         return bridge;
     }

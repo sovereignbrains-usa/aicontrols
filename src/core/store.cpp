@@ -714,7 +714,12 @@ std::vector<TranscriptEntry> LoadGrokTranscript(const fs::path& folder) {
     return entries;
 }
 
+std::wstring g_settingsFile;  // tests: their own; empty is the real file
+
 fs::path SettingsFile() {
+    if (!g_settingsFile.empty()) {
+        return g_settingsFile;
+    }
     return fs::path(KnownFolder(FOLDERID_RoamingAppData)) / L"AIControls" / L"settings.json";
 }
 
@@ -999,6 +1004,10 @@ void SetChatIndexFile(const std::wstring& file) {
     const std::lock_guard lock(g_chatsMutex);
     g_chatsFile = file;
     g_chats = {};
+}
+
+void SetSettingsFile(const std::wstring& file) {
+    g_settingsFile = file;
 }
 
 bool DeleteSession(const std::wstring& workspace, const std::string& id) {
@@ -1863,6 +1872,10 @@ Settings LoadSettings() {
     settings.connectors = JsonAt(data, "connectors").is_boolean() && JsonAt(data, "connectors").get<bool>();
     settings.grokFast = JsonAt(data, "grokFast").is_boolean() && JsonAt(data, "grokFast").get<bool>();
     settings.connectLater = JsonAt(data, "connectLater").is_boolean() && JsonAt(data, "connectLater").get<bool>();
+    const Json& notify = JsonAt(data, "notifyAway");
+    settings.notifyAway = !notify.is_boolean() || notify.get<bool>();
+    settings.directTraffic =
+        JsonAt(data, "directTraffic").is_boolean() && JsonAt(data, "directTraffic").get<bool>();
     const auto number = [&](const char* key, long long fallback) {
         const Json& value = JsonAt(data, key);
         return value.is_number() ? value.get<long long>() : fallback;
@@ -1959,6 +1972,8 @@ void SaveSettings(const Settings& settings) {
                 {"connectors", settings.connectors},
                 {"grokFast", settings.grokFast},
                 {"connectLater", settings.connectLater},
+                {"notifyAway", settings.notifyAway},
+                {"directTraffic", settings.directTraffic},
                 {"sessionPercent", settings.sessionPercent},
                 {"sessionResets", settings.sessionResets},
                 {"weekPercent", settings.weekPercent},

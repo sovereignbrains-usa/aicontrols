@@ -1868,6 +1868,7 @@ int ChatWindow::Run(int show) {
     SetSettingsReadOnly(gallery_);
     secrets_.Load();
     settings_ = LoadSettings();
+    SetDirectTraffic(settings_.directTraffic);
     // The model lists known before a process has answered: Claude's as last reported, Grok's as measured 27.10.2026
     // (grok.exe reports its own once a Grok chat has started).
     claudeModels_ = Json::parse(settings_.claudeModels, nullptr, false);
@@ -7338,6 +7339,11 @@ void ChatWindow::ShowAccountMenu() {
     AppendMenuW(menu.get(), MF_STRING | (setupBusy_ ? MF_GRAYED : 0), GrokUpdateAvailable() ? 8 : 9,
                 GrokUpdateAvailable() ? grokUpdate.c_str() : L"Проверить обновления Grok");
     AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu.get(), MF_STRING | (settings_.notifyAway ? MF_CHECKED : 0), 10,
+                L"Уведомления, когда окно не перед глазами");
+    AppendMenuW(menu.get(), MF_STRING | (settings_.directTraffic ? MF_CHECKED : 0), 11,
+                L"Трафик всегда напрямую");
+    AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu.get(), MF_STRING, 6, L"Подключения: Claude, Grok, GitHub…");
     AppendMenuW(menu.get(), MF_STRING, 2, L"Выйти из Claude");  // only Claude's: Grok and GitHub stay connected
     switch (Menu(menu.get(), screen, true)) {
@@ -7346,6 +7352,23 @@ void ChatWindow::ShowAccountMenu() {
         break;
     case 6:
         OpenConnect();
+        break;
+    case 10:
+        settings_.notifyAway = !settings_.notifyAway;
+        SaveSettings(settings_);
+        if (!settings_.notifyAway) {
+            FLASHWINFO stop{sizeof(stop), hwnd_, FLASHW_STOP, 0, 0};
+            FlashWindowEx(&stop);
+        }
+        Flash(settings_.notifyAway ? L"Уведомления включены" : L"Уведомления выключены", 3000);
+        break;
+    case 11:
+        settings_.directTraffic = !settings_.directTraffic;
+        SaveSettings(settings_);
+        SetDirectTraffic(settings_.directTraffic);
+        Flash(settings_.directTraffic ? L"Трафик напрямую. Уже открытый ход идёт как шёл."
+                                      : L"Трафик: мост, затем локальный прокси, иначе напрямую.",
+              5000);
         break;
     case 4:
         UpdateClaudeCli();
@@ -7998,8 +8021,10 @@ void ChatWindow::NextLink() {
     if (connectOpen_ && LinksDone()) {  // all in: on to the chat, and the taskbar says so if the browser is in front
         connectOpen_ = false;
         Flash(L"Всё подключено: Claude, Grok и GitHub", 5000);
-        FLASHWINFO flash{sizeof(flash), hwnd_, FLASHW_TRAY | FLASHW_TIMERNOFG, 0, 0};
-        FlashWindowEx(&flash);
+        if (settings_.notifyAway) {
+            FLASHWINFO flash{sizeof(flash), hwnd_, FLASHW_TRAY | FLASHW_TIMERNOFG, 0, 0};
+            FlashWindowEx(&flash);
+        }
     }
 }
 
@@ -11617,7 +11642,7 @@ std::wstring ChatWindow::TooltipText() {
         if (GrokUpdateAvailable()) {
             return L"Аккаунт · вышел Grok " + ToWide(grokLatest_);
         }
-        return L"Аккаунт, подключения, версии Claude и Grok, выход";
+        return L"Аккаунт, подключения, уведомления, трафик, версии Claude и Grok, выход";
     case Target::ConnectRow:  // a failure in full: the row has room for its start only
         return hover_.row < links_.size() && links_[hover_.row].state == LinkState::Failed ? links_[hover_.row].note
                                                                                             : std::wstring();
@@ -14028,7 +14053,7 @@ void ChatWindow::TakeDraft(const std::string& key) {
 }
 
 void ChatWindow::AnnounceAway(std::wstring_view heading, std::wstring_view body, const std::string& session) {
-    if (gallery_ || !WindowIsAway(hwnd_)) {
+    if (gallery_ || !settings_.notifyAway || !WindowIsAway(hwnd_)) {
         return;
     }
     ShowToast(heading, body, session);

@@ -96,6 +96,11 @@ struct Settings {
     bool grokFast = false;
     // "Позже" on the accounts' screen: it no longer opens by itself while the chosen agent can answer.
     bool connectLater = false;
+    // A Windows toast and a taskbar flash when a turn ends or a tool waits, and this window is not in front.
+    // An older file has no key: still on.
+    bool notifyAway = true;
+    // The CLI's HTTPS skips the bridge and the local proxies. A process already running keeps its path.
+    bool directTraffic = false;
     // What runs without a card: "" asks before anything that changes something, "edits" writes files on this
     // computer unasked (commands and servers still ask), "all" asks nothing.
     std::string permissions;
@@ -222,5 +227,7 @@ Settings LoadSettings();
 void SaveSettings(const Settings& settings);
 // A window that only shows samples (--gallery) must not write the settings of the real one.
 void SetSettingsReadOnly(bool readOnly);
+// Tests: a settings file of their own, not the user's. Empty: the real one again.
+void SetSettingsFile(const std::wstring& file);
 
 }  // namespace aic

@@ -110,9 +110,13 @@ SpawnedProcess SpawnPiped(const std::wstring& exe, std::wstring commandLine,
 std::wstring FindClaudeExe();
 // This very program: ssh asks it for a server's password (AskPass in main.cpp).
 std::wstring OwnExe();
-// The way out for the CLI's HTTPS: our bridge (core/bridge.h); if it cannot listen, the old client's
-// bridge (2092), else sing-box's mixed port (2080), else direct (empty).
+// The way out for the CLI's HTTPS. Direct when SetDirectTraffic is on. Otherwise our bridge
+// (core/bridge.h); if it cannot listen, the old client's bridge (2092), else sing-box's mixed port
+// (2080), else direct (empty).
 std::wstring PickProxy();
+// A checked "Трафик всегда напрямую" skips the bridge and the local proxies. A process already
+// running keeps the path it was started with.
+void SetDirectTraffic(bool direct);
 
 std::string ToUtf8(std::wstring_view text);
 std::wstring ToWide(std::string_view text);
