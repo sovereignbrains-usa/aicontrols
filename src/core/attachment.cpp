@@ -2,7 +2,14 @@
 
 #include "core/secret_guard.h"
 
+#include <propidl.h>
 #include <wincrypt.h>
+
+#include <mfapi.h>
+#include <mfidl.h>
+#include <mfreadwrite.h>
+
+#include <limits>
 
 #include <algorithm>
 #include <cstdint>
@@ -129,6 +136,28 @@ std::vector<uint8_t> Encode(IWICImagingFactory* wic, IWICBitmapSource* source, R
 
 // A decoded picture into an attachment: the original bytes when they already fit the API,
 // else scaled to 1568 px and re-encoded (PNG, or JPEG when PNG is still too big).
+// Scaled to 1568 px and re-encoded (PNG, or JPEG when PNG is still too big). A video frame always comes through
+// here: Media Foundation's RGB32 is not a file the API would take as-is.
+Attachment FromSource(IWICImagingFactory* wic, IWICBitmapSource* source, std::wstring name) {
+    Attachment attachment;
+    attachment.type = Attachment::Type::Image;
+    attachment.name = std::move(name);
+    const wil::com_ptr<IWICBitmapSource> fitted = Fit(wic, source, kImageSide);
+    std::vector<uint8_t> bytes =
+        Encode(wic, Convert(wic, fitted.get(), GUID_WICPixelFormat32bppBGRA).get(), GUID_ContainerFormatPng);
+    attachment.mediaType = "image/png";
+    if (bytes.size() > kImageBytes) {
+        bytes = Encode(wic, Convert(wic, fitted.get(), GUID_WICPixelFormat24bppBGR).get(), GUID_ContainerFormatJpeg);
+        attachment.mediaType = "image/jpeg";
+    }
+    attachment.base64 = Base64(bytes);
+
+    const wil::com_ptr<IWICBitmapSource> preview =
+        Convert(wic, Fit(wic, source, kThumbnailSide).get(), GUID_WICPixelFormat32bppPBGRA);
+    THROW_IF_FAILED(wic->CreateBitmapFromSource(preview.get(), WICBitmapCacheOnLoad, attachment.thumbnail.put()));
+    return attachment;
+}
+
 Attachment FromDecoder(IWICImagingFactory* wic, IWICBitmapDecoder* decoder, std::wstring name,
                        const std::vector<uint8_t>& original, const std::string& originalType) {
     wil::com_ptr<IWICBitmapFrameDecode> frame;
@@ -137,29 +166,18 @@ Attachment FromDecoder(IWICImagingFactory* wic, IWICBitmapDecoder* decoder, std:
     UINT height = 0;
     THROW_IF_FAILED(frame->GetSize(&width, &height));
 
-    Attachment attachment;
-    attachment.type = Attachment::Type::Image;
-    attachment.name = std::move(name);
     if (!originalType.empty() && original.size() <= kImageBytes && width <= kImageSide && height <= kImageSide) {
+        Attachment attachment;
+        attachment.type = Attachment::Type::Image;
+        attachment.name = std::move(name);
         attachment.mediaType = originalType;
         attachment.base64 = Base64(original);
-    } else {
-        const wil::com_ptr<IWICBitmapSource> fitted = Fit(wic, frame.get(), kImageSide);
-        std::vector<uint8_t> bytes =
-            Encode(wic, Convert(wic, fitted.get(), GUID_WICPixelFormat32bppBGRA).get(), GUID_ContainerFormatPng);
-        attachment.mediaType = "image/png";
-        if (bytes.size() > kImageBytes) {
-            bytes = Encode(wic, Convert(wic, fitted.get(), GUID_WICPixelFormat24bppBGR).get(),
-                           GUID_ContainerFormatJpeg);
-            attachment.mediaType = "image/jpeg";
-        }
-        attachment.base64 = Base64(bytes);
+        const wil::com_ptr<IWICBitmapSource> preview =
+            Convert(wic, Fit(wic, frame.get(), kThumbnailSide).get(), GUID_WICPixelFormat32bppPBGRA);
+        THROW_IF_FAILED(wic->CreateBitmapFromSource(preview.get(), WICBitmapCacheOnLoad, attachment.thumbnail.put()));
+        return attachment;
     }
-
-    const wil::com_ptr<IWICBitmapSource> preview =
-        Convert(wic, Fit(wic, frame.get(), kThumbnailSide).get(), GUID_WICPixelFormat32bppPBGRA);
-    THROW_IF_FAILED(wic->CreateBitmapFromSource(preview.get(), WICBitmapCacheOnLoad, attachment.thumbnail.put()));
-    return attachment;
+    return FromSource(wic, frame.get(), std::move(name));
 }
 
 std::string ImageType(const std::wstring& extension) {
@@ -206,6 +224,21 @@ std::vector<uint8_t> FromBase64(const std::string& text) {
     }
     bytes.resize(length);
     return bytes;
+}
+
+// 100-nanosecond units. Hours only when there is one: "0:12", "1:05", "1:02:03".
+std::wstring FrameClock(int64_t hundredNs) {
+    if (hundredNs < 0) {
+        hundredNs = 0;
+    }
+    const int64_t whole = hundredNs / 10'000'000;
+    const int seconds = static_cast<int>(whole % 60);
+    const int minutes = static_cast<int>((whole / 60) % 60);
+    const int hours = static_cast<int>(whole / 3600);
+    if (hours > 0) {
+        return std::format(L"{}:{:02}:{:02}", hours, minutes, seconds);
+    }
+    return std::format(L"{}:{:02}", minutes, seconds);
 }
 
 fs::path ImagesDir() {
@@ -263,6 +296,190 @@ std::optional<Attachment> LoadAttachment(IWICImagingFactory* wic, const std::wst
         error = name + L": не получилось прочитать";
         return std::nullopt;
     }
+}
+
+bool IsVideoAttachment(const std::wstring& path) {
+    const std::wstring extension = Lower(fs::path(path).extension().wstring());
+    return extension == L".mp4" || extension == L".webm" || extension == L".mov";
+}
+
+std::vector<int64_t> VideoFrameTicks(int64_t duration) {
+    constexpr int64_t kGap = 5'000'000;  // 0.5 s, in 100-nanosecond units
+    constexpr int64_t kMaxFrames = 8;
+    if (duration <= 0) {
+        return {0};
+    }
+    int64_t count = duration / kGap;
+    if (count < 1) {
+        count = 1;
+    } else if (count > kMaxFrames) {
+        count = kMaxFrames;
+    }
+    std::vector<int64_t> ticks;
+    ticks.reserve(static_cast<size_t>(count));
+    for (int64_t i = 0; i < count; ++i) {
+        ticks.push_back(duration * (2 * i + 1) / (2 * count));
+    }
+    return ticks;
+}
+
+// Up to eight frames, half a second apart, each in the middle of its slice. The picture is what the model sees;
+// `cue` says which moment of which file, because an image block carries no name. Audio is not read. A seek lands
+// on a keyframe, so two asks that return the same timestamp count once. RGB32 leaves the fourth byte unused
+// (often 0); copying it as BGRA with alpha 255 keeps the frame opaque.
+std::vector<Attachment> LoadVideoFrames(IWICImagingFactory* wic, const std::wstring& path, std::wstring& error) {
+    error.clear();
+    const std::wstring name = fs::path(path).filename().wstring();
+    auto fail = [&](const wchar_t* why) {
+        error = name + L": " + why;
+        return std::vector<Attachment>{};
+    };
+    if (wic == nullptr || FAILED(MFStartup(MF_VERSION))) {
+        return fail(L"файл не открылся");
+    }
+    const auto shutdown = wil::scope_exit([] { MFShutdown(); });
+
+    wil::com_ptr<IMFAttributes> attributes;
+    wil::com_ptr<IMFSourceReader> reader;
+    if (FAILED(MFCreateAttributes(attributes.put(), 1)) ||
+        FAILED(attributes->SetUINT32(MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, TRUE)) ||
+        FAILED(MFCreateSourceReaderFromURL(path.c_str(), attributes.get(), reader.put()))) {
+        return fail(L"файл не открылся");
+    }
+    reader->SetStreamSelection(static_cast<DWORD>(MF_SOURCE_READER_ALL_STREAMS), FALSE);
+    if (FAILED(reader->SetStreamSelection(static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM), TRUE))) {
+        return fail(L"в ролике нет видео");
+    }
+    wil::com_ptr<IMFMediaType> requested;
+    if (FAILED(MFCreateMediaType(requested.put())) || FAILED(requested->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video)) ||
+        FAILED(requested->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32)) ||
+        FAILED(reader->SetCurrentMediaType(static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM), nullptr,
+                                            requested.get()))) {
+        return fail(L"ролик не прочитался");
+    }
+
+    int64_t duration = 0;
+    PROPVARIANT attribute{};
+    PropVariantInit(&attribute);
+    if (SUCCEEDED(reader->GetPresentationAttribute(static_cast<DWORD>(MF_SOURCE_READER_MEDIASOURCE), MF_PD_DURATION,
+                                                   &attribute))) {
+        if (attribute.vt == VT_UI8 && attribute.uhVal.QuadPart < 0x8000000000000000ULL) {
+            duration = static_cast<int64_t>(attribute.uhVal.QuadPart);
+        } else if (attribute.vt == VT_I8) {
+            duration = attribute.hVal.QuadPart;
+        }
+    }
+    PropVariantClear(&attribute);
+
+    constexpr uint64_t kMaxPixels = (256ull * 1024 * 1024) / 4;  // decoded BGRA; an 8K frame still fits
+    std::vector<Attachment> frames;
+    std::optional<LONGLONG> seen;
+    for (const int64_t tick : VideoFrameTicks(duration)) {
+        try {
+            PROPVARIANT position{};
+            PropVariantInit(&position);
+            position.vt = VT_I8;
+            position.hVal.QuadPart = tick;
+            const HRESULT sought = reader->SetCurrentPosition(GUID_NULL, position);
+            PropVariantClear(&position);
+            if (FAILED(sought)) {
+                continue;
+            }
+
+            DWORD flags = 0;
+            LONGLONG time = 0;
+            wil::com_ptr<IMFSample> sample;
+            HRESULT read = reader->ReadSample(static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM), 0, nullptr,
+                                               &flags, &time, sample.put());
+            if (SUCCEEDED(read) && (flags & MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED) && !sample) {
+                flags = 0;
+                time = 0;
+                read = reader->ReadSample(static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM), 0, nullptr, &flags,
+                                          &time, sample.put());
+            }
+            if (FAILED(read) || !sample || (flags & MF_SOURCE_READERF_ERROR)) {
+                if (flags & MF_SOURCE_READERF_ERROR) {
+                    break;
+                }
+                continue;
+            }
+            if (seen && *seen == time) {
+                continue;
+            }
+            seen = time;
+
+            wil::com_ptr<IMFMediaType> mediaType;
+            UINT32 width = 0;
+            UINT32 height = 0;
+            if (FAILED(reader->GetCurrentMediaType(static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM),
+                                                   mediaType.put())) ||
+                FAILED(MFGetAttributeSize(mediaType.get(), MF_MT_FRAME_SIZE, &width, &height)) || width == 0 ||
+                height == 0 || static_cast<uint64_t>(width) * height > kMaxPixels) {
+                continue;
+            }
+
+            LONG stride = static_cast<LONG>(width) * 4;
+            UINT32 storedStride = 0;
+            if (SUCCEEDED(mediaType->GetUINT32(MF_MT_DEFAULT_STRIDE, &storedStride))) {
+                std::memcpy(&stride, &storedStride, sizeof(stride));
+            }
+            if (stride == 0) {
+                stride = static_cast<LONG>(width) * 4;
+            }
+            const size_t rowBytes = static_cast<size_t>(width) * 4;
+            const int64_t signedStride = stride;
+            const size_t absStride = static_cast<size_t>(signedStride < 0 ? -signedStride : signedStride);
+            if (absStride < rowBytes || absStride > std::numeric_limits<size_t>::max() / height) {
+                continue;
+            }
+
+            std::vector<uint8_t> bgra(rowBytes * height);
+            {
+                wil::com_ptr<IMFMediaBuffer> buffer;
+                if (FAILED(sample->ConvertToContiguousBuffer(buffer.put()))) {
+                    continue;
+                }
+                BYTE* data = nullptr;
+                DWORD available = 0;
+                if (FAILED(buffer->Lock(&data, nullptr, &available)) || data == nullptr) {
+                    continue;
+                }
+                const auto unlock = wil::scope_exit([&buffer] { buffer->Unlock(); });
+                if (static_cast<uint64_t>(absStride) * height > available) {
+                    continue;
+                }
+                for (UINT32 y = 0; y < height; ++y) {
+                    const size_t from = stride >= 0 ? static_cast<size_t>(y) : static_cast<size_t>(height - 1 - y);
+                    uint8_t* dst = bgra.data() + static_cast<size_t>(y) * rowBytes;
+                    std::memcpy(dst, data + from * absStride, rowBytes);
+                    for (UINT32 x = 0; x < width; ++x) {
+                        dst[x * 4 + 3] = 255;
+                    }
+                }
+            }
+
+            wil::com_ptr<IWICBitmap> bitmap;
+            if (bgra.size() > 0xFFFFFFFFULL ||
+                FAILED(wic->CreateBitmapFromMemory(width, height, GUID_WICPixelFormat32bppBGRA,
+                                                   static_cast<UINT>(rowBytes), static_cast<UINT>(bgra.size()), bgra.data(),
+                                                   bitmap.put()))) {
+                continue;
+            }
+            const std::wstring clock = FrameClock(time);
+            Attachment frame = FromSource(wic, bitmap.get(), name + L" · " + clock);
+            if (frame.base64.empty()) {
+                continue;
+            }
+            frame.cue = L"кадр " + clock + L" из «" + name + L"»";
+            frames.push_back(std::move(frame));
+        } catch (const std::exception&) {
+            continue;
+        }
+    }
+    if (frames.empty()) {
+        return fail(L"ни одного кадра");
+    }
+    return frames;
 }
 
 bool ClipboardHasImage() {

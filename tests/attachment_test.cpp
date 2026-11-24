@@ -284,6 +284,26 @@ int main() {
                "the preview reads it back with its size");
         Expect(!aic::LoadImagePreview(wic.get(), (scratch / L"missing.png").wstring(), 64, width, height) && width == 0,
                "a missing file gives no preview");
+
+        const std::vector<int64_t> unknown = aic::VideoFrameTicks(0);
+        Expect(unknown.size() == 1 && unknown[0] == 0, "an unknown duration is one frame at the start");
+        const std::vector<int64_t> brief = aic::VideoFrameTicks(4'000'000);
+        Expect(brief.size() == 1 && brief[0] == 2'000'000, "0.4 s is one frame in the middle");
+        const std::vector<int64_t> second = aic::VideoFrameTicks(10'000'000);
+        Expect(second.size() == 2 && second[0] == 2'500'000 && second[1] == 7'500'000, "1 s is frames at 1/4 and 3/4");
+        Expect(aic::VideoFrameTicks(30'000'000).size() == 6, "3 s is six frames");
+        Expect(aic::VideoFrameTicks(40'000'000).size() == 8, "4 s is eight frames");
+        const std::vector<int64_t> longClip = aic::VideoFrameTicks(100'000'000);
+        Expect(longClip.size() == 8 && longClip.front() > 0 && longClip.back() < 100'000'000,
+               "10 s stays at eight frames, inside the clip");
+        const std::vector<int64_t> negative = aic::VideoFrameTicks(-5);
+        Expect(negative.size() == 1 && negative[0] == 0, "a negative duration is the start");
+        std::wstring videoError;
+        Expect(aic::LoadVideoFrames(wic.get(), first, videoError).empty() && !videoError.empty(),
+               "a picture is not a video");
+        Expect(aic::IsVideoAttachment(L"C:\\clip.MP4") && aic::IsVideoAttachment(L"a.webm") &&
+                   aic::IsVideoAttachment(L"b.mov") && !aic::IsVideoAttachment(L"frame.png"),
+               "only mp4, webm and mov count as video");
     }
     fs::remove_all(scratch, error);
     SecretFieldGuard();

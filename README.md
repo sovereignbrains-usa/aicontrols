@@ -2,7 +2,7 @@ English · [Русский](README.ru.md)
 
 # AIControls
 
-[![release 0.1.125](https://img.shields.io/badge/release-0.1.125-4c92ff)](https://github.com/sovereignbrains/aicontrols/releases)
+[![release 0.1.126](https://img.shields.io/badge/release-0.1.126-4c92ff)](https://github.com/sovereignbrains/aicontrols/releases)
 [![MIT](https://img.shields.io/github/license/sovereignbrains/aicontrols)](LICENSE)
 [![build](https://github.com/sovereignbrains/aicontrols/actions/workflows/build.yml/badge.svg)](https://github.com/sovereignbrains/aicontrols/actions/workflows/build.yml)
 
@@ -13,7 +13,7 @@ C++23, Win32, Direct2D and DirectWrite. No Electron, one exe.
 > Not an official Anthropic or xAI product. “Claude” is a trademark of Anthropic.
 > The client starts the `claude.exe` and `grok.exe` you already installed and talks to them.
 
-Current build: **0.1.125**.
+Current build: **0.1.126**.
 
 ## What it does
 
@@ -21,6 +21,7 @@ Current build: **0.1.125**.
 - Both agents in one list. Switching the model continues the same conversation: the other side receives the thread.
 - Streamed replies, markdown: headings, lists, quotes, links, tables, code.
 - Attachments: files and pictures (`+`, `Ctrl+U`, `Ctrl+V`, drag and drop). Pictures are scaled down to 1568 px. Voice is `Ctrl+M`.
+- A video (mp4, webm, mov) is sent as several frames. Sound is not included.
 - You can send a message while a reply is still coming. `Esc` stops it.
 - Select text with the mouse, `Ctrl+C`. Model and effort, including Auto. A limit ring; the reset time is Moscow time.
 - Permissions are separate for Claude and for Grok. The buttons are «Спрашивать», «Файлы без вопросов», Auto, «План», «Без вопросов».

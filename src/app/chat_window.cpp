@@ -10220,7 +10220,7 @@ void ChatWindow::PickFiles() {
     dialog->SetOptions(options | FOS_ALLOWMULTISELECT | FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST);
     const std::array<COMDLG_FILTERSPEC, 2> filters{{
         {L"Фото и файлы",
-         L"*.png;*.jpg;*.jpeg;*.gif;*.webp;*.bmp;*.pdf;*.txt;*.md;*.json;*.log;*.csv;*.xml;*.yml;*.yaml;*.toml;"
+         L"*.png;*.jpg;*.jpeg;*.gif;*.webp;*.bmp;*.mp4;*.webm;*.mov;*.pdf;*.txt;*.md;*.json;*.log;*.csv;*.xml;*.yml;*.yaml;*.toml;"
          L"*.ini;*.cfg;*.conf;*.cpp;*.h;*.hpp;*.c;*.py;*.js;*.ts;*.go;*.rs;*.ps1;*.cmd;*.sh"},
         {L"Все файлы", L"*.*"},
     }};
@@ -10246,6 +10246,20 @@ void ChatWindow::PickFiles() {
 
 void ChatWindow::AttachFile(const std::wstring& path) {
     std::wstring error;
+    if (IsVideoAttachment(path)) {
+        std::vector<Attachment> frames = LoadVideoFrames(wic_.get(), path, error);
+        if (frames.empty()) {
+            Flash(error.empty() ? std::wstring(L"Ролик не прочитался") : error, 5000);
+            return;
+        }
+        const size_t count = frames.size();
+        for (Attachment& frame : frames) {
+            attachments_.push_back(std::move(frame));
+        }
+        Attached();
+        Flash(L"Ролик: " + Counted(count, L"кадр", L"кадра", L"кадров"), 3000);
+        return;
+    }
     if (std::optional<Attachment> attachment = LoadAttachment(wic_.get(), path, error)) {
         attachments_.push_back(std::move(*attachment));
         Attached();
@@ -14229,6 +14243,10 @@ void ChatWindow::Submit() {
     std::wstring shown;
     std::vector<FeedImage> images;  // shown as pictures above the bubble, not as lines in it
     for (const Attachment& attachment : attachments_) {
+        // A video frame's picture has no name. The line before it says which moment it is.
+        if (!attachment.cue.empty()) {
+            content.push_back(Json{{"type", "text"}, {"text", ToUtf8(attachment.cue)}});
+        }
         content.push_back(ContentBlock(attachment));
         if (attachment.type == Attachment::Type::Image) {
             const std::wstring path =

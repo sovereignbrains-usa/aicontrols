@@ -3,9 +3,11 @@
 #include <windows.h>
 #include <wincodec.h>
 
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include <wil/com.h>
 
@@ -13,7 +15,7 @@
 
 namespace aic {
 
-// Something sent along with a message: a picture, a PDF, or a text file's content.
+// Something sent along with a message: a picture, a PDF, a text file, or one frame of a video.
 struct Attachment {
     enum class Type { Image, Document, Text };
     Type type = Type::Image;
@@ -23,10 +25,20 @@ struct Attachment {
     std::string base64;     // Image, Document
     std::string text;       // Text: the file's UTF-8 content
     wil::com_ptr<IWICBitmap> thumbnail;  // Image: small, 32bppPBGRA, for Direct2D
+    std::wstring cue;  // told to the model right before this block; a video frame's moment, empty otherwise
 };
 
 // COM must be initialized on the calling thread. On failure: nullopt and a message in `error`.
 std::optional<Attachment> LoadAttachment(IWICImagingFactory* wic, const std::wstring& path, std::wstring& error);
+
+// A video is sent as a few still frames. .mp4, .webm and .mov only.
+bool IsVideoAttachment(const std::wstring& path);
+// Sample times in 100-nanosecond units: at most 8, one every 0.5 s, each in the middle of its slice.
+// A duration of 0 or less is a single sample at the start.
+std::vector<int64_t> VideoFrameTicks(int64_t duration);
+// Those frames as pictures. COM must be initialized. On failure: empty, and a message in `error`.
+// A frame that does not decode is skipped when another one succeeded.
+std::vector<Attachment> LoadVideoFrames(IWICImagingFactory* wic, const std::wstring& path, std::wstring& error);
 // A picture on the clipboard (a screenshot); nullopt with an empty `error` when there is none.
 std::optional<Attachment> ClipboardImage(IWICImagingFactory* wic, HWND owner, std::wstring& error);
 bool ClipboardHasImage();
