@@ -27,6 +27,19 @@ std::string InstalledClaudeVersion(const std::wstring& exe);
 // 2.1.99 < 2.1.302. Anything that is not dotted numbers counts as unknown (never "less").
 bool ClaudeVersionLess(std::string_view older, std::string_view newer);
 
+// What `grok update --check --json` prints. `error` is that field when it is a non-empty string; JSON null is not one.
+struct GrokUpdateCheck {
+    std::string installed;  // currentVersion
+    std::string latest;     // latestVersion
+    std::string error;
+};
+
+// The first JSON object in `output`. Empty versions and a non-empty error when that object is not there.
+GrokUpdateCheck ParseGrokUpdateCheck(const std::string& output);
+// `grok update --check --json`. `error` is "not installed" when `exe` is empty. The auto-updater stays on:
+// one-shot questions set GROK_DISABLE_AUTOUPDATER, and that flag would hide a newer build.
+GrokUpdateCheck QueryGrokUpdate(const std::wstring& exe, const std::wstring& proxy);
+
 // SHA-256 of a file as lower case hex; empty when it cannot be read.
 std::string FileSha256(const std::wstring& path);
 

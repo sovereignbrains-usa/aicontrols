@@ -36,6 +36,28 @@ int main() {
                !ClaudeVersionLess("junk", "2.1.0") && !ClaudeVersionLess("2.1.0", ""),
            "equal, newer and unknown are not older");
 
+    const GrokUpdateCheck newer = ParseGrokUpdateCheck(
+        R"({"currentVersion":"1.0.92","latestVersion":"1.0.93","updateAvailable":true,"error":null})");
+    Expect(newer.installed == "1.0.92" && newer.latest == "1.0.93" && newer.error.empty() &&
+               ClaudeVersionLess(newer.installed, newer.latest),
+           "grok check offers a newer build");
+    const GrokUpdateCheck same = ParseGrokUpdateCheck(
+        R"({"currentVersion":"1.0.92","latestVersion":"1.0.92","updateAvailable":false,"error":null})");
+    Expect(same.installed == "1.0.92" && same.latest == "1.0.92" && same.error.empty() &&
+               !ClaudeVersionLess(same.installed, same.latest),
+           "grok check already current");
+    const GrokUpdateCheck prefixed = ParseGrokUpdateCheck(
+        "checking\n{\"currentVersion\":\"1.0.92\",\"latestVersion\":\"1.0.100\",\"error\":null}\ndone\n");
+    Expect(prefixed.installed == "1.0.92" && prefixed.latest == "1.0.100" && prefixed.error.empty() &&
+               ClaudeVersionLess(prefixed.installed, prefixed.latest),
+           "grok check json after a log line");
+    const GrokUpdateCheck junk = ParseGrokUpdateCheck("not json");
+    Expect(!junk.error.empty() && junk.installed.empty() && junk.latest.empty(), "grok check without json");
+    const GrokUpdateCheck offline = ParseGrokUpdateCheck(
+        R"({"currentVersion":"1.0.92","latestVersion":"","updateAvailable":false,"error":"offline"})");
+    Expect(offline.error == "offline" && offline.installed == "1.0.92" && offline.latest.empty(),
+           "grok check error string");
+
     const std::string sum(64, 'A');
     const std::string manifest = R"({"version":"2.1.302","platforms":{"win32-x64":{"checksum":")" + sum +
                                  R"(","size":1},"linux-x64":{"checksum":"short"}}})";

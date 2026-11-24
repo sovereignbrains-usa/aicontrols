@@ -280,6 +280,82 @@ bool ClaudeVersionLess(std::string_view older, std::string_view newer) {
     return parts(older) < parts(newer);
 }
 
+GrokUpdateCheck ParseGrokUpdateCheck(const std::string& output) {
+    // A log line may sit in front of the object, and another after it. The object itself is what the check said.
+    const auto object = [](const std::string& text) {
+        const size_t start = text.find('{');
+        if (start == std::string::npos) {
+            return std::string();
+        }
+        int depth = 0;
+        bool inString = false;
+        bool escape = false;
+        for (size_t i = start; i < text.size(); ++i) {
+            const char c = text[i];
+            if (inString) {
+                if (escape) {
+                    escape = false;
+                } else if (c == '\\') {
+                    escape = true;
+                } else if (c == '"') {
+                    inString = false;
+                }
+                continue;
+            }
+            if (c == '"') {
+                inString = true;
+            } else if (c == '{') {
+                ++depth;
+            } else if (c == '}' && --depth == 0) {
+                return text.substr(start, i + 1 - start);
+            }
+        }
+        return std::string();
+    };
+
+    GrokUpdateCheck check;
+    const std::string json = object(output);
+    const Json parsed = json.empty() ? Json() : Json::parse(json, nullptr, false);
+    if (!parsed.is_object()) {
+        check.error = "no answer";
+        return check;
+    }
+    check.installed = JsonStr(parsed, "currentVersion");
+    check.latest = JsonStr(parsed, "latestVersion");
+    if (const auto error = parsed.find("error"); error != parsed.end() && error->is_string()) {
+        const std::string text = error->get<std::string>();
+        if (!text.empty()) {
+            check.error = text;
+        }
+    }
+    return check;
+}
+
+GrokUpdateCheck QueryGrokUpdate(const std::wstring& exe, const std::wstring& proxy) {
+    if (exe.empty()) {
+        return {{}, {}, "not installed"};
+    }
+    const CliResult run = RunCli(L"\"" + exe + L"\" update --check --json", proxy, 60);
+    GrokUpdateCheck check = ParseGrokUpdateCheck(run.output);
+    const bool failed = !run.started || run.timedOut || run.cancelled || run.exitCode != 0;
+    // A JSON error, or a clean answer, stands. A dead process that printed no object leaves its tail.
+    if (!failed || check.error != "no answer") {
+        return check;
+    }
+    std::string tail = run.output;
+    if (tail.size() > 300) {
+        tail.erase(0, tail.size() - 300);
+    }
+    while (!tail.empty() && std::isspace(static_cast<unsigned char>(tail.front()))) {
+        tail.erase(tail.begin());
+    }
+    while (!tail.empty() && std::isspace(static_cast<unsigned char>(tail.back()))) {
+        tail.pop_back();
+    }
+    check.error = tail.empty() ? (run.timedOut ? "timed out" : "check failed") : tail;
+    return check;
+}
+
 std::string FileSha256(const std::wstring& path) {
     wil::unique_hfile file(CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
                                        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr));

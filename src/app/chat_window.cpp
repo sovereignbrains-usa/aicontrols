@@ -107,6 +107,10 @@ struct SetupEvent {
 struct ClaudeVersions {
     std::string installed;
     std::string latest;
+    std::string grokInstalled;
+    std::string grokLatest;
+    std::string grokError;
+    bool grokAsked = false;  // the account menu asked: say so when nothing newer came back
 };
 
 constexpr UINT kRepos = WM_APP + 10;      // ReposResult*: the GitHub repositories
@@ -1116,11 +1120,13 @@ private:
 
     // The CLI itself: fetched when it is missing, updated from the account menu.
     bool ClaudeUpdateAvailable() const { return ClaudeVersionLess(claudeVersion_, claudeLatest_); }
+    bool GrokUpdateAvailable() const { return ClaudeVersionLess(grokVersion_, grokLatest_); }
     void InstallClaudeCli();
     void InstallGrokCli();
     void UpdateClaudeCli();
+    void UpdateGrokCli();
     void OnSetupEvent(const SetupEvent& event);
-    void CheckClaudeVersions();
+    void CheckClaudeVersions(bool grokAsked = false);
     void OnClaudeVersions(const ClaudeVersions& versions);
     std::wstring AccountName() const;
     std::wstring AccountPlan() const;
@@ -1607,6 +1613,9 @@ private:
     std::string claudeVersion_;      // as last asked; empty until the first answer
     std::string claudeLatest_;
     std::string announcedVersion_;   // the newest version already mentioned in a flash
+    std::string grokVersion_;        // grok.exe, kept when a later check could not say
+    std::string grokLatest_;
+    std::string announcedGrok_;
     std::thread versionThread_;
     bool terminalOpen_ = false;
     bool termFocus_ = false;         // typing goes to the shell
@@ -7322,6 +7331,12 @@ void ChatWindow::ShowAccountMenu() {
     const std::wstring update = L"Обновить Claude до " + ToWide(claudeLatest_);
     AppendMenuW(menu.get(), MF_STRING | (setupBusy_ ? MF_GRAYED : 0), ClaudeUpdateAvailable() ? 4 : 5,
                 ClaudeUpdateAvailable() ? update.c_str() : L"Проверить обновления Claude");
+    const std::wstring grokVersion = grokVersion_.empty() ? std::wstring(L"Grok: версия неизвестна")
+                                                          : L"Grok " + ToWide(grokVersion_);
+    AppendMenuW(menu.get(), MF_STRING | MF_GRAYED, 7, grokVersion.c_str());
+    const std::wstring grokUpdate = L"Обновить Grok до " + ToWide(grokLatest_);
+    AppendMenuW(menu.get(), MF_STRING | (setupBusy_ ? MF_GRAYED : 0), GrokUpdateAvailable() ? 8 : 9,
+                GrokUpdateAvailable() ? grokUpdate.c_str() : L"Проверить обновления Grok");
     AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu.get(), MF_STRING, 6, L"Подключения: Claude, Grok, GitHub…");
     AppendMenuW(menu.get(), MF_STRING, 2, L"Выйти из Claude");  // only Claude's: Grok and GitHub stay connected
@@ -7338,6 +7353,13 @@ void ChatWindow::ShowAccountMenu() {
     case 5:
         CheckClaudeVersions();
         Flash(L"Проверяю, нет ли новой версии Claude…");
+        break;
+    case 8:
+        UpdateGrokCli();
+        break;
+    case 9:
+        CheckClaudeVersions(true);
+        Flash(L"Проверяю, нет ли новой версии Grok…");
         break;
     default:
         break;
@@ -7476,7 +7498,89 @@ void ChatWindow::UpdateClaudeCli() {
     Refresh();
 }
 
+// `grok update` replaces grok.exe, so every chat that still runs it lets go of the file first.
+void ChatWindow::UpdateGrokCli() {
+    const std::wstring exe = FindGrokExe();
+    if (setupBusy_ || exe.empty()) {
+        return;
+    }
+    const bool grokBusy = (busy_ && GrokRunning()) ||
+                          std::ranges::any_of(parked_, [](const std::unique_ptr<Parked>& chat) {
+                              return chat->busy && chat->runner->agent == &chat->runner->grok;
+                          });
+    if (grokBusy && MessageBoxW(hwnd_, L"Сейчас Grok отвечает. Обновление прервёт ответ. Продолжить?", L"AIControls",
+                                MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES) {
+        return;
+    }
+    if (setupThread_.joinable()) {
+        setupThread_.join();
+    }
+    const auto stopGrok = [](Runner& runner, std::vector<FeedItem>& feed) {
+        runner.host.CancelAll();
+        for (FeedItem& item : feed) {
+            if (item.kind == Kind::Approval && item.verdict == Verdict::Pending) {
+                item.verdict = Verdict::Cancelled;
+            }
+        }
+        runner.agent->Stop();
+    };
+    if (GrokRunning()) {
+        generation_ = ++generations_;  // a late line from the process just stopped is not this chat's
+        stopGrok(*runner_, feed_);
+        running_ = false;
+        busy_ = false;
+    }
+    for (const std::unique_ptr<Parked>& chat : parked_) {
+        if (chat->runner->agent != &chat->runner->grok) {
+            continue;
+        }
+        chat->generation = 0;
+        stopGrok(*chat->runner, chat->feed);
+        chat->running = chat->busy = false;
+    }
+    setupBusy_ = true;
+    setupInstalling_ = true;
+    setupNote_.clear();
+    setupCancel_ = false;
+    Flash(L"Обновляю Grok…", 60000);
+    const HWND hwnd = hwnd_;
+    const std::atomic<bool>* cancel = &setupCancel_;
+    setupThread_ = std::thread([hwnd, exe, cancel] {
+        const CliResult run = RunCli(L"\"" + exe + L"\" update", PickProxy(), 300, cancel);
+        std::string error;
+        if (run.cancelled || run.timedOut || !run.started || run.exitCode != 0) {
+            error = run.timedOut ? "Не дождался конца обновления"
+                                 : (run.output.size() > 300 ? run.output.substr(run.output.size() - 300) : run.output);
+            if (error.empty()) {
+                error = "Обновление не удалось (код " + std::to_string(run.exitCode) + ")";
+            }
+        }
+        PostSetup(hwnd, SetupEvent{100, false, true, error.empty(), true, true, std::move(error)});
+    });
+    Refresh();
+}
+
 void ChatWindow::OnSetupEvent(const SetupEvent& event) {
+    if (event.grok && event.update) {
+        if (!event.finished) {
+            return;
+        }
+        setupBusy_ = false;
+        setupInstalling_ = false;
+        if (event.ok) {
+            setupNote_.clear();
+            CheckClaudeVersions();
+            Flash(L"Grok обновлён", 5000);
+        } else {
+            setupNote_ = event.error == "Cancelled" ? std::wstring(L"Отменено.") : ToWide(event.error);
+            Flash(L"Не удалось обновить Grok: " + setupNote_, 8000);
+        }
+        if (GrokSelected() && !running_) {  // a Claude chat that is open keeps its process
+            StartClaude();
+        }
+        Refresh();
+        return;
+    }
     if (event.grok) {
         if (!event.finished) {
             if (event.installing) {
@@ -7543,15 +7647,20 @@ void ChatWindow::OnSetupEvent(const SetupEvent& event) {
     Refresh();
 }
 
-void ChatWindow::CheckClaudeVersions() {
+void ChatWindow::CheckClaudeVersions(bool grokAsked) {
     if (versionThread_.joinable()) {
         versionThread_.join();
     }
     const HWND hwnd = hwnd_;
-    versionThread_ = std::thread([hwnd] {
+    versionThread_ = std::thread([hwnd, grokAsked] {
         auto versions = std::make_unique<ClaudeVersions>();
         versions->installed = InstalledClaudeVersion(FindClaudeExe());
         versions->latest = LatestClaudeRelease(PickProxy()).version;
+        const GrokUpdateCheck grok = QueryGrokUpdate(FindGrokExe(), PickProxy());
+        versions->grokInstalled = grok.installed;
+        versions->grokLatest = grok.latest;
+        versions->grokError = grok.error;
+        versions->grokAsked = grokAsked;
         if (PostMessageW(hwnd, kClaudeVersions, 0, reinterpret_cast<LPARAM>(versions.get()))) {
             versions.release();
         }
@@ -7563,9 +7672,37 @@ void ChatWindow::OnClaudeVersions(const ClaudeVersions& versions) {
     if (!versions.latest.empty()) {
         claudeLatest_ = versions.latest;
     }
-    if (ClaudeUpdateAvailable() && announcedVersion_ != claudeLatest_) {
+    if (!versions.grokInstalled.empty()) {
+        grokVersion_ = versions.grokInstalled;
+    }
+    if (!versions.grokLatest.empty()) {
+        grokLatest_ = versions.grokLatest;
+    }
+    const bool claudeNew = ClaudeUpdateAvailable() && announcedVersion_ != claudeLatest_;
+    const bool grokNew = GrokUpdateAvailable() && announcedGrok_ != grokLatest_;
+    if (claudeNew) {
         announcedVersion_ = claudeLatest_;
+    }
+    if (grokNew) {
+        announcedGrok_ = grokLatest_;
+    }
+    if (claudeNew && grokNew) {
+        Flash(L"Вышли новые версии: Claude " + ToWide(claudeLatest_) + L" и Grok " + ToWide(grokLatest_) +
+                  L". Обновить можно в меню аккаунта",
+              10000);
+    } else if (claudeNew) {
         Flash(L"Вышла новая версия Claude " + ToWide(claudeLatest_) + L": обновить можно в меню аккаунта", 10000);
+    } else if (grokNew) {
+        Flash(L"Вышла новая версия Grok " + ToWide(grokLatest_) + L": обновить можно в меню аккаунта", 10000);
+    } else if (versions.grokAsked && !GrokUpdateAvailable()) {
+        if (!versions.grokError.empty()) {
+            const std::wstring why = versions.grokError == "not installed" ? std::wstring(L"Grok не установлен")
+                                                                          : ToWide(versions.grokError);
+            Flash(L"Не удалось проверить Grok: " + why, 8000);
+        } else {
+            const std::string shown = !grokVersion_.empty() ? grokVersion_ : grokLatest_;
+            Flash((shown.empty() ? std::wstring(L"Grok") : L"Grok " + ToWide(shown)) + L" — последняя версия", 5000);
+        }
     }
     Refresh();
 }
@@ -11457,8 +11594,16 @@ std::wstring ChatWindow::TooltipText() {
     case Target::SidebarSearch:
         return L"Поиск (Ctrl+H): стрелки, Enter, влево свернуть. Alt+↑↓ чаты, Alt+←→ проекты";
     case Target::Account:
-        return ClaudeUpdateAvailable() ? L"Аккаунт · вышел Claude " + ToWide(claudeLatest_)
-                                       : std::wstring(L"Аккаунт, подключения, версия Claude, выход");
+        if (ClaudeUpdateAvailable() && GrokUpdateAvailable()) {
+            return L"Аккаунт · вышли Claude " + ToWide(claudeLatest_) + L" и Grok " + ToWide(grokLatest_);
+        }
+        if (ClaudeUpdateAvailable()) {
+            return L"Аккаунт · вышел Claude " + ToWide(claudeLatest_);
+        }
+        if (GrokUpdateAvailable()) {
+            return L"Аккаунт · вышел Grok " + ToWide(grokLatest_);
+        }
+        return L"Аккаунт, подключения, версии Claude и Grok, выход";
     case Target::ConnectRow:  // a failure in full: the row has room for its start only
         return hover_.row < links_.size() && links_[hover_.row].state == LinkState::Failed ? links_[hover_.row].note
                                                                                             : std::wstring();

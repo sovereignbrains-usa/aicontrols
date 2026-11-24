@@ -2,7 +2,7 @@ English · [Русский](README.ru.md)
 
 # AIControls
 
-[![release 0.1.124](https://img.shields.io/badge/release-0.1.124-4c92ff)](https://github.com/sovereignbrains/aicontrols/releases)
+[![release 0.1.125](https://img.shields.io/badge/release-0.1.125-4c92ff)](https://github.com/sovereignbrains/aicontrols/releases)
 [![MIT](https://img.shields.io/github/license/sovereignbrains/aicontrols)](LICENSE)
 [![build](https://github.com/sovereignbrains/aicontrols/actions/workflows/build.yml/badge.svg)](https://github.com/sovereignbrains/aicontrols/actions/workflows/build.yml)
 
@@ -13,7 +13,7 @@ C++23, Win32, Direct2D and DirectWrite. No Electron, one exe.
 > Not an official Anthropic or xAI product. “Claude” is a trademark of Anthropic.
 > The client starts the `claude.exe` and `grok.exe` you already installed and talks to them.
 
-Current build: **0.1.124**.
+Current build: **0.1.125**.
 
 ## What it does
 
@@ -26,6 +26,7 @@ Current build: **0.1.124**.
 - Permissions are separate for Claude and for Grok. The buttons are «Спрашивать», «Файлы без вопросов», Auto, «План», «Без вопросов».
 - Grok names the chat from the first question and answer (2–6 words, up to 48 characters). A name you type wins.
 - When a reply finishes, or a tool waits for permission, and the window is not in front: a Windows notification, and the taskbar button flashes. A click opens that chat.
+- The account menu checks Grok the same way it checks Claude, and can update it.
 
 **Tools.** The client’s own MCP server: `run_command` (PowerShell),
 `read_file`, `write_file`, `edit_file`, `list_directory`, `screenshot`, `browser`, `list_chats`, `read_chat`,
