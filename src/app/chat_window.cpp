@@ -10,6 +10,7 @@
 #include <shlobj.h>
 #include <shlwapi.h>
 #include <shobjidl.h>
+#include <roapi.h>
 #include <WebView2.h>
 #include <wrl/event.h>
 
@@ -37,6 +38,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -44,6 +46,7 @@
 #include "app/fonts.h"
 #include "app/popup_menu.h"
 #include "app/resource.h"
+#include "app/toast.h"
 #include "core/app_update.h"
 #include "core/attachment.h"
 #include "core/auth.h"
@@ -1502,6 +1505,8 @@ private:
     void WarnLimits();
     void OnClaude(const Json& message);
     void OnClaudeExit(const ExitInfo& exit);
+    void AnnounceAway(std::wstring_view heading, std::wstring_view body, const std::string& session);
+    void OpenFromToast(const std::string& id);
     void Add(Kind kind, std::wstring text, bool leading = false);
     void Refresh() { InvalidateRect(hwnd_, nullptr, FALSE); }
     bool HasConversation() const;
@@ -1985,7 +1990,10 @@ int ChatWindow::Run(int show) {
     LoadRepos();
     CheckClaudeVersions();
     StartClaude();  // warm up: the first answer does not wait for the CLI to start
-    if (!settings_.reopen.empty()) {  // back from an update: the chat it was in
+    AttachToastWindow(hwnd_);
+    if (const std::string opened = TakePendingToast(); !opened.empty()) {
+        OpenFromToast(opened);  // a toast click launched this process before the list existed
+    } else if (!settings_.reopen.empty()) {  // back from an update: the chat it was in
         const std::string id = std::exchange(settings_.reopen, std::string());
         SaveSettings(settings_);
         for (const Project& project : projects_) {
@@ -3068,6 +3076,11 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         } else if (Parked* chat = ParkedAt(wParam)) {
             OnParked(*chat, [&] { OnClaudeExit(*payload); });
         }
+        return 0;
+    }
+    case kToastOpen: {
+        const std::unique_ptr<std::string> id(reinterpret_cast<std::string*>(lParam));
+        OpenFromToast(id ? *id : std::string{});
         return 0;
     }
     case WM_DESTROY:
@@ -13855,6 +13868,67 @@ void ChatWindow::TakeDraft(const std::string& key) {
     PlaceChildren();
 }
 
+void ChatWindow::AnnounceAway(std::wstring_view heading, std::wstring_view body, const std::string& session) {
+    if (gallery_ || !WindowIsAway(hwnd_)) {
+        return;
+    }
+    ShowToast(heading, body, session);
+    FLASHWINFO info{};
+    info.cbSize = sizeof(info);
+    info.hwnd = hwnd_;
+    info.dwFlags = FLASHW_TRAY | FLASHW_TIMERNOFG;
+    FlashWindowEx(&info);
+}
+
+void ChatWindow::OpenFromToast(const std::string& id) {
+    if (hwnd_ == nullptr) {
+        return;
+    }
+    if (IsIconic(hwnd_)) {
+        ShowWindow(hwnd_, SW_RESTORE);
+    }
+    ShowWindow(hwnd_, SW_SHOW);
+    SetForegroundWindow(hwnd_);
+    if (id.empty() || id == sessionId_ || id == chainFrom_) {
+        return;
+    }
+    const auto openListed = [&](bool refresh) {
+        if (refresh) {
+            RefreshSessions();
+        }
+        for (const Project& project : projects_) {
+            const auto found = std::ranges::find_if(project.sessions, [&](const SessionInfo& session) {
+                return SameChat(session, id);
+            });
+            if (found == project.sessions.end()) {
+                continue;
+            }
+            OpenChat(project.folder, *found);
+            RevealOpened();
+            return true;
+        }
+        return false;
+    };
+    if (openListed(false) || openListed(true)) {
+        return;
+    }
+    for (const std::unique_ptr<Parked>& parked : parked_) {
+        const std::string key = ParkedKey(*parked);
+        if (key != id && parked->sessionId != id && parked->chainFrom != id) {
+            continue;
+        }
+        SessionInfo session;
+        session.id = parked->sessionId.empty() ? id : parked->sessionId;
+        session.title = parked->title;
+        if (parked->sessionId.empty()) {
+            session.linked.push_back(key);
+        }
+        OpenChat(parked->workspace, session);
+        RevealOpened();
+        return;
+    }
+}
+
 void ChatWindow::OnParked(Parked& chat, const std::function<void()>& handle) {
     const auto pending = [this] {
         return std::ranges::count_if(feed_, [](const FeedItem& item) {
@@ -13869,9 +13943,15 @@ void ChatWindow::OnParked(Parked& chat, const std::function<void()>& handle) {
     const std::string id = sessionId_;
     const std::wstring title = title_;
     handle();
-    const bool done = wasBusy && !busy_;
+    // A dead process used to look like a finished answer (busy fell either way). Split them.
+    const bool died = wasBusy && !running_;
+    const bool done = wasBusy && !busy_ && running_;
     const bool asks = pending() > waited;
     const bool renamed = id != sessionId_ || title != title_;
+    std::string toastId = !sessionId_.empty() ? sessionId_ : chainFrom_;
+    if (toastId.empty()) {
+        toastId = "aic-parked-" + std::to_string(generation_);
+    }
     inBackground_ = false;
     SwapChat(chat);
     feedSelecting_ = selecting;
@@ -13891,13 +13971,18 @@ void ChatWindow::OnParked(Parked& chat, const std::function<void()>& handle) {
         chat.runner->agent->Stop();
         std::erase_if(parked_, [&](const std::unique_ptr<Parked>& parked) { return parked.get() == &chat; });
     }
-    if (done || asks || renamed || settled) {
+    if (done || asks || renamed || settled || died) {
         ListChanged();
     }
     if (asks) {
         Flash(L"Ждёт разрешения: " + name, 6000);
+        AnnounceAway(L"Ждёт разрешения", name, toastId);
+    } else if (died) {
+        Flash(L"Чат остановился: " + name, 6000);
+        AnnounceAway(L"Чат остановился", name, toastId);
     } else if (done) {
         Flash(L"Ответ готов: " + name, 5000);
+        AnnounceAway(L"Ответ готов", name, toastId);
     }
     if (updatePending_ && !AnyBusy()) {
         StartUpdate();
@@ -14198,6 +14283,12 @@ void ChatWindow::OnClaude(const Json& message) {
             ListChanged();  // a new chat appears in the list, a title may have changed
             NameChat();
         }
+        if (!stopped && !inBackground_) {
+            const bool failed = (isError.is_boolean() && isError.get<bool>()) ||
+                                JsonStr(message, "subtype") != "success";
+            const std::wstring body = title_.empty() ? L"Новый чат" : L"«" + title_ + L"»";
+            AnnounceAway(failed ? L"Ход закончился с ошибкой" : L"Ответ готов", body, sessionId_);
+        }
     } else if (type == "aic_usage") {  // Grok's plan: what _x.ai/billing answered
         const PlanUsage usage = ParseGrokBilling(JsonAt(message, "billing").dump());
         if (usage.ok) {
@@ -14340,6 +14431,10 @@ void ChatWindow::AskApproval(const std::string& requestId, const Json& request) 
         runner_->agent->Respond(requestId, Json{{"behavior", "allow"}, {"updatedInput", input}});
     }
     feed_.push_back(std::move(item));
+    if (!inBackground_ && feed_.back().verdict == Verdict::Pending) {
+        const std::wstring body = title_.empty() ? L"Новый чат" : L"«" + title_ + L"»";
+        AnnounceAway(L"Ждёт разрешения", body, sessionId_);
+    }
     stick_ = true;
     glide_.reset();
 }
@@ -14491,6 +14586,10 @@ void ChatWindow::OnClaudeExit(const ExitInfo& exit) {
         text += L"\n" + tail;
     }
     Add(exit.code == 0 ? Kind::Notice : Kind::Error, std::move(text));
+    if (!inBackground_ && (wasBusy || exit.code != 0)) {
+        const std::wstring body = title_.empty() ? L"Новый чат" : L"«" + title_ + L"»";
+        AnnounceAway(L"Чат остановился", body, sessionId_);
+    }
 }
 
 void ChatWindow::Add(Kind kind, std::wstring text, bool leading) {
@@ -14660,10 +14759,25 @@ void ChatWindow::FillGallery() {
 int RunChatWindow(HINSTANCE instance, int show) {
     // The file dialog and WIC are COM; plain CoInitialize (not OleInitialize) also keeps RichEdit
     // from registering itself as a drop target, so dropped files reach the window.
-    if (FAILED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE))) {
+    const HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    if (FAILED(com)) {
         return 1;
     }
-    auto uninitialize = wil::scope_exit([] { CoUninitialize(); });
+    // On top of that STA, RoInitialize returns S_FALSE and still has to be unpaired.
+    const HRESULT runtime = RoInitialize(RO_INIT_SINGLETHREADED);
+    auto uninitialize = wil::scope_exit([runtime] {
+        StopToasts();
+        if (SUCCEEDED(runtime)) {
+            RoUninitialize();
+        }
+        CoUninitialize();
+    });
+    if (RaiseRunningWindow()) {
+        return 0;  // a second launch, or a toast click while this one is open: the first window comes forward
+    }
+    if (SUCCEEDED(runtime)) {
+        PrepareToasts();  // the process id, before any window
+    }
     try {
         ChatWindow window(instance);
         return window.Run(show);

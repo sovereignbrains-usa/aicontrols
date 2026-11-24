@@ -85,9 +85,10 @@ add_executable(aicontrols WIN32
   src/app/browser_view.cpp
   src/app/fonts.cpp
   src/app/popup_menu.cpp
+  src/app/toast.cpp
   src/app/aicontrols.manifest
   src/app/aicontrols.rc)
-target_link_libraries(aicontrols PRIVATE aic_core d2d1 dwrite dwmapi comctl32 shlwapi unofficial::webview2::webview2)
+target_link_libraries(aicontrols PRIVATE aic_core d2d1 dwrite dwmapi comctl32 shlwapi runtimeobject propsys uuid unofficial::webview2::webview2)
 # A map beside the exe: a crash dump (WER LocalDumps) is then read with tools\probes\dumpscan.ps1 and this file.
 if(MSVC)
   target_link_options(aicontrols PRIVATE /MAP)

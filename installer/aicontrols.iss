@@ -59,8 +59,8 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 Source: "{#SourceDir}\aicontrols.exe"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-Name: "{autoprograms}\AIControls"; Filename: "{app}\aicontrols.exe"
-Name: "{autodesktop}\AIControls"; Filename: "{app}\aicontrols.exe"; Tasks: desktopicon
+Name: "{autoprograms}\AIControls"; Filename: "{app}\aicontrols.exe"; AppUserModelID: "sovereignbrains.AIControls"
+Name: "{autodesktop}\AIControls"; Filename: "{app}\aicontrols.exe"; Tasks: desktopicon; AppUserModelID: "sovereignbrains.AIControls"
 
 [Run]
 ; Not in silent mode: an update started by hand should not pop a window up on its own.
