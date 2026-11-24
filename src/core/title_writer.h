@@ -5,7 +5,7 @@
 
 namespace aic {
 
-// A chat's title from what it is about, not its first line: one cheap call (Haiku, no tools, no session kept)
+// A chat's title from what it is about, not its first line: one cheap call (Grok, no tools, low effort)
 // over the first exchange, after its first answer. Stored as the CLI's own generated title would be, so a
 // title the user gave stays above it.
 

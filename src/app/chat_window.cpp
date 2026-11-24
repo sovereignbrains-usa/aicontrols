@@ -113,7 +113,7 @@ constexpr UINT kUsage = WM_APP + 15;        // PlanUsage*: the plan's limits as 
 constexpr UINT kMemorySaved = WM_APP + 14;  // MemorySave*: the memory committed and pushed
 constexpr UINT kGithubDone = WM_APP + 17;   // GithubDone*: the token checked, or the browser's sign-in ended
 constexpr UINT kBrowserTask = WM_APP + 18;  // std::function<void()>*: the browser tool's work for this thread
-constexpr UINT kChatTitled = WM_APP + 19;   // Haiku named a chat: the list reads its title again
+constexpr UINT kChatTitled = WM_APP + 19;   // a chat was named: the list reads its title again
 constexpr UINT kSignInOpen = WM_APP + 20;   // SignInOpen*: GitHub's sign-in page, for a tab of the client's own browser
 
 struct GithubDone {
@@ -1629,10 +1629,10 @@ private:
     std::thread memoryThread_;
     size_t journalUnseen_ = 0;  // the bug's red dot: entries since the journal was last opened
     void OpenJournal();
-    std::thread titleThread_;  // Haiku naming a chat after its first answer (title_writer)
+    std::thread titleThread_;  // naming a chat after its first answer (title_writer)
     std::atomic<bool> titleCancel_ = false;
     std::atomic<bool> titling_ = false;
-    std::set<std::string> titled_;  // asked once a run: a chat Haiku could not name keeps its first line
+    std::set<std::string> titled_;  // asked once a run: a chat that could not be named keeps its first line
     // Chats that answered in the background and went from parked_ (their CLI ended): a steady dot in the list
     // until each is opened. By session id.
     std::set<std::string> unseen_;
@@ -11043,14 +11043,14 @@ void ChatWindow::SaveMemoryNow() {
         memoryThread_.join();
     }
     savingMemory_ = true;
-    Flash(sessionId_.empty() ? L"Сохраняю память…" : L"Haiku записывает память из этого чата…", 300'000);
+    Flash(sessionId_.empty() ? L"Сохраняю память…" : L"Grok записывает память из этого чата…", 300'000);
     const HWND hwnd = hwnd_;
     const std::wstring workspace = workspace_;
     const std::wstring folder = SharedMemoryFolder();
     const std::string session = sessionId_;
     memoryThread_ = std::thread([hwnd, workspace, folder, session, token] {
-        // First Haiku writes down what this chat taught (one call, no tools); then the folder goes up, also
-        // when Haiku could not (the plan's limit spent): what is there is saved anyway.
+        // First Grok writes down what this chat taught (one call, no tools); then the folder goes up, also
+        // when that call could not (the plan's limit spent): what is there is saved anyway.
         MemoryWrite written;
         written.ok = true;
         if (!session.empty()) {
@@ -11112,7 +11112,7 @@ void ChatWindow::OnMemorySaved(const MemorySave& saved) {
     savingMemory_ = false;
     std::wstring wrote;
     if (!saved.written) {
-        wrote = L"Haiku не записал (" + ToWide(saved.writeError.substr(0, 120)) + L"). ";
+        wrote = L"Grok не записал (" + ToWide(saved.writeError.substr(0, 120)) + L"). ";
     } else if (saved.created + saved.appended > 0) {
         wrote = std::format(L"Записано: новых заметок {}, дополнено {}. ", saved.created, saved.appended);
     } else {
@@ -11459,7 +11459,7 @@ std::wstring ChatWindow::TooltipText() {
         return L"Закрыть вкладку";
     case Target::SaveMemoryBtn:
         return savingMemory_ ? L"Сохраняю память…"
-                             : L"Записать главное из этого чата в память (Haiku, один дешёвый запрос) и отправить в облако";
+                             : L"Записать главное из этого чата в память (Grok, один дешёвый запрос) и отправить в облако";
     case Target::Update:
         return L"Поставить AIControls " + (update_ ? ToWide(update_->version) : std::wstring()) +
                L" и перезапустить. Этот чат откроется снова";

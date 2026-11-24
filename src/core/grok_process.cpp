@@ -1,6 +1,10 @@
 #include "core/grok_process.h"
 
+#include "core/auth.h"
+#include "core/store.h"
 #include "core/tools.h"
+
+#include <objbase.h>
 
 #include <algorithm>
 #include <array>
@@ -1064,6 +1068,242 @@ std::wstring FindGrokExe() {
         return std::wstring(buffer.data(), length);
     }
     return {};
+}
+
+namespace {
+
+// grok 1.0.92, 24.11.2026: `grok models` lists grok-4.7 (the default), this one, grok-4.6 and grok-4.5.
+// A title and a memory note are one short call; the fast model and low effort keep it cheap.
+constexpr const char* kAskModel = "grok-4.7-build-fast";
+
+// `--tools` cannot empty the set: a name that is not a tool leaves the others in place. Deny each built-in
+// instead. The id and the name the model is shown differ for five of them; either spelling removes the tool.
+// hashline_* is the same file tool as read_file / grep / search_replace. search_replace stays on the list
+// beside read_file: grok 1.0.77 refuses to build an agent that can edit and cannot read (0.1.120).
+// search_tool and use_tool are the MCP bridge; left in, a one-shot could call the client's own tools.
+constexpr const char* kNoTools =
+    "read_file,hashline_read,grep,hashline_grep,list_dir,search_replace,hashline_edit,write,"
+    "run_terminal_cmd,run_terminal_command,task,spawn_subagent,"
+    "get_task_output,get_command_or_subagent_output,wait_tasks,wait_commands_or_subagents,"
+    "kill_task,kill_command_or_subagent,web_search,web_fetch,"
+    "image_gen,image_edit,image_to_video,reference_to_video,workflow,"
+    "scheduler_create,scheduler_delete,scheduler_list,monitor,enter_plan_mode,exit_plan_mode,"
+    "ask_user_question,todo_write,search_tool,use_tool,Agent";
+
+bool Blank(std::string_view text) {
+    return text.find_first_not_of(" \t\r\n") == std::string_view::npos;
+}
+
+std::string Snip(std::string_view text) {
+    std::string out(text.substr(0, std::min(text.size(), size_t{200})));
+    for (char& c : out) {
+        if (c == '\n' || c == '\r') {
+            c = ' ';
+        }
+    }
+    return out;
+}
+
+std::wstring NewSessionId() {
+    GUID id{};
+    if (FAILED(CoCreateGuid(&id))) {
+        std::random_device device;
+        id.Data1 = device();
+        id.Data2 = static_cast<unsigned short>(device());
+        id.Data3 = static_cast<unsigned short>(0x4000 | (device() & 0x0FFF));
+        for (unsigned char& byte : id.Data4) {
+            byte = static_cast<unsigned char>(device());
+        }
+        id.Data4[0] = static_cast<unsigned char>(0x80 | (id.Data4[0] & 0x3F));
+    }
+    char text[40];
+    snprintf(text, sizeof(text), "%08lx-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+             static_cast<unsigned long>(id.Data1), static_cast<unsigned>(id.Data2), static_cast<unsigned>(id.Data3),
+             static_cast<unsigned>(id.Data4[0]), static_cast<unsigned>(id.Data4[1]),
+             static_cast<unsigned>(id.Data4[2]), static_cast<unsigned>(id.Data4[3]),
+             static_cast<unsigned>(id.Data4[4]), static_cast<unsigned>(id.Data4[5]),
+             static_cast<unsigned>(id.Data4[6]), static_cast<unsigned>(id.Data4[7]));
+    return ToWide(text);
+}
+
+bool SameFolder(std::wstring left, std::wstring right) {
+    auto norm = [](std::wstring path) {
+        for (wchar_t& c : path) {
+            if (c == L'/') {
+                c = L'\\';
+            }
+        }
+        while (!path.empty() && path.back() == L'\\') {
+            path.pop_back();
+        }
+        return path;
+    };
+    left = norm(std::move(left));
+    right = norm(std::move(right));
+    return CompareStringOrdinal(left.c_str(), -1, right.c_str(), -1, TRUE) == CSTR_EQUAL;
+}
+
+// The session of this call only, and only when its folder is the scratch one. Never a project chat.
+void DropScratchSession(const std::wstring& scratch, const std::string& sessionId, const std::wstring& reportedCwd) {
+    if (sessionId.empty() || sessionId.find_first_of("/\\.:") != std::string::npos) {
+        return;
+    }
+    const auto drop = [&](const std::wstring& workspace) {
+        if (workspace.empty() || !SameFolder(workspace, scratch)) {
+            return;
+        }
+        std::error_code error;
+        const fs::path parent = GrokHistoryFolder(workspace);
+        fs::remove_all(parent / ToWide(sessionId), error);
+        if (fs::is_directory(parent, error) && fs::is_empty(parent, error)) {
+            fs::remove(parent, error);
+        }
+    };
+    drop(scratch);
+    drop(reportedCwd);
+}
+
+bool WriteUtf8(const fs::path& file, std::string_view text) {
+    std::ofstream out(file, std::ios::binary | std::ios::trunc);
+    out.write(text.data(), static_cast<std::streamsize>(text.size()));
+    return static_cast<bool>(out);
+}
+
+}  // namespace
+
+GrokAskJson ParseGrokAsk(std::string_view output) {
+    GrokAskJson result;
+    // Top-level objects only. The answer's text is itself JSON often (a memory note), so a `{` inside a string
+    // is not another result. stderr may sit on either side; the last object that carries an answer wins.
+    bool inString = false;
+    bool escape = false;
+    int depth = 0;
+    size_t start = std::string_view::npos;
+    Json chosen = nullptr;
+    bool any = false;
+    for (size_t i = 0; i < output.size(); ++i) {
+        const char c = output[i];
+        if (inString) {
+            if (escape) {
+                escape = false;
+            } else if (c == '\\') {
+                escape = true;
+            } else if (c == '"') {
+                inString = false;
+            }
+            continue;
+        }
+        if (c == '"') {
+            inString = true;
+            continue;
+        }
+        if (c == '{') {
+            if (depth == 0) {
+                start = i;
+            }
+            ++depth;
+        } else if (c == '}' && depth > 0) {
+            --depth;
+            if (depth == 0 && start != std::string_view::npos) {
+                const Json object = Json::parse(output.substr(start, i - start + 1), nullptr, false);
+                if (object.is_object() && (object.contains("text") || object.contains("stopReason") ||
+                                           object.contains("error") || object.contains("sessionId"))) {
+                    chosen = object;
+                    any = true;
+                }
+                start = std::string_view::npos;
+            }
+        }
+    }
+    if (!any) {
+        result.error = "no answer";
+        return result;
+    }
+    result.sessionId = JsonStr(chosen, "sessionId");
+    result.cwd = JsonStr(chosen, "cwd");
+    const std::string stop = JsonStr(chosen, "stopReason");
+    const Json& text = JsonAt(chosen, "text");
+    const std::string words = text.is_string() ? text.get<std::string>() : std::string();
+    if (stop == "end_turn" && !Blank(words)) {
+        result.ok = true;
+        result.text = words;
+        return result;
+    }
+    const Json& failure = JsonAt(chosen, "error");
+    if (failure.is_string() && !failure.get<std::string>().empty()) {
+        result.error = Snip(failure.get<std::string>());
+    } else if (!stop.empty() && stop != "end_turn") {
+        result.error = stop;
+    } else {
+        result.error = Blank(words) ? "empty answer" : "no answer";
+    }
+    return result;
+}
+
+GrokAsk AskGrok(const std::string& prompt, std::string_view systemPrompt, int timeoutSeconds,
+                const std::atomic<bool>* cancel, std::wstring_view scratchName) {
+    GrokAsk result;
+    if (scratchName.empty() || scratchName.find_first_of(L"\\/:") != std::wstring_view::npos) {
+        result.error = "bad scratch";
+        return result;
+    }
+    const std::wstring exe = FindGrokExe();
+    if (exe.empty()) {
+        result.error = "grok.exe not found";
+        return result;
+    }
+    wchar_t temp[MAX_PATH]{};
+    const DWORD tempLen = GetTempPathW(MAX_PATH, temp);
+    if (tempLen == 0 || tempLen >= MAX_PATH) {
+        result.error = "no temp folder";
+        return result;
+    }
+    const fs::path scratch = fs::path(std::wstring(temp, tempLen)) / scratchName;
+    std::error_code error;
+    fs::create_directories(scratch, error);
+    const std::wstring suffix = std::to_wstring(GetCurrentThreadId());
+    const fs::path promptFile = scratch / (L"prompt-" + suffix + L".txt");
+    const fs::path systemFile = scratch / (L"system-" + suffix + L".txt");
+    if (!WriteUtf8(promptFile, prompt) || !WriteUtf8(systemFile, systemPrompt)) {
+        fs::remove(promptFile, error);
+        fs::remove(systemFile, error);
+        result.error = "could not write the prompt";
+        return result;
+    }
+    const std::wstring sessionId = NewSessionId();
+    // No -p: with no prompt of its own it would read stdin. --prompt-file is the whole prompt and starts the
+    // headless run. --max-turns 1 stops a turn that still finds a tool. No --always-approve.
+    const std::wstring command =
+        QuoteArg(exe) + L" --prompt-file " + QuoteArg(promptFile.wstring()) + L" --system-prompt-file " +
+        QuoteArg(systemFile.wstring()) + L" --output-format json --model " + QuoteArg(ToWide(kAskModel)) +
+        L" --effort low --max-turns 1 --no-memory --disable-web-search --no-subagents --no-plan --verbatim "
+        L"--no-auto-update --session-id " +
+        QuoteArg(sessionId) + L" --disallowed-tools " + QuoteArg(ToWide(kNoTools));
+    const CliResult run = RunCli(command, PickProxy(), timeoutSeconds, cancel,
+                                 {}, {{L"NO_COLOR", L"1"}, {L"GROK_DISABLE_AUTOUPDATER", L"1"}, {L"GROK_MEMORY", L"0"}},
+                                 scratch.wstring());
+    fs::remove(promptFile, error);
+    fs::remove(systemFile, error);
+    const GrokAskJson parsed = ParseGrokAsk(run.output);
+    DropScratchSession(scratch.wstring(), ToUtf8(sessionId), ToWide(parsed.cwd));
+    if (!parsed.sessionId.empty()) {
+        DropScratchSession(scratch.wstring(), parsed.sessionId, ToWide(parsed.cwd));
+    }
+    if (!run.started || run.timedOut || run.cancelled) {
+        result.error = run.timedOut ? "timed out" : "did not run";
+        return result;
+    }
+    if (run.exitCode == 0 && parsed.ok) {
+        result.ok = true;
+        result.text = parsed.text;
+        return result;
+    }
+    if (!parsed.error.empty() && parsed.error != "no answer") {
+        result.error = parsed.error;
+    } else {
+        result.error = run.output.empty() ? "no answer" : Snip(run.output);
+    }
+    return result;
 }
 
 }  // namespace aic

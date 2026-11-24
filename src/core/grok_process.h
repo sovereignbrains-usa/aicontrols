@@ -10,6 +10,7 @@
 #include <map>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -145,5 +146,29 @@ private:
 
 // %USERPROFILE%\.grok\bin\grok.exe (the installer's place), else PATH; empty if none.
 std::wstring FindGrokExe();
+
+// One headless turn of grok.exe, for a title or a memory note. No tools, no memory, low effort, the fast model.
+// `scratchName` is a single folder under %TEMP%: the call runs there, so it is not a chat of the project, and the
+// session grok.exe writes for that folder is removed. grok.exe missing is "grok.exe not found", with no fall back
+// to claude.exe.
+struct GrokAsk {
+    bool ok = false;
+    std::string text;
+    std::string error;
+};
+GrokAsk AskGrok(const std::string& prompt, std::string_view systemPrompt, int timeoutSeconds,
+                const std::atomic<bool>* cancel, std::wstring_view scratchName);
+
+// The object of `--output-format json` taken out of a blob that also holds stderr (RunCli joins the two).
+// ok only when stopReason is end_turn and text is not blank. Any other stop reason is a failure, one this client
+// has not seen included: a new reason is not a success.
+struct GrokAskJson {
+    bool ok = false;
+    std::string text;
+    std::string sessionId;
+    std::string cwd;
+    std::string error;
+};
+GrokAskJson ParseGrokAsk(std::string_view output);
 
 }  // namespace aic

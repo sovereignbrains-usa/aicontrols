@@ -1,15 +1,12 @@
 #include "core/memory_writer.h"
 
-#include <windows.h>
-
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <regex>
 #include <sstream>
 
-#include "core/auth.h"
-#include "core/claude_process.h"
+#include "core/grok_process.h"
 #include "core/store.h"
 
 namespace aic {
@@ -199,44 +196,14 @@ MemoryWrite WriteMemoryFromChat(const std::wstring& workspace, const std::string
         chat += *it + "\n\n";
     }
     const std::wstring folder = SharedMemoryFolder();
-
-    // The prompt goes in through a file on standard input (too long for a command line), the call runs in a
-    // scratch folder and keeps no session: nothing of it shows among the chats.
-    wchar_t temp[MAX_PATH]{};
-    GetTempPathW(MAX_PATH, temp);
-    const fs::path scratch = fs::path(temp) / L"aicontrols-memory";
-    std::error_code error;
-    fs::create_directories(scratch, error);
-    const fs::path input = scratch / L"prompt.txt";
-    {
-        std::ofstream out(input, std::ios::binary);
-        out << MemoryPrompt(folder, chat);
-    }
-    const std::wstring exe = FindClaudeExe();
-    if (exe.empty()) {
-        result.error = "claude.exe not found";
+    const GrokAsk shot = AskGrok(MemoryPrompt(folder, chat),
+                                 "You maintain an assistant's long-term memory notes. Answer with JSON only.", 300,
+                                 cancel, L"aicontrols-memory");
+    if (!shot.ok) {
+        result.error = shot.error.empty() ? "no answer" : shot.error;
         return result;
     }
-    const std::wstring command =
-        L"\"" + exe + L"\" -p --model haiku --tools \"\" --strict-mcp-config --no-session-persistence "
-        L"--output-format json --system-prompt \"You maintain an assistant's long-term memory notes. Answer with "
-        L"JSON only.\"";
-    const CliResult run = RunCli(command, L"", 300, cancel, {}, {}, scratch.wstring(), input.wstring());
-    fs::remove(input, error);
-    if (!run.started || run.timedOut || run.cancelled) {
-        result.error = run.timedOut ? "timed out" : "did not run";
-        return result;
-    }
-    // --output-format json: one object; its "result" is the model's text.
-    const size_t brace = run.output.find('{');
-    const Json reply = brace == std::string::npos ? Json() : Json::parse(run.output.substr(brace), nullptr, false);
-    const std::string text = reply.is_object() ? Str(reply, "result") : std::string();
-    if (run.exitCode != 0 || (reply.is_object() && JsonAt(reply, "is_error").is_boolean() &&
-                              JsonAt(reply, "is_error").get<bool>())) {
-        result.error = text.empty() ? run.output.substr(0, 400) : text.substr(0, 400);
-        return result;
-    }
-    MemoryEdits edits = ParseMemoryEdits(text);
+    MemoryEdits edits = ParseMemoryEdits(shot.text);
     if (preview != nullptr) {
         *preview = std::move(edits);
     } else {

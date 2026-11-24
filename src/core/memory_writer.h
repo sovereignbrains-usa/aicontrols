@@ -6,7 +6,7 @@
 
 namespace aic {
 
-// Claude's memory written from a chat by one cheap call: Haiku, no tools, a short system prompt, the chat's
+// The assistant's memory written from a chat by one cheap call: Grok, no tools, a short system prompt, the chat's
 // words only (no tool output, the end of it) and the memory's index; it answers with what to add, the client
 // writes it. Then SaveMemory pushes it.
 

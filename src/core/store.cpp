@@ -141,7 +141,7 @@ std::wstring PromptTitle(const std::wstring& prompt) {
         at = end + 1;
     }
     std::wstring title = titled.empty() ? attached : titled;
-    // Only until Haiku names the chat by what it is about (title_writer): the first sentence of it, not a whole
+    // Only until the chat is named by what it is about (title_writer): the first sentence of it, not a whole
     // paragraph, shortened on a word. The row trims it again to its width; the tip shows this.
     for (size_t at = title.find_first_of(L".?!"); at != std::wstring::npos; at = title.find_first_of(L".?!", at + 1)) {
         if (at >= 12 && at + 1 < title.size() && title[at + 1] == L' ') {

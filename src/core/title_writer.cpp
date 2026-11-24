@@ -1,20 +1,13 @@
 #include "core/title_writer.h"
 
-#include <windows.h>
-
 #include <algorithm>
-#include <filesystem>
-#include <fstream>
 #include <vector>
 
-#include "core/auth.h"
-#include "core/claude_process.h"
+#include "core/grok_process.h"
 #include "core/store.h"
 
 namespace aic {
 namespace {
-
-namespace fs = std::filesystem;
 
 constexpr size_t kPromptChars = 1'500;  // of the first message
 constexpr size_t kReplyChars = 1'200;   // of the answer's start
@@ -118,42 +111,13 @@ TitleWrite GenerateChatTitle(const std::wstring& workspace, const std::string& s
         "Пользователь: " + Cut(asked, kPromptChars) + "\n\n" +
         (answered.empty() ? std::string() : "Ассистент: " + Cut(answered, kReplyChars) + "\n");
 
-    // The words go in through a file on standard input, the call runs in a scratch folder and keeps no session:
-    // nothing of it shows among the chats.
-    wchar_t temp[MAX_PATH]{};
-    GetTempPathW(MAX_PATH, temp);
-    const fs::path scratch = fs::path(temp) / L"aicontrols-title";
-    std::error_code error;
-    fs::create_directories(scratch, error);
-    const fs::path input = scratch / (L"prompt-" + std::to_wstring(GetCurrentThreadId()) + L".txt");
-    {
-        std::ofstream out(input, std::ios::binary);
-        out << prompt;
-    }
-    const std::wstring exe = FindClaudeExe();
-    if (exe.empty()) {
-        fs::remove(input, error);
-        result.error = "claude.exe not found";
+    const GrokAsk shot = AskGrok(prompt, "You name chats. Answer with the title only.", 90, cancel,
+                                 L"aicontrols-title");
+    if (!shot.ok) {
+        result.error = shot.error.empty() ? "no answer" : shot.error;
         return result;
     }
-    const std::wstring command =
-        L"\"" + exe + L"\" -p --model haiku --tools \"\" --strict-mcp-config --no-session-persistence "
-        L"--output-format json --system-prompt \"You name chats. Answer with the title only.\"";
-    const CliResult run = RunCli(command, L"", 90, cancel, {}, {}, scratch.wstring(), input.wstring());
-    fs::remove(input, error);
-    if (!run.started || run.timedOut || run.cancelled) {
-        result.error = run.timedOut ? "timed out" : "did not run";
-        return result;
-    }
-    const size_t brace = run.output.find('{');
-    const Json reply = brace == std::string::npos ? Json() : Json::parse(run.output.substr(brace), nullptr, false);
-    const Json& text = JsonAt(reply, "result");
-    const Json& failed = JsonAt(reply, "is_error");
-    if (run.exitCode != 0 || !text.is_string() || (failed.is_boolean() && failed.get<bool>())) {
-        result.error = text.is_string() ? text.get<std::string>().substr(0, 200) : run.output.substr(0, 200);
-        return result;
-    }
-    result.title = CleanTitle(text.get<std::string>());
+    result.title = CleanTitle(shot.text);
     result.ok = !result.title.empty();
     if (!result.ok) {
         result.error = "empty title";
