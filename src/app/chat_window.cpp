@@ -223,6 +223,8 @@ constexpr float kPanStill = 10.f;
 constexpr ULONGLONG kPanHold = 300;      // ms
 constexpr float kBarStrip = 12.f;        // a scrollbar's strip a press takes: wider than the thumb drawn
 constexpr UINT_PTR kSubclassId = 1;
+// On the input window, not the frame: the system caret inverts the letters under it, so the bar blinks here.
+constexpr UINT_PTR kInputCaretTimer = 0xA1C;
 constexpr size_t kTranscriptLimit = 200;
 
 // Layout, in DIPs.
@@ -1382,7 +1384,13 @@ private:
                                       DWORD_PTR self);
     LRESULT Handle(UINT message, WPARAM wParam, LPARAM lParam);
     LRESULT OnInputFilter(const MSGFILTER& filter);
-    void FitCaret(HWND input);
+    void FitCaret(HWND input, bool painting);
+    void HideShownCaret(HWND input);
+    void EnsureInputCaretTimer(HWND input);
+    void StopInputCaret(HWND input);
+    void BlinkInputCaret(HWND input);
+    RECT InputCaretRect(HWND input, POINT at) const;
+    void PaintInputCaret(HWND input);
     void OnCommand(WPARAM wParam, LPARAM lParam);
     void OnClick(float x, float y);
     void OnPopupKey(WPARAM key);
@@ -2157,9 +2165,13 @@ private:
     std::optional<float> glide_;  // where the wheel is taking the feed
     std::chrono::steady_clock::time_point glideStep_;
 
-    POINT caretSet_{-1, -1};  // where FitCaret last put its caret
+    POINT caretSet_{-1, -1};  // where the input's bar is drawn (RichEdit's caret, shifted onto the letters)
     LONG caretTop_ = -1;      // below the line's top, px (the font's internal leading)
     LONG caretHeight_ = 0;
+    bool caretOn_ = true;          // the drawn bar; the system caret stays hidden (it inverts the letters)
+    bool inputCaretTimer_ = false;
+    bool caretHidden_ = false;     // HideCaret already counted for this visible phase
+    bool inputBlank_ = true;       // the field is empty: the placeholder is showing
     LONG inputShift_ = 0;     // RichEdit's baseline against GDI's for the same font, px (the placeholder follows it)
     float textHeight_ = kTextMin;  // the input's text area, grows with what is typed
     int inputLinePx_ = 0;          // one of its lines, as RichEdit lays it out: its scrollbar counts in them
@@ -2548,6 +2560,13 @@ LRESULT CALLBACK ChatWindow::InputProc(HWND hwnd, UINT message, WPARAM wParam, L
         }
         return 0;
     }
+    if (message == WM_TIMER && wParam == kInputCaretTimer) {
+        reinterpret_cast<ChatWindow*>(self)->BlinkInputCaret(hwnd);
+        return 0;  // RichEdit must not see this timer
+    }
+    if (message == WM_KILLFOCUS) {
+        reinterpret_cast<ChatWindow*>(self)->StopInputCaret(hwnd);
+    }
     const LRESULT result = DefSubclassProc(hwnd, message, wParam, lParam);
     switch (message) {  // what may have scrolled it: the bar beside it follows
     case WM_LBUTTONUP:
@@ -2572,6 +2591,9 @@ LRESULT CALLBACK ChatWindow::InputProc(HWND hwnd, UINT message, WPARAM wParam, L
     default:
         break;
     }
+    if (GetFocus() == hwnd) {
+        reinterpret_cast<ChatWindow*>(self)->FitCaret(hwnd, message == WM_PAINT);
+    }
     if (message == WM_PAINT && GetWindowTextLengthW(hwnd) == 0) {
         const auto* window = reinterpret_cast<const ChatWindow*>(self);
         HDC dc = GetDC(hwnd);
@@ -2587,8 +2609,8 @@ LRESULT CALLBACK ChatWindow::InputProc(HWND hwnd, UINT message, WPARAM wParam, L
         SelectObject(dc, old);
         ReleaseDC(hwnd, dc);
     }
-    if (GetFocus() == hwnd) {
-        reinterpret_cast<ChatWindow*>(self)->FitCaret(hwnd);
+    if (message == WM_PAINT) {
+        reinterpret_cast<ChatWindow*>(self)->PaintInputCaret(hwnd);
     }
     return result;
 }
@@ -2598,10 +2620,12 @@ LRESULT CALLBACK ChatWindow::InputProc(HWND hwnd, UINT message, WPARAM wParam, L
 // 16). The caret was cut by GDI's numbers and stood 1-2 px low, with 2-3 px hanging under the tails. Whenever
 // RichEdit has put its own, it is replaced by one from a pixel above the capitals to a pixel under the tails, at
 // the same place; the line's height is read off RichEdit's caret, and the placeholder is drawn by the same line.
-void ChatWindow::FitCaret(HWND input) {
+// That caret is an XOR, so the letters under it inverted, and replacing it without hiding left the column inverted.
+// It stays hidden. A solid bar is drawn where it stood and blinked from the input's own timer.
+void ChatWindow::FitCaret(HWND input, bool painting) {
     POINT at{};
-    if (!GetCaretPos(&at) || (at.x == caretSet_.x && at.y == caretSet_.y)) {
-        return;  // ours, where we put it
+    if (!GetCaretPos(&at)) {
+        return;
     }
     if (caretTop_ < 0) {
         GUITHREADINFO info{sizeof(info)};
@@ -2627,10 +2651,121 @@ void ChatWindow::FitCaret(HWND input) {
             InvalidateRect(input, nullptr, FALSE);  // the placeholder moves to the same line
         }
     }
-    CreateCaret(input, nullptr, std::max(1, ToPx(1.5f)), caretHeight_);
+    HideShownCaret(input);
+    if (at.x == caretSet_.x && at.y == caretSet_.y) {
+        EnsureInputCaretTimer(input);
+        return;
+    }
+    const POINT previous = caretSet_;
     caretSet_ = POINT{at.x, at.y + caretTop_};
     SetCaretPos(caretSet_.x, caretSet_.y);
-    ShowCaret(input);
+    caretHidden_ = false;  // moving it can show it again
+    HideShownCaret(input);
+    EnsureInputCaretTimer(input);
+    if (painting || (previous.x == caretSet_.x && previous.y == caretSet_.y)) {
+        return;  // a paint that invalidates paints again: RichEdit puts its caret back on every frame
+    }
+    const RECT was = InputCaretRect(input, previous);
+    const RECT now = InputCaretRect(input, caretSet_);
+    if (was.right > was.left) {
+        InvalidateRect(input, &was, FALSE);
+    }
+    if (now.right > now.left && (now.left != was.left || now.top != was.top || now.right != was.right ||
+                                 now.bottom != was.bottom)) {
+        InvalidateRect(input, &now, FALSE);
+    }
+}
+
+void ChatWindow::HideShownCaret(HWND input) {
+    GUITHREADINFO info{sizeof(info)};
+    if (!GetGUIThreadInfo(GetCurrentThreadId(), &info) || info.hwndCaret != input) {
+        caretHidden_ = false;
+        return;
+    }
+    // The bit means the caret is showing. Hiding on every message climbs the hide count: HideCaret stays true
+    // while the caret is already hidden, and a loop never ends.
+    if ((info.flags & GUI_CARETBLINKING) == 0) {
+        caretHidden_ = false;
+        return;
+    }
+    if (caretHidden_) {
+        return;
+    }
+    HideCaret(input);
+    caretHidden_ = true;
+}
+
+RECT ChatWindow::InputCaretRect(HWND input, POINT at) const {
+    if (at.x < 0 || caretHeight_ <= 0) {
+        return {};
+    }
+    const int width = std::max(1, ToPx(1.5f));
+    RECT bar{at.x, at.y, at.x + width, at.y + caretHeight_};
+    RECT client{};
+    GetClientRect(input, &client);
+    RECT out{};
+    if (!IntersectRect(&out, &bar, &client)) {
+        return {};
+    }
+    return out;
+}
+
+void ChatWindow::EnsureInputCaretTimer(HWND input) {
+    if (inputCaretTimer_ || GetFocus() != input) {
+        return;
+    }
+    const UINT blink = GetCaretBlinkTime();
+    if (blink == 0 || blink == INFINITE) {
+        caretOn_ = true;  // blinking is off: the bar stays
+        return;
+    }
+    if (SetTimer(input, kInputCaretTimer, blink, nullptr) != 0) {
+        inputCaretTimer_ = true;
+        caretOn_ = true;
+    }
+}
+
+void ChatWindow::StopInputCaret(HWND input) {
+    inputCaretTimer_ = false;  // a timer already queued must not bring the bar back
+    KillTimer(input, kInputCaretTimer);
+    caretOn_ = false;
+    caretHidden_ = false;
+    const RECT bar = InputCaretRect(input, caretSet_);
+    if (bar.right > bar.left) {
+        InvalidateRect(input, &bar, FALSE);
+    }
+}
+
+void ChatWindow::BlinkInputCaret(HWND input) {
+    if (!inputCaretTimer_ || GetFocus() != input) {
+        return;
+    }
+    caretOn_ = !caretOn_;
+    const RECT bar = InputCaretRect(input, caretSet_);
+    if (bar.right > bar.left) {
+        InvalidateRect(input, &bar, FALSE);
+    }
+}
+
+void ChatWindow::PaintInputCaret(HWND input) {
+    if (!caretOn_ || GetFocus() != input || caretHeight_ <= 0) {
+        return;
+    }
+    CHARRANGE sel{};
+    SendMessageW(input, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&sel));
+    if (sel.cpMin != sel.cpMax) {
+        return;  // a selection owns the line; RichEdit hides its caret too
+    }
+    const RECT bar = InputCaretRect(input, caretSet_);
+    if (bar.right <= bar.left) {
+        return;
+    }
+    HDC dc = GetDC(input);
+    const HGDIOBJ old = SelectObject(dc, GetStockObject(DC_BRUSH));
+    SetDCBrushColor(dc, ToColorRef(kPrimary));
+    FillRect(dc, &bar, static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
+    SelectObject(dc, old);
+    ReleaseDC(input, dc);
 }
 LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
@@ -3983,10 +4118,18 @@ void ChatWindow::OnCommand(WPARAM wParam, LPARAM lParam) {
     }
     const WORD code = HIWORD(wParam);
     if (code == EN_CHANGE) {
-        // Spaces and line breaks alone are nothing to send.
+        // Spaces and line breaks alone are nothing to send. The field is wiped only when the
+        // placeholder comes or goes; a full erase on every letter flashed the text.
+        const bool had = hasText_;
         hasText_ = std::ranges::any_of(FieldText(input_), [](wchar_t c) { return !std::iswspace(c); });
-        InvalidateRect(input_, nullptr, TRUE);  // the placeholder comes and goes
-        Refresh();
+        const bool blank = GetWindowTextLengthW(input_) == 0;
+        if (blank != inputBlank_) {
+            inputBlank_ = blank;
+            InvalidateRect(input_, nullptr, FALSE);
+        }
+        if (had != hasText_) {
+            Refresh();  // the send button follows
+        }
     } else if (code == EN_SETFOCUS || code == EN_KILLFOCUS) {
         inputFocused_ = code == EN_SETFOCUS;
         if (inputFocused_) {
