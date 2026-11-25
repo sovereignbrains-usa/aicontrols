@@ -951,6 +951,426 @@ void UseDarkMenus() {
     }
 }
 
+// A dark yes/no over the client. ForceDark menus do not reach MessageBox, and a card drawn in the
+// main window would sit under the input and the browser popup. Да is true. Нет is the default:
+// Escape, Alt+F4, and a click on the dimmed area.
+bool AskYesNo(HWND owner, const std::wstring& question, const std::wstring& note, ID2D1Factory* d2d,
+              IDWriteFactory* dwrite, IDWriteFontCollection* fonts, float dpi) {
+    const auto systemBox = [&]() {
+        std::wstring text = question;
+        if (!note.empty()) {
+            if (!text.empty()) {
+                text += L"\n";
+            }
+            text += note;
+        }
+        return MessageBoxW(owner, text.c_str(), L"AIControls", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES;
+    };
+    if (owner == nullptr || d2d == nullptr || dwrite == nullptr || dpi < 1.f) {
+        return systemBox();
+    }
+    const auto makeFormat = [&](float size, DWRITE_FONT_WEIGHT weight, DWRITE_TEXT_ALIGNMENT align,
+                                DWRITE_PARAGRAPH_ALIGNMENT paragraph,
+                                bool wrap) -> wil::com_ptr<IDWriteTextFormat> {
+        wil::com_ptr<IDWriteTextFormat> format;
+        if (FAILED(dwrite->CreateTextFormat(kTextFont, fonts, weight, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
+                                            size, L"ru-ru", format.put()))) {
+            return {};
+        }
+        format->SetTextAlignment(align);
+        format->SetParagraphAlignment(paragraph);
+        format->SetWordWrapping(wrap ? DWRITE_WORD_WRAPPING_WRAP : DWRITE_WORD_WRAPPING_NO_WRAP);
+        return format;
+    };
+    const auto questionFormat = makeFormat(15.f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_LEADING,
+                                           DWRITE_PARAGRAPH_ALIGNMENT_NEAR, true);
+    const auto noteFormat = makeFormat(13.f, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_LEADING,
+                                       DWRITE_PARAGRAPH_ALIGNMENT_NEAR, true);
+    const auto buttonFormat = makeFormat(13.f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER,
+                                         DWRITE_PARAGRAPH_ALIGNMENT_CENTER, false);
+    const auto markFormat = makeFormat(16.f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER,
+                                       DWRITE_PARAGRAPH_ALIGNMENT_CENTER, false);
+    if (!questionFormat || !buttonFormat || !markFormat || (!note.empty() && !noteFormat)) {
+        return systemBox();
+    }
+
+    RECT client{};
+    if (!GetClientRect(owner, &client)) {
+        return systemBox();
+    }
+    const int pxW = client.right - client.left;
+    const int pxH = client.bottom - client.top;
+    if (pxW < 80 || pxH < 80) {
+        return systemBox();
+    }
+    const float clientW = static_cast<float>(pxW) * 96.f / dpi;
+    const float clientH = static_cast<float>(pxH) * 96.f / dpi;
+
+    constexpr float kPad = 20.f;
+    constexpr float kWant = 400.f;
+    constexpr float kBtnH = 32.f;
+    constexpr float kBtnGap = 8.f;
+    constexpr float kRadius = 12.f;
+    constexpr float kBtnRadius = 8.f;
+    constexpr float kMarkR = 14.f;
+    constexpr float kScrim = 0.60f;
+    constexpr uint32_t kBorder = 0x34343a;
+    constexpr uint32_t kIdle = 0x232327;
+    constexpr uint32_t kIdleHot = 0x2e2e34;
+    constexpr uint32_t kAccentHot = 0x6aa6ff;
+
+    float cardW = std::min(kWant, clientW - 24.f);
+    if (cardW < 280.f) {
+        cardW = std::max(220.f, clientW - 16.f);
+    }
+    cardW = std::min(cardW, clientW - 8.f);
+    const float textL = kPad + kMarkR * 2.f + 14.f;
+    const float textW = std::max(40.f, cardW - textL - kPad);
+    const auto blockHeight = [&](IDWriteTextFormat* format, const std::wstring& value) {
+        if (value.empty() || format == nullptr) {
+            return 0.f;
+        }
+        wil::com_ptr<IDWriteTextLayout> layout;
+        if (FAILED(dwrite->CreateTextLayout(value.c_str(), static_cast<UINT32>(value.size()), format, textW, 4000.f,
+                                            layout.put()))) {
+            return 0.f;
+        }
+        DWRITE_TEXT_METRICS metrics{};
+        layout->GetMetrics(&metrics);
+        return std::ceil(metrics.height) + 1.f;
+    };
+    const float qH = std::max(22.f, blockHeight(questionFormat.get(), question));
+    const float nH = blockHeight(noteFormat.get(), note);
+    const float noteGap = nH > 0.f ? 8.f : 0.f;
+    const float buttonsTop = kPad + qH + noteGap + nH + 18.f;
+    float cardH = buttonsTop + kBtnH + kPad;
+    if (cardH > clientH - 16.f) {
+        cardH = std::max(80.f, clientH - 16.f);
+    }
+    const float cardL = std::max(4.f, (clientW - cardW) / 2.f);
+    const float cardT = std::max(4.f, (clientH - cardH) / 2.f);
+    float btnW = 104.f;
+    const float btnRoom = cardW - 2.f * kPad - kBtnGap;
+    if (btnRoom < btnW * 2.f) {
+        btnW = std::max(72.f, btnRoom / 2.f);
+    }
+    const float noL = cardL + cardW - kPad - btnW;
+    const float yesL = noL - kBtnGap - btnW;
+    const float btnT = cardT + buttonsTop;
+    const D2D1_RECT_F yesRect = D2D1::RectF(yesL, btnT, yesL + btnW, btnT + kBtnH);
+    const D2D1_RECT_F noRect = D2D1::RectF(noL, btnT, noL + btnW, btnT + kBtnH);
+    const D2D1_RECT_F questionRect = D2D1::RectF(cardL + textL, cardT + kPad, cardL + textL + textW, cardT + kPad + qH);
+    const D2D1_RECT_F noteRect =
+        D2D1::RectF(cardL + textL, cardT + kPad + qH + noteGap, cardL + textL + textW, cardT + kPad + qH + noteGap + nH);
+    const D2D1_POINT_2F mark{cardL + kPad + kMarkR, cardT + kPad + qH / 2.f};
+    const D2D1_RECT_F card = D2D1::RectF(cardL, cardT, cardL + cardW, cardT + cardH);
+    const auto inside = [](const D2D1_RECT_F& rect, float x, float y) {
+        return x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom;
+    };
+    const auto inCard = [&](float x, float y) {
+        return x >= card.left && x < card.right && y >= card.top && y < card.bottom;
+    };
+    const auto buttonAt = [&](float x, float y) {
+        if (inside(yesRect, x, y)) {
+            return 0;
+        }
+        if (inside(noRect, x, y)) {
+            return 1;
+        }
+        return -1;
+    };
+
+    POINT origin{};
+    ClientToScreen(owner, &origin);
+    const auto toDip = [&](POINT screen) {
+        return D2D1::Point2F(static_cast<float>(screen.x - origin.x) * 96.f / dpi,
+                             static_cast<float>(screen.y - origin.y) * 96.f / dpi);
+    };
+    const std::wstring yesLabel = L"Да";
+    const std::wstring noLabel = L"Нет";
+    const std::wstring markLabel = L"?";
+
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSEXW windowClass{sizeof(windowClass)};
+        windowClass.lpfnWndProc = DefWindowProcW;
+        windowClass.hInstance = GetModuleHandleW(nullptr);
+        windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        windowClass.lpszClassName = L"AIControlsAsk";
+        if (RegisterClassExW(&windowClass) != 0 || GetLastError() == ERROR_CLASS_ALREADY_EXISTS) {
+            registered = true;
+        }
+    }
+    if (!registered) {
+        return systemBox();
+    }
+
+    // Disabled first, so the owner cannot paint or take a click back over the question. The guard ends
+    // before a system box: a return expression runs before local destructors, so MessageBox would open
+    // while the owner is still disabled.
+    int result = -1;  // -1 system box, 0 no, 1 yes
+    {
+    struct Guard {
+        HWND owner = nullptr;
+        HWND previous = nullptr;
+        HWND dialog = nullptr;
+        bool on = false;
+        ~Guard() {
+            if (!on) {
+                return;
+            }
+            const HWND was = dialog;
+            if (dialog != nullptr) {
+                DestroyWindow(dialog);
+                dialog = nullptr;
+            }
+            EnableWindow(owner, TRUE);
+            SetForegroundWindow(owner);
+            if (previous != nullptr && previous != was && IsWindow(previous)) {
+                SetFocus(previous);
+            }
+        }
+    } guard;
+    guard.owner = owner;
+    guard.previous = GetFocus();
+    EnableWindow(owner, FALSE);
+    guard.on = true;
+    guard.dialog = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST, L"AIControlsAsk", L"", WS_POPUP,
+                                   origin.x, origin.y, pxW, pxH, owner, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (guard.dialog != nullptr) {
+        EnableWindow(guard.dialog, TRUE);  // an owned window of a disabled owner can come up disabled
+        const HWND dialog = guard.dialog;
+        int focus = 1;  // Нет, as MB_DEFBUTTON2
+        int hot = -1;
+        int pressed = -1;
+        const auto paint = [&]() -> bool {
+            BITMAPINFO info{};
+            info.bmiHeader.biSize = sizeof(info.bmiHeader);
+            info.bmiHeader.biWidth = pxW;
+            info.bmiHeader.biHeight = -pxH;
+            info.bmiHeader.biPlanes = 1;
+            info.bmiHeader.biBitCount = 32;
+            info.bmiHeader.biCompression = BI_RGB;
+            void* bits = nullptr;
+            const wil::unique_hdc memory(CreateCompatibleDC(nullptr));
+            const wil::unique_hbitmap bitmap(CreateDIBSection(memory.get(), &info, DIB_RGB_COLORS, &bits, nullptr, 0));
+            if (!memory || !bitmap || bits == nullptr) {
+                return false;
+            }
+            const auto selected = wil::SelectObject(memory.get(), bitmap.get());
+            (void)selected;
+            const D2D1_RENDER_TARGET_PROPERTIES properties = D2D1::RenderTargetProperties(
+                D2D1_RENDER_TARGET_TYPE_DEFAULT,
+                D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED), dpi, dpi);
+            wil::com_ptr<ID2D1DCRenderTarget> rt;
+            const RECT whole{0, 0, pxW, pxH};
+            if (FAILED(d2d->CreateDCRenderTarget(&properties, rt.put())) || FAILED(rt->BindDC(memory.get(), &whole))) {
+                return false;
+            }
+            wil::com_ptr<ID2D1SolidColorBrush> brush;
+            if (FAILED(rt->CreateSolidColorBrush(Color(kPrimary), brush.put())) || !brush) {
+                return false;
+            }
+            const auto premul = [](uint32_t rgb, float alpha) {
+                const float r = static_cast<float>((rgb >> 16) & 0xff) / 255.f * alpha;
+                const float g = static_cast<float>((rgb >> 8) & 0xff) / 255.f * alpha;
+                const float b = static_cast<float>(rgb & 0xff) / 255.f * alpha;
+                return D2D1::ColorF(r, g, b, alpha);
+            };
+            const auto drawText = [&](const std::wstring& value, IDWriteTextFormat* format, const D2D1_RECT_F& rect,
+                                      uint32_t rgb) {
+                if (value.empty() || format == nullptr) {
+                    return;
+                }
+                brush->SetColor(Color(rgb));
+                rt->DrawText(value.c_str(), static_cast<UINT32>(value.size()), format, rect, brush.get(),
+                             D2D1_DRAW_TEXT_OPTIONS_CLIP);
+            };
+            rt->BeginDraw();
+            rt->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+            rt->Clear(premul(kWindow, kScrim));
+            const D2D1_RECT_F box = D2D1::RectF(card.left + 0.5f, card.top + 0.5f, card.right - 0.5f, card.bottom - 0.5f);
+            brush->SetColor(Color(kCard));
+            rt->FillRoundedRectangle(D2D1::RoundedRect(box, kRadius, kRadius), brush.get());
+            brush->SetColor(Color(kBorder));
+            rt->DrawRoundedRectangle(D2D1::RoundedRect(box, kRadius, kRadius), brush.get(), 1.f);
+            brush->SetColor(Color(kAccent));
+            rt->FillEllipse(D2D1::Ellipse(mark, kMarkR, kMarkR), brush.get());
+            drawText(markLabel, markFormat.get(),
+                     D2D1::RectF(mark.x - kMarkR, mark.y - kMarkR, mark.x + kMarkR, mark.y + kMarkR), kPrimary);
+            drawText(question, questionFormat.get(), questionRect, kPrimary);
+            drawText(note, noteFormat.get(), noteRect, kSecondary);
+            const auto buttonFill = [&](const D2D1_RECT_F& rect, int index) {
+                const bool on = index == focus;
+                const bool over = index == hot;
+                uint32_t rgb = kIdle;
+                if (on && over) {
+                    rgb = kAccentHot;
+                } else if (on) {
+                    rgb = kAccent;
+                } else if (over) {
+                    rgb = kIdleHot;
+                }
+                brush->SetColor(Color(rgb));
+                rt->FillRoundedRectangle(D2D1::RoundedRect(rect, kBtnRadius, kBtnRadius), brush.get());
+            };
+            buttonFill(yesRect, 0);
+            buttonFill(noRect, 1);
+            drawText(yesLabel, buttonFormat.get(), yesRect, kPrimary);
+            drawText(noLabel, buttonFormat.get(), noRect, kPrimary);
+            if (FAILED(rt->EndDraw())) {
+                return false;
+            }
+            POINT at{origin.x, origin.y};
+            POINT zero{};
+            SIZE size{pxW, pxH};
+            BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+            return UpdateLayeredWindow(dialog, nullptr, &at, &size, memory.get(), &zero, 0, &blend, ULW_ALPHA) != FALSE;
+        };
+        if (paint()) {
+            ShowWindow(dialog, SW_SHOW);
+            SetForegroundWindow(dialog);
+            SetFocus(dialog);
+            const HCURSOR hand = LoadCursorW(nullptr, IDC_HAND);
+            const HCURSOR arrow = LoadCursorW(nullptr, IDC_ARROW);
+            bool done = false;
+            result = 0;
+            while (!done) {
+                MSG message{};
+                const BOOL got = GetMessageW(&message, nullptr, 0, 0);
+                if (got == 0) {
+                    PostQuitMessage(static_cast<int>(message.wParam));
+                    result = 0;
+                    break;
+                }
+                if (got < 0) {
+                    result = 0;
+                    break;
+                }
+                bool dispatch = true;
+                const bool ours = message.hwnd == dialog;
+                switch (message.message) {
+                case WM_MOUSEMOVE:
+                    if (ours) {
+                        dispatch = false;
+                        const D2D1_POINT_2F at = toDip(message.pt);
+                        const int over = buttonAt(at.x, at.y);
+                        const int newFocus = over >= 0 ? over : focus;
+                        if (over != hot || newFocus != focus) {
+                            hot = over;
+                            focus = newFocus;
+                            paint();
+                        }
+                        SetCursor(over >= 0 ? hand : arrow);
+                    }
+                    break;
+                case WM_LBUTTONDOWN:
+                    if (ours) {
+                        dispatch = false;
+                        SetFocus(dialog);
+                        const D2D1_POINT_2F at = toDip(message.pt);
+                        const int over = buttonAt(at.x, at.y);
+                        if (over >= 0) {
+                            pressed = over;
+                            if (focus != over || hot != over) {
+                                focus = over;
+                                hot = over;
+                                paint();
+                            }
+                        } else if (!inCard(at.x, at.y)) {
+                            result = 0;
+                            done = true;
+                        } else {
+                            pressed = -1;
+                        }
+                    }
+                    break;
+                case WM_LBUTTONUP:
+                    if (ours) {
+                        dispatch = false;
+                        const D2D1_POINT_2F at = toDip(message.pt);
+                        const int over = buttonAt(at.x, at.y);
+                        if (pressed >= 0 && pressed == over) {
+                            result = pressed == 0 ? 1 : 0;
+                            done = true;
+                        }
+                        pressed = -1;
+                    }
+                    break;
+                case WM_KEYDOWN:
+                case WM_SYSKEYDOWN:
+                    if (ours || message.hwnd == owner || message.hwnd == nullptr) {
+                        dispatch = false;
+                        switch (message.wParam) {
+                        case VK_ESCAPE:
+                            result = 0;
+                            done = true;
+                            break;
+                        case VK_F4:
+                            if (message.message == WM_SYSKEYDOWN) {
+                                result = 0;
+                                done = true;
+                            }
+                            break;
+                        case VK_RETURN:
+                        case VK_SPACE:
+                            result = focus == 0 ? 1 : 0;
+                            done = true;
+                            break;
+                        case VK_LEFT:
+                        case VK_RIGHT:
+                        case VK_TAB:
+                            focus = focus == 0 ? 1 : 0;
+                            paint();
+                            break;
+                        default:
+                            break;
+                        }
+                    }
+                    break;
+                case WM_CLOSE:
+                    if (ours) {
+                        dispatch = false;
+                        result = 0;
+                        done = true;
+                    }
+                    break;
+                case WM_KEYUP:
+                case WM_SYSKEYUP:
+                case WM_CHAR:
+                case WM_SYSCHAR:
+                case WM_MOUSEWHEEL:
+                case WM_MOUSEHWHEEL:
+                case WM_LBUTTONDBLCLK:
+                case WM_RBUTTONDOWN:
+                case WM_RBUTTONUP:
+                case WM_RBUTTONDBLCLK:
+                case WM_MBUTTONDOWN:
+                case WM_MBUTTONUP:
+                    if (ours) {
+                        dispatch = false;
+                    }
+                    break;
+                default:
+                    break;
+                }
+                if (dispatch) {
+                    TranslateMessage(&message);
+                    DispatchMessageW(&message);
+                }
+                if (!IsWindow(dialog)) {
+                    result = 0;
+                    break;
+                }
+            }
+        }
+    }
+    }
+    if (result < 0) {
+        return systemBox();
+    }
+    return result == 1;
+}
 class ChatWindow {
 public:
     explicit ChatWindow(HINSTANCE instance) : instance_(instance) {}
@@ -1139,8 +1559,6 @@ private:
     void OnSetupEvent(const SetupEvent& event);
     void CheckClaudeVersions(bool grokAsked = false);
     void OnClaudeVersions(const ClaudeVersions& versions);
-    std::wstring AccountName() const;
-    std::wstring AccountPlan() const;
 
     // The terminal at the right: PowerShell in a pseudo console, drawn from the emulator's screen.
     struct TermPoint {
@@ -3246,9 +3664,10 @@ void ChatWindow::OnClick(float x, float y) {
         ShowWindow(hwnd_, IsZoomed(hwnd_) ? SW_RESTORE : SW_MAXIMIZE);
         return;
     case Target::WinClose: {  // asked first: the cross is easy to hit by mistake (the updater closes unasked)
-        const std::wstring question = AnyBusy() ? L"Закрыть AIControls?\nЧаты, которые сейчас отвечают, оборвутся."
-                                                : std::wstring(L"Закрыть AIControls?");
-        if (MessageBoxW(hwnd_, question.c_str(), L"AIControls", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES) {
+        HideTip();
+        if (AskYesNo(hwnd_, L"Закрыть AIControls?",
+                     AnyBusy() ? L"Чаты, которые сейчас отвечают, оборвутся." : L"", d2d_.get(), dwrite_.get(),
+                     fonts_.get(), Dpi())) {
             PostMessageW(hwnd_, WM_CLOSE, 0, 0);
         }
         return;
@@ -7172,23 +7591,6 @@ void ChatWindow::PaintTerminal(const Geometry& g) {
 
 // ---- The account --------------------------------------------------------------------------------
 
-std::wstring ChatWindow::AccountName() const {
-    std::string email = auth_.email;
-    if (email.empty()) {
-        return userName_.empty() ? std::wstring(L"Аккаунт") : ToWide(userName_);
-    }
-    return ToWide(email.substr(0, email.find('@')));
-}
-
-std::wstring ChatWindow::AccountPlan() const {
-    if (auth_.plan.empty()) {
-        return {};
-    }
-    std::wstring plan = ToWide(auth_.plan);
-    plan[0] = static_cast<wchar_t>(std::towupper(plan[0]));
-    return plan;
-}
-
 void ChatWindow::RefreshAuth() {
     if (authWorking_) {
         authAgain_ = true;
@@ -7538,8 +7940,7 @@ void ChatWindow::ShowAccountMenu() {
     POINT screen{ToPx(g.account.left + 8.f), ToPx(g.account.top)};
     ClientToScreen(hwnd_, &screen);
     wil::unique_hmenu menu(CreatePopupMenu());
-    const std::wstring who = auth_.email.empty() ? AccountName() : ToWide(auth_.email);
-    AppendMenuW(menu.get(), MF_STRING | MF_GRAYED, 1, who.c_str());
+    AppendMenuW(menu.get(), MF_STRING | MF_GRAYED, 1, L"Аккаунты");
     AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
     // Name on the left, version or action in the dim column. One command per program.
     const auto versionRow = [](const wchar_t* name, const std::string& installed, const std::string& latest,
@@ -8969,7 +9370,7 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
         Text(UpdateLabel(), button_.get(), g.update, kPrimary);
     }
 
-    {  // the account, at the bottom: who is signed in and the plan, or the way to sign in
+    {  // the accounts, at the bottom: no one login and no plan (those differ per service)
         Line({g.sidebar.left, g.account.top - 4.f}, {g.sidebar.right, g.account.top - 4.f}, kLine, 1.f);
         const bool hovered = hover_.target == Target::Account;
         if (hovered) {
@@ -8985,27 +9386,17 @@ void ChatWindow::PaintSidebar(const Geometry& g) {
             Text(L"Войти в аккаунт", ui_.get(),
                  D2D1::RectF(g.account.left + 44, g.account.top, g.account.right - 8, g.account.bottom), kAccent);
         } else {
-            // One line, as in Claude's app: "name · plan", the plan quieter.
-            const std::wstring name = AccountName();
-            brush_->SetColor(Color(0x7a5af8));
-            target_->FillEllipse(D2D1::Ellipse(c, 10.f, 10.f), brush_.get());
-            Text(std::wstring(1, static_cast<wchar_t>(std::towupper(name[0]))), badge_.get(),
-                 D2D1::RectF(c.x - 10, c.y - 10, c.x + 10, c.y + 10), kPrimary);
-            const std::wstring plan = AccountPlan();
-            const float nameLeft = g.account.left + 40;
-            const float room = g.account.right - 8 - nameLeft;
-            const std::wstring tail = plan.empty() ? std::wstring() : L" · " + plan;
-            const float tailWidth = tail.empty() ? 0.f : TextWidth(tail, ui_.get());
-            const float nameWidth = std::min(TextWidth(name, ui_.get()), std::max(0.f, room - tailWidth));
-            Text(name, ui_.get(), D2D1::RectF(nameLeft, g.account.top, nameLeft + nameWidth, g.account.bottom), kPrimary);
-            if (!tail.empty()) {
-                Text(tail, ui_.get(),
-                     D2D1::RectF(nameLeft + nameWidth, g.account.top, nameLeft + nameWidth + tailWidth, g.account.bottom),
-                     kSecondary);
-            }
+            // One mark for every account: logins and plans differ per service.
+            brush_->SetColor(Color(kLine));
+            target_->FillEllipse(D2D1::Ellipse(c, 12.f, 12.f), brush_.get());
+            const uint32_t ink = hovered ? kPrimary : kSecondary;
+            brush_->SetColor(Color(ink));
+            target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(c.x, c.y - 3.5f), 2.5f, 2.5f), brush_.get());
+            Fill(D2D1::RectF(c.x - 5.2f, c.y + 0.4f, c.x + 5.2f, c.y + 7.6f), 4.6f, ink);
+            Text(L"Аккаунты", ui_.get(),
+                 D2D1::RectF(g.account.left + 44, g.account.top, g.account.right - 8, g.account.bottom), kPrimary);
         }
     }
-
     {  // the way to the secrets
         const bool active = hover_.target == Target::Secrets;
         if (active) {
@@ -11859,15 +12250,15 @@ std::wstring ChatWindow::TooltipText() {
         return L"Поиск (Ctrl+H): стрелки, Enter, влево свернуть. Alt+↑↓ чаты, Alt+←→ проекты";
     case Target::Account:
         if (ClaudeUpdateAvailable() && GrokUpdateAvailable()) {
-            return L"Аккаунт · вышли Claude " + ToWide(claudeLatest_) + L" и Grok " + ToWide(grokLatest_);
+            return L"Аккаунты · вышли Claude " + ToWide(claudeLatest_) + L" и Grok " + ToWide(grokLatest_);
         }
         if (ClaudeUpdateAvailable()) {
-            return L"Аккаунт · вышел Claude " + ToWide(claudeLatest_);
+            return L"Аккаунты · вышел Claude " + ToWide(claudeLatest_);
         }
         if (GrokUpdateAvailable()) {
-            return L"Аккаунт · вышел Grok " + ToWide(grokLatest_);
+            return L"Аккаунты · вышел Grok " + ToWide(grokLatest_);
         }
-        return L"Аккаунт, подключения, уведомления, версии Claude и Grok";
+        return L"Аккаунты, подключения, уведомления, версии Claude и Grok";
     case Target::ConnectSignOut:
         if (hover_.row == kGrokLink) {
             return L"Выйти только из Grok. Claude и GitHub останутся";
