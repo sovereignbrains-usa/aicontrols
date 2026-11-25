@@ -2,7 +2,7 @@
 
 # AIControls
 
-[![release 0.1.131](https://img.shields.io/badge/release-0.1.131-4c92ff)](https://github.com/sovereignbrains/aicontrols/releases)
+[![release 0.1.132](https://img.shields.io/badge/release-0.1.132-4c92ff)](https://github.com/sovereignbrains/aicontrols/releases)
 [![MIT](https://img.shields.io/github/license/sovereignbrains/aicontrols)](LICENSE)
 [![build](https://github.com/sovereignbrains/aicontrols/actions/workflows/build.yml/badge.svg)](https://github.com/sovereignbrains/aicontrols/actions/workflows/build.yml)
 
@@ -13,7 +13,7 @@ C++23, Win32, Direct2D и DirectWrite. Без Electron, один exe.
 > Не официальный продукт Anthropic или xAI. «Claude» — товарный знак Anthropic.
 > Клиент запускает установленные у вас `claude.exe` и `grok.exe` и разговаривает с ними.
 
-Текущая сборка — **0.1.131**.
+Текущая сборка — **0.1.132**.
 
 ## Что умеет
 
@@ -52,7 +52,7 @@ C++23, Win32, Direct2D и DirectWrite. Без Electron, один exe.
   Под адресом — закладки облачных ИИ (ChatGPT, Claude, Gemini, Grok, Qwen, DeepSeek…); звёздочка в поле добавляет страницу,
   правая кнопка — порядок и удаление, средняя — в новой вкладке. Входы в аккаунты хранит профиль браузера.
 - Жучок внизу панели — журнал сбоев: красные строки чатов, ошибки браузера и названий, падения клиента из отчётов Windows.
-  Красная точка — есть непросмотренное; «Разобрать в чате» кладёт журнал в сообщение.
+  Красная точка — есть неразобранные; «Разобрать новые» кладёт только их в сообщение и помечает разобранными.
 - Полосы прокрутки тянутся мышью, средняя кнопка прокручивает, как в браузере. Своя шапка вместо заголовка окна.
 - Обновляется само. Скачанный установщик сверяйте с `.sha256` рядом с ним.
   После установки открывается тот же чат.
@@ -76,7 +76,7 @@ C++23, Win32, Direct2D и DirectWrite. Без Electron, один exe.
 
 Настройки — `%APPDATA%\AIControls\settings.json`, секреты — `%APPDATA%\AIControls\secrets.bin`,
 связка частей одного чата — `%APPDATA%\AIControls\chats.json`.
-Журнал сбоев — `%LOCALAPPDATA%\AIControls\journal.jsonl` (и страница `journal.html` рядом),
+Журнал сбоев — `%LOCALAPPDATA%\AIControls\journal.jsonl`,
 закладки — `%LOCALAPPDATA%\AIControls\bookmarks.json` и значки сайтов в `favicons\`.
 Сами чаты лежат у CLI: Claude — `%USERPROFILE%\.claude\projects`, Grok — `%USERPROFILE%\.grok\sessions`.
 

@@ -584,7 +584,7 @@ Limit Current(const Limit& limit) {
 }
 
 // The lists that scroll: each has a bar at its right edge to be dragged, and scrolls under the middle button.
-enum class Scroller { None, Feed, Sidebar, Secrets, Terminal, Input };
+enum class Scroller { None, Feed, Sidebar, Secrets, Terminal, Journal, Input };
 
 // A list's scrollbar as laid out now: the strip a press takes, the thumb in it, and where the list is, in its
 // own units (DIPs for the feed, rows or lines for the others).
@@ -1586,6 +1586,7 @@ private:
         bool browser = false;      // a browser tab (no shell). Page 0 is the one the tool drives
         int browserPage = 0;       // which page of the browser this tab shows; the "+" opens 1, 2, ...
         std::string server;        // user@host[:port]: the tab runs ssh to it instead of PowerShell
+        bool journal = false;      // the failures journal: drawn here, no shell and no page
     };
     TermTab* Tab() const { return activeTab_ < tabs_.size() ? tabs_[activeTab_].get() : nullptr; }
     VtScreen* Screen() const { return Tab() != nullptr ? Tab()->screen.get() : nullptr; }
@@ -1624,8 +1625,10 @@ private:
     bool PreviewOwnsControls() const { return PreviewShown() && previewControls_; }
     // The browser tab: the agent's page (the browser tool), in the same column.
     bool BrowserShown() const { return terminalOpen_ && Tab() != nullptr && Tab()->browser; }
+    // The failures journal, in the same column as a shell. Not a page: the window draws it.
+    bool JournalShown() const { return terminalOpen_ && Tab() != nullptr && Tab()->journal; }
     bool ShellShown() const {
-        return terminalOpen_ && Tab() != nullptr && !Tab()->browser && Tab()->preview.empty();
+        return terminalOpen_ && Tab() != nullptr && !Tab()->browser && Tab()->preview.empty() && !Tab()->journal;
     }
     void ShowBrowserTab();
     void ShowShellTab();
@@ -1661,7 +1664,7 @@ private:
     }  // Ctrl+click in the page: the element goes into the message
     // Wide: the sidebar goes and the chat keeps only a strip, the rest is the preview's; again: as it was.
     void SetPreviewWide(bool wide);
-    float MinChat() const { return PreviewShown() || BrowserShown() ? kMinChatPreview : kMinChat; }
+    float MinChat() const { return PreviewShown() || BrowserShown() || JournalShown() ? kMinChatPreview : kMinChat; }
 
     // The sidebar: search, the way to the secrets, the projects with their chats (or the secrets view in their
     // place). A project is a folder its chats work in; the general chats are always last, under the projects.
@@ -1910,6 +1913,7 @@ private:
     void FillGallery();  // --gallery: one sample of every kind of feed item, awkward data included
     bool gallery_ = false;
     bool galleryConnect_ = false;  // --gallery connect: the connect screen instead, its rows in each state
+    bool galleryJournal_ = false;  // --gallery journal: the failure list, beside the sample chat
     void Restart();
     void ResetChat();
     void NewChat();
@@ -2080,8 +2084,24 @@ private:
     std::thread voiceThread_;
     std::atomic<bool> usageRunning_ = false;
     std::thread memoryThread_;
-    size_t journalUnseen_ = 0;  // the bug's red dot: entries since the journal was last opened
+    size_t journalUnseen_ = 0;  // the bug's red dot: lines not reviewed yet (opening the journal does not clear it)
+    uint64_t journalGen_ = std::numeric_limits<uint64_t>::max();        // generation the dot was last synced to
+    uint64_t journalGroupsGen_ = std::numeric_limits<uint64_t>::max();  // generation the cards were read at
+    std::vector<JournalGroup> journalGroups_;
+    float journalScroll_ = 0.f;   // dips from the top of the cards
+    float journalContent_ = 0.f;  // the cards' full height, dips
+    struct JournalCard {
+        D2D1_RECT_F rect{};
+        size_t index = 0;  // into journalGroups_
+    };
+    std::vector<JournalCard> journalHits_;  // cards that were on screen last paint
     void OpenJournal();
+    void ReviewNewInChat();
+    void ClearJournalAsk(bool reviewedOnly);
+    void ShowJournalMenu(POINT screen, size_t index);
+    void PaintJournal(const Geometry& g);
+    std::optional<size_t> JournalCardAt(float x, float y) const;
+    void CopyJournalCard(size_t index);
     std::thread titleThread_;  // naming a chat after its first answer (title_writer)
     std::atomic<bool> titleCancel_ = false;
     std::atomic<bool> titling_ = false;
@@ -2306,6 +2326,7 @@ int ChatWindow::Run(int show) {
         for (int i = 1; args && i < count; ++i) {
             gallery_ = gallery_ || std::wstring_view(args.get()[i]) == L"--gallery";
             galleryConnect_ = galleryConnect_ || (gallery_ && std::wstring_view(args.get()[i]) == L"connect");
+            galleryJournal_ = galleryJournal_ || (gallery_ && std::wstring_view(args.get()[i]) == L"journal");
         }
     }
     SetSettingsReadOnly(gallery_);
@@ -2397,6 +2418,10 @@ int ChatWindow::Run(int show) {
     SetWindowPos(hwnd_, nullptr, 0, 0, ToPx(1000.f), ToPx(840.f), SWP_NOMOVE | SWP_NOZORDER);
     ShowWindow(hwnd_, show);
     UpdateWindow(hwnd_);
+    if (galleryJournal_) {
+        SetWindowTextW(hwnd_, L"AIControls — журнал");
+        SetWindowPos(hwnd_, HWND_TOP, 60, 40, 0, 0, SWP_NOSIZE | SWP_SHOWWINDOW);
+    }
     if (!fonts_) {
         Add(Kind::Error, L"Встроенные шрифты не загрузились — показываю системным.");
     }
@@ -3131,7 +3156,7 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         if (LOWORD(lParam) == HTCLIENT && reinterpret_cast<HWND>(wParam) == hwnd_) {
             const bool clickable = hover_.target != Target::None && hover_.target != Target::InsidePopup &&
                                    hover_.target != Target::TermScreen && hover_.target != Target::ScrollBar;
-            bool text = hover_.target == Target::TermScreen;
+            bool text = hover_.target == Target::TermScreen && !JournalShown();
             bool link = false;
             if (hover_.target == Target::None && popup_ == Popup::None && HasConversation()) {  // over the feed: text
                 POINT cursor{};
@@ -3327,7 +3352,11 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
             return whole;
         };
         if (popup_ == Popup::None && Inside(g.term, ToDip(at.x), ToDip(at.y))) {
-            ScrollTerminal(-static_cast<long long>(std::lround(steps * 3)));
+            if (JournalShown()) {
+                ScrollTo(Scroller::Journal, journalScroll_ + steps * 64.f);
+            } else {
+                ScrollTerminal(-static_cast<long long>(std::lround(steps * 3)));
+            }
         } else if (popup_ == Popup::None && secretsOpen_ && Inside(g.panel, ToDip(at.x), ToDip(at.y))) {
             const auto moved = static_cast<long long>(secretsFirst_) + wholeRows(2.f);
             secretsFirst_ = ClampFirst(static_cast<size_t>(std::max<long long>(moved, 0)), SecretLines().size(),
@@ -3386,6 +3415,22 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         break;
     case WM_RBUTTONUP:
         if (std::exchange(panEndedByPress_, false)) {
+            return 0;
+        }
+        if (popup_ == Popup::None && JournalShown() &&
+            HitTest(CursorDip(lParam).x, CursorDip(lParam).y).target == Target::TermScreen) {
+            POINT screen{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+            ClientToScreen(hwnd_, &screen);
+            const D2D1_POINT_2F at = CursorDip(lParam);
+            if (const std::optional<size_t> card = JournalCardAt(at.x, at.y)) {
+                wil::unique_hmenu menu(CreatePopupMenu());
+                AppendMenuW(menu.get(), MF_STRING, 1, L"Копировать");
+                if (Menu(menu.get(), screen) == 1) {
+                    CopyJournalCard(*card);
+                }
+            } else {
+                ShowJournalMenu(screen, activeTab_);
+            }
             return 0;
         }
         if (popup_ == Popup::None && Screen() &&
@@ -4381,7 +4426,7 @@ Geometry ChatWindow::Layout() const {
         const float stripTop = buttonTop;
         const float stripBottom = buttonTop + kButton;
         const float stripLeft = std::max(g.browserBtn.right + 12.f, g.term.left + 12.f);  // right of a sidebar beside it
-        const bool wide = (PreviewShown() || BrowserShown() || previewWide_) && !PreviewOwnsControls();
+        const bool wide = (PreviewShown() || BrowserShown() || JournalShown() || previewWide_) && !PreviewOwnsControls();
         // Not under the header's buttons at the right (a panel widened over the window reaches them).
         const float headerLimit =
             (g.memory.right > g.memory.left ? g.memory.left : (g.update.right > g.update.left ? g.update.left : g.winMin.left)) - 8.f;
@@ -4529,7 +4574,7 @@ Hit ChatWindow::HitTest(float x, float y) const {
     }
     if (popup_ == Popup::None) {  // a list's scrollbar: before its rows, which reach under it
         for (const Scroller s : {Scroller::Feed, Scroller::Sidebar, Scroller::Secrets, Scroller::Terminal,
-                                 Scroller::Input}) {
+                                 Scroller::Journal, Scroller::Input}) {
             if (const auto bar = Bar(g, s); bar && Inside(bar->strip, x, y)) {
                 return {Target::ScrollBar, static_cast<size_t>(s)};
             }
@@ -5562,6 +5607,15 @@ void ChatWindow::Paint() {
     EnsureTarget();
     if (!target_) {
         return;
+    }
+    // A write from another thread (the browser, a title) lights the dot without waiting for this window to notice.
+    const uint64_t journalSeen = JournalGeneration();
+    if (journalSeen != journalGen_) {
+        const size_t unseen = JournalUnseen();
+        if (JournalGeneration() == journalSeen) {  // a write landed during the count: look again next paint
+            journalGen_ = journalSeen;
+            journalUnseen_ = unseen;
+        }
     }
     const Geometry g = Layout();
     target_->BeginDraw();
@@ -7077,6 +7131,9 @@ std::wstring ChatWindow::TabLabel(const TermTab& tab) const {
         }
         return tab.browserPage == 0 ? L"Браузер" : std::format(L"Браузер {}", tab.number);
     }
+    if (tab.journal) {
+        return L"Журнал";
+    }
     if (!tab.preview.empty()) {
         return L"Превью · " + std::filesystem::path(tab.preview).filename().wstring();
     }
@@ -7093,7 +7150,9 @@ void ChatWindow::AddTerminalTab(const std::string& server) {
     auto tab = std::make_unique<TermTab>();
     tab->server = server;
     int number = 1;  // the lowest number not in use; a browser's number is its own
-    while (std::ranges::any_of(tabs_, [&](const auto& other) { return !other->browser && other->number == number; })) {
+    while (std::ranges::any_of(tabs_, [&](const auto& other) {
+               return !other->browser && !other->journal && other->number == number;
+           })) {
         ++number;
     }
     tab->number = number;
@@ -7195,6 +7254,8 @@ void ChatWindow::CloseTerminalTab(size_t index) {
     }
     activeTab_ = std::min(activeTab_, tabs_.size() - 1);
     PlacePreview();
+    // The preview's own menu closes a tab without selecting again, so the focus follows the tab that remains.
+    termFocus_ = !PreviewShown() && !BrowserShown() && !JournalShown();
     Refresh();
 }
 
@@ -7204,7 +7265,7 @@ void ChatWindow::SelectTerminalTab(size_t index) {
         selAnchor_.reset();
         selEnd_.reset();
     }
-    termFocus_ = !PreviewShown() && !BrowserShown();  // the page takes its own clicks and keys
+    termFocus_ = !PreviewShown() && !BrowserShown() && !JournalShown();  // the page takes its own clicks and keys
     searchFocus_ = false;
     SetFocus(hwnd_);
     PlacePreview();
@@ -7225,9 +7286,9 @@ void ChatWindow::SetTerminalOpen(bool open) {
             AddTerminalTab();
         }
         SyncTerminalSize();
-        termFocus_ = true;
+        termFocus_ = !JournalShown() && !PreviewShown() && !BrowserShown();
         searchFocus_ = false;
-        SetFocus(hwnd_);
+        SetFocus(termFocus_ ? hwnd_ : input_);
     } else {
         termFocus_ = false;
         selecting_ = false;
@@ -7305,7 +7366,7 @@ void ChatWindow::OnTermChar(wchar_t c) {
         termSwallowChar_ = false;
         return;
     }
-    if (Tab() == nullptr) {
+    if (Tab() == nullptr || Tab()->journal) {  // a journal tab has no shell to restart
         return;
     }
     if (Tab()->exited) {
@@ -7334,7 +7395,7 @@ void ChatWindow::OnTermChar(wchar_t c) {
 }
 
 void ChatWindow::OnTermKey(WPARAM key) {
-    if (Tab() == nullptr) {
+    if (Tab() == nullptr || Tab()->journal) {
         return;
     }
     if (Tab()->exited) {
@@ -7589,6 +7650,10 @@ void ChatWindow::PaintTerminal(const Geometry& g) {
             Line(tip, {tip.x + back * sx * 3.5f, tip.y}, color, 1.4f);
             Line(tip, {tip.x, tip.y + back * sy * 3.5f}, color, 1.4f);
         }
+    }
+    if (JournalShown()) {
+        PaintJournal(g);
+        return;
     }
     if (!Screen()) {
         if (BrowserShown() && browserView_) {
@@ -10205,6 +10270,21 @@ std::optional<ScrollBar> ChatWindow::Bar(const Geometry& g, Scroller s) const {
         view = static_cast<float>(fit);
         break;
     }
+    case Scroller::Journal: {
+        if (!JournalShown() || g.term.right <= g.term.left) {
+            return std::nullopt;
+        }
+        view = g.termScreen.bottom - g.termScreen.top;
+        max = journalContent_ - view;
+        if (max <= 0.5f) {  // before the shared check: a short list has no bar, and must not divide by a tiny max
+            return std::nullopt;
+        }
+        right = g.term.right - 6.f;
+        top = g.termScreen.top;
+        bottom = g.termScreen.bottom;
+        pos = journalScroll_;
+        break;
+    }
     case Scroller::None:
         return std::nullopt;
     }
@@ -10226,7 +10306,7 @@ std::optional<ScrollBar> ChatWindow::Bar(const Geometry& g, Scroller s) const {
 Scroller ChatWindow::ScrollerAt(const Geometry& g, float x, float y) const {
     Scroller s = Scroller::None;
     if (Inside(g.term, x, y)) {
-        s = Scroller::Terminal;
+        s = JournalShown() ? Scroller::Journal : Scroller::Terminal;
     } else if (Inside(g.sidebar, x, y)) {
         s = secretsOpen_ ? Scroller::Secrets : Scroller::Sidebar;
     } else if (Inside(g.feed, x, y)) {
@@ -10261,6 +10341,13 @@ void ChatWindow::ScrollTo(Scroller s, float pos) {
             SendMessageW(input_, EM_SETSCROLLPOS, 0, reinterpret_cast<LPARAM>(&to));
         }
         break;
+    case Scroller::Journal: {
+        const Geometry g = Layout();
+        const float view = g.termScreen.bottom - g.termScreen.top;
+        const float most = std::max(0.f, journalContent_ - view);
+        journalScroll_ = std::clamp(pos, 0.f, most);
+        break;
+    }
     case Scroller::None:
         return;
     }
@@ -10278,6 +10365,7 @@ void ChatWindow::ScrollDips(Scroller s, float dips) {
     const float unit = s == Scroller::Sidebar ? kHistoryRow
                        : s == Scroller::Secrets ? kSecretRow
                        : s == Scroller::Input   ? std::max(1.f, ToDip(inputLinePx_))
+                       : s == Scroller::Journal ? 1.f
                                                 : cellH_;
     panRemainder_ += dips / unit;
     const float whole = std::trunc(panRemainder_);
@@ -11647,7 +11735,7 @@ void ChatWindow::PlacePreview() {
 void ChatWindow::ShowShellTab() {
     size_t at = tabs_.size();
     for (size_t i = 0; i < tabs_.size(); ++i) {
-        if (!tabs_[i]->browser && tabs_[i]->preview.empty()) {
+        if (!tabs_[i]->browser && tabs_[i]->preview.empty() && !tabs_[i]->journal) {
             at = i;
             break;
         }
@@ -11849,12 +11937,6 @@ void ChatWindow::OnPreviewMessage(const std::wstring& message) {
             SetPreviewWide(!previewWide_);
         } else if (command == "minimize") {
             ShowWindow(hwnd_, SW_MINIMIZE);
-        } else if (command == "journal-chat" && tab->preview == JournalPage()) {  // only the journal's own page
-            const std::wstring text = L"Разбери сбои из журнала AIControls (" + JournalFile() + L"):\n\n" + JournalText();
-            termFocus_ = false;
-            SetFocus(input_);
-            SendMessageW(input_, EM_REPLACESEL, TRUE, reinterpret_cast<LPARAM>(text.c_str()));
-            Flash(L"Журнал в сообщении: отправь, когда допишешь");
         }
         return;
     }
@@ -12020,14 +12102,254 @@ void ChatWindow::SaveMemoryNow() {
 // a run; the user's own title (a rename, meanwhile too) is never replaced.
 void ChatWindow::OpenJournal() {
     ImportCrashReports();  // a crash of a client still open beside this one, or one since the start
-    MarkJournalSeen();
-    journalUnseen_ = 0;
-    if (!WriteJournalPage()) {
-        Flash(L"Журнал не открылся: не записать " + JournalPage());
+    const uint64_t seen = JournalGeneration();
+    journalUnseen_ = JournalUnseen();  // opening does not review: the dot stays until the lines are taken or marked
+    if (JournalGeneration() == seen) {
+        journalGen_ = seen;
+    }
+    size_t index = tabs_.size();
+    for (size_t i = 0; i < tabs_.size(); ++i) {
+        if (tabs_[i]->journal) {
+            index = i;
+            break;
+        }
+    }
+    if (index == tabs_.size()) {
+        auto tab = std::make_unique<TermTab>();
+        tab->journal = true;
+        tab->number = 0;  // not a shell's number; AddTerminalTab skips this tab
+        tab->id = ++nextTabId_;
+        tabs_.push_back(std::move(tab));
+        index = tabs_.size() - 1;
+    }
+    activeTab_ = index;
+    selAnchor_.reset();
+    selEnd_.reset();
+    if (!terminalOpen_) {
+        SetTerminalOpen(true);  // the tab is already there, so this does not start a shell
+    } else {
+        SelectTerminalTab(activeTab_);
+    }
+    termFocus_ = false;
+    searchFocus_ = false;
+    SetFocus(input_);  // "Разобрать" writes into the message; the column stays beside the chat
+    Refresh();
+}
+
+// The unreviewed lines, collapsed, into the message. Taking them is what reviews them.
+void ChatWindow::ReviewNewInChat() {
+    const std::wstring text = TakeNewJournal();
+    if (text.empty()) {
+        // An empty take with lines still unreviewed is a rewrite that did not land, not an empty journal.
+        Flash(JournalUnseen() == 0 ? L"Новых сбоев нет" : L"Журнал не записался: попробуй ещё раз");
+    } else {
+        const std::wstring message = L"Разбери новые сбои из журнала AIControls:\n\n" + text;
+        termFocus_ = false;
+        SetFocus(input_);
+        SendMessageW(input_, EM_REPLACESEL, TRUE, reinterpret_cast<LPARAM>(message.c_str()));
+        Flash(L"Новые сбои в сообщении: отправь, когда допишешь");
+    }
+    const uint64_t seen = JournalGeneration();
+    journalUnseen_ = JournalUnseen();
+    if (JournalGeneration() == seen) {
+        journalGen_ = seen;
+    }
+    journalGroupsGen_ = std::numeric_limits<uint64_t>::max();
+    Refresh();
+}
+
+void ChatWindow::ClearJournalAsk(bool reviewedOnly) {
+    const wchar_t* question = reviewedOnly ? L"Очистить разобранные?" : L"Очистить журнал?";
+    const wchar_t* note = reviewedOnly ? L"Нет, новые останутся." : L"Нет, новые тоже удалятся.";
+    if (!AskYesNo(hwnd_, question, note, d2d_.get(), dwrite_.get(), fonts_.get(), Dpi())) {
         return;
     }
-    OpenPreview(JournalPage());
+    if (ClearJournal(reviewedOnly) > 0) {
+        journalScroll_ = 0.f;
+    }
+    const uint64_t seen = JournalGeneration();
+    journalUnseen_ = JournalUnseen();
+    if (JournalGeneration() == seen) {
+        journalGen_ = seen;
+    }
+    journalGroupsGen_ = std::numeric_limits<uint64_t>::max();
     Refresh();
+}
+
+void ChatWindow::ShowJournalMenu(POINT screen, size_t index) {
+    const std::vector<JournalGroup> groups = ReadJournalGroups();
+    const bool anyFresh = JournalUnseen() > 0;
+    const bool anyReviewed = std::ranges::any_of(groups, [](const JournalGroup& group) { return group.count > group.fresh; });
+    constexpr UINT kReview = 1, kClearReviewed = 2, kClearAll = 3, kClose = 4;
+    wil::unique_hmenu menu(CreatePopupMenu());
+    AppendMenuW(menu.get(), anyFresh ? MF_STRING : MF_STRING | MF_GRAYED, kReview, L"Разобрать новые");
+    AppendMenuW(menu.get(), anyReviewed ? MF_STRING : MF_STRING | MF_GRAYED, kClearReviewed, L"Очистить разобранные");
+    AppendMenuW(menu.get(), groups.empty() ? MF_STRING | MF_GRAYED : MF_STRING, kClearAll, L"Очистить всё");
+    AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu.get(), MF_STRING, kClose, L"Закрыть");
+    switch (Menu(menu.get(), screen)) {
+    case kReview:
+        ReviewNewInChat();
+        break;
+    case kClearReviewed:
+        ClearJournalAsk(true);
+        break;
+    case kClearAll:
+        ClearJournalAsk(false);
+        break;
+    case kClose:
+        CloseTerminalTab(index);
+        if (terminalOpen_) {
+            SelectTerminalTab(activeTab_);
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+std::optional<size_t> ChatWindow::JournalCardAt(float x, float y) const {
+    for (const JournalCard& card : journalHits_) {
+        if (Inside(card.rect, x, y)) {
+            return card.index;
+        }
+    }
+    return std::nullopt;
+}
+
+void ChatWindow::CopyJournalCard(size_t index) {
+    if (index >= journalGroups_.size()) {
+        return;
+    }
+    if (SetClipboardText(hwnd_, journalGroups_[index].text)) {
+        Flash(L"Скопировано");
+    }
+}
+
+// Cards in the column: newest group first, the same source and text collapsed. Scroll is dips, not the shell's lines.
+void ChatWindow::PaintJournal(const Geometry& g) {
+    if (journalGroupsGen_ != journalGen_) {
+        const uint64_t seen = JournalGeneration();
+        journalGroups_ = ReadJournalGroups();
+        if (JournalGeneration() == seen) {
+            journalGroupsGen_ = seen;
+        }
+    }
+    journalHits_.clear();
+    const D2D1_RECT_F screen = g.termScreen;
+    const float cardLeft = screen.left;
+    const float cardRight = screen.right - kBarStrip;  // the bar's strip starts two dips further right
+    if (cardRight <= cardLeft + 48.f) {
+        journalContent_ = 0.f;
+        journalScroll_ = 0.f;
+        return;
+    }
+    if (journalGroups_.empty()) {
+        journalContent_ = 0.f;
+        journalScroll_ = 0.f;
+        const float mid = (screen.top + screen.bottom) / 2.f;
+        Text(L"Сбоев не было.", notice_.get(),
+             D2D1::RectF(screen.left + 12.f, mid - 16.f, screen.right - 12.f, mid + 16.f), kSecondary);
+        return;
+    }
+
+    const float inner = std::max(20.f, cardRight - cardLeft - 24.f);
+    const auto statusOf = [](const JournalGroup& group) {
+        if (group.fresh == 0 && group.count > 1) {
+            return std::format(L"×{} · разобрана", group.count);
+        }
+        if (group.fresh == 0) {
+            return std::wstring(L"разобрана");
+        }
+        if (group.fresh == group.count && group.count > 1) {
+            return std::format(L"×{} · новая", group.count);
+        }
+        if (group.fresh == group.count) {
+            return std::wstring(L"новая");
+        }
+        return std::format(L"×{} · новых {}", group.count, group.fresh);
+    };
+
+    std::vector<float> heights;
+    std::vector<wil::com_ptr<IDWriteTextLayout>> bodies;
+    heights.reserve(journalGroups_.size());
+    bodies.reserve(journalGroups_.size());
+    float content = 12.f;
+    for (const JournalGroup& group : journalGroups_) {
+        wil::com_ptr<IDWriteTextLayout> body;
+        float bodyH = 18.f;
+        if (SUCCEEDED(dwrite_->CreateTextLayout(group.text.c_str(), static_cast<UINT32>(group.text.size()),
+                                                termFont_.get(), inner, 10000.f, body.put())) &&
+            body) {
+            body->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
+            body->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+            const DWRITE_TRIMMING none{DWRITE_TRIMMING_GRANULARITY_NONE, 0, 0};
+            body->SetTrimming(&none, nullptr);
+            DWRITE_TEXT_METRICS metrics{};
+            body->GetMetrics(&metrics);
+            bodyH = std::max(1.f, std::ceil(metrics.height));
+            body->SetMaxHeight(bodyH);
+        }
+        heights.push_back(12.f + 20.f + 4.f + bodyH + 12.f);
+        bodies.push_back(std::move(body));
+        content += heights.back();
+    }
+    content += static_cast<float>(journalGroups_.size() - 1) * 8.f + 12.f;
+    journalContent_ = content;
+    const float most = std::max(0.f, content - (screen.bottom - screen.top));
+    if (const float clamped = std::clamp(journalScroll_, 0.f, most); clamped != journalScroll_) {
+        journalScroll_ = clamped;
+        Refresh();  // InvalidateRect: this paint is not re-entered
+    }
+
+    target_->PushAxisAlignedClip(screen, D2D1_ANTIALIAS_MODE_ALIASED);
+    float y = screen.top + 12.f - journalScroll_;
+    for (size_t i = 0; i < journalGroups_.size(); ++i) {
+        const JournalGroup& group = journalGroups_[i];
+        const float height = heights[i];
+        const D2D1_RECT_F rect = D2D1::RectF(cardLeft, y, cardRight, y + height);
+        const bool visible = rect.bottom > screen.top && rect.top < screen.bottom;
+        if (visible) {
+            const bool hot = Inside(rect, mouse_.x, mouse_.y) && Inside(screen, mouse_.x, mouse_.y);
+            Fill(rect, 8.f, hot ? kRaised : kCard);
+            if (group.crash) {
+                Solid(D2D1::RectF(rect.left, rect.top + 8.f, rect.left + 3.f, rect.bottom - 8.f), kDanger);
+            }
+            const std::wstring status = statusOf(group);
+            const float statusW = TextWidth(status, ui_.get());
+            const float statusLeft = rect.right - 12.f - statusW;
+            Text(status, ui_.get(),
+                 D2D1::RectF(statusLeft, rect.top + 12.f, rect.right - 12.f, rect.top + 32.f),
+                 group.fresh == 0 ? kSecondary : kWaiting);
+            const float room = std::max(0.f, statusLeft - 8.f - (rect.left + 12.f));
+            std::wstring header = ToWide(group.time) + L" · " + ToWide(group.source);
+            if (!group.build.empty()) {
+                const std::wstring withBuild = header + L" · " + ToWide(group.build);
+                if (TextWidth(withBuild, ui_.get()) <= room) {
+                    header = withBuild;
+                }
+            }
+            if (TextWidth(header, ui_.get()) > room) {
+                while (!header.empty() && TextWidth(header + L"…", ui_.get()) > room) {
+                    header.pop_back();
+                }
+                header += L"…";
+            }
+            if (room > 0.f) {
+                Text(header, ui_.get(), D2D1::RectF(rect.left + 12.f, rect.top + 12.f, statusLeft - 8.f, rect.top + 32.f),
+                     group.crash ? kDanger : kSecondary);
+            }
+            if (bodies[i]) {
+                brush_->SetColor(Color(kTermFg));
+                target_->DrawTextLayout(D2D1::Point2F(rect.left + 12.f, rect.top + 36.f), bodies[i].get(), brush_.get(),
+                                        D2D1_DRAW_TEXT_OPTIONS_CLIP);
+            }
+            journalHits_.push_back(JournalCard{rect, i});
+        }
+        y += height + 8.f;
+    }
+    target_->PopAxisAlignedClip();
+    PaintBar(g, Scroller::Journal);
 }
 
 void ChatWindow::NameChat() {
@@ -12428,8 +12750,15 @@ std::wstring ChatWindow::TooltipText() {
         return L"Поставить AIControls " + (update_ ? ToWide(update_->version) : std::wstring()) +
                L" и перезапустить. Этот чат откроется снова";
     case Target::PreviewWide:
-        return previewWide_ ? L"Вернуть как было" : L"Превью на всё окно (чат остаётся полосой слева)";
+        if (previewWide_) {
+            return L"Вернуть как было";
+        }
+        return JournalShown() ? L"Журнал на всё окно (чат остаётся полосой слева)"
+                              : L"Превью на всё окно (чат остаётся полосой слева)";
     case Target::TermTab:
+        if (hover_.row < tabs_.size() && tabs_[hover_.row]->journal) {
+            return L"Правый клик: разобрать новые, очистить";
+        }
         if (hover_.row < tabs_.size() && !tabs_[hover_.row]->preview.empty()) {
             return L"Ctrl+клик по элементу страницы — вставить его в сообщение. Правая кнопка — меню";
         }
@@ -12975,6 +13304,10 @@ void ChatWindow::ShowTermAddMenu(POINT screen) {
 
 void ChatWindow::ShowTabMenu(size_t index, POINT screen) {
     if (index >= tabs_.size()) {
+        return;
+    }
+    if (tabs_[index]->journal) {
+        ShowJournalMenu(screen, index);
         return;
     }
     if (!tabs_[index]->preview.empty()) {
@@ -15580,6 +15913,12 @@ void ChatWindow::FillGallery() {
         std::filesystem::remove_all(folder, error);
         SetJournalFolder(folder.wstring());
         SetBookmarksFolder((folder / L"bookmarks").wstring());  // the starting set, nothing of his touched
+        JournalWrite("чат", L"Старый обрыв: соединение закрылось");
+        TakeNewJournal();  // reviewed, so the list has one settled card
+        JournalWrite("названия", L"Название чата не придумалось: проверка не прошла");
+        TakeNewJournal();
+        JournalWrite("названия", L"Название чата не придумалось: проверка не прошла");  // mixed: one new copy
+        JournalWrite("чат", L"Claude завершился с кодом 1: stderr «API Error: 529 overloaded»");
         JournalWrite("чат", L"Claude завершился с кодом 1: stderr «API Error: 529 overloaded»");
         JournalWrite("браузер", L"Окно браузера не создалось (0x80004005)");
         JournalWrite("сбой", L"Клиент упал: c0000409 — аварийный выход (__fastfail: std::terminate, переполнение буфера, "
@@ -15707,6 +16046,9 @@ void ChatWindow::FillGallery() {
     RefreshSessions();
     stick_ = true;
     glide_.reset();
+    if (galleryJournal_) {
+        OpenJournal();  // the list beside the sample chat; the scratch folder is already set
+    }
     Refresh();
 }
 
@@ -15728,11 +16070,20 @@ int RunChatWindow(HINSTANCE instance, int show) {
         }
         CoUninitialize();
     });
-    if (RaiseRunningWindow()) {
+    bool galleryLaunch = false;
+    {
+        int count = 0;
+        const std::unique_ptr<LPWSTR, decltype(&LocalFree)> args(CommandLineToArgvW(GetCommandLineW(), &count),
+                                                                  &LocalFree);
+        for (int i = 1; args && i < count; ++i) {
+            galleryLaunch = galleryLaunch || std::wstring_view(args.get()[i]) == L"--gallery";
+        }
+    }
+    if (!galleryLaunch && RaiseRunningWindow()) {
         return 0;  // a second launch, or a toast click while this one is open: the first window comes forward
     }
-    if (SUCCEEDED(runtime)) {
-        PrepareToasts();  // the process id, before any window
+    if (!galleryLaunch && SUCCEEDED(runtime)) {
+        PrepareToasts();  // the process id, before any window. A gallery look must not register a second activator.
     }
     try {
         ChatWindow window(instance);

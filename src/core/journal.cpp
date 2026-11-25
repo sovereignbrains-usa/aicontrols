@@ -5,15 +5,14 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
-#include <cstdio>
-#include <deque>
+#include <cstdint>
 #include <filesystem>
 #include <format>
 #include <fstream>
 #include <map>
 #include <mutex>
 #include <optional>
-#include <sstream>
+#include <string>
 
 #include "core/claude_process.h"
 
@@ -28,8 +27,9 @@ constexpr uintmax_t kMostBytes = 256 * 1024;  // past it, the oldest go
 constexpr size_t kKeepLines = 150;
 
 std::mutex g_journalMutex;
-std::wstring g_folder;                 // empty: %LOCALAPPDATA%\AIControls
-std::optional<size_t> g_unseen;        // counted once, then kept up as lines come
+std::wstring g_folder;                          // empty: %LOCALAPPDATA%\AIControls
+std::optional<size_t> g_unseen;                 // counted once, then kept up as lines come
+std::atomic<uint64_t> g_generation{0};
 
 fs::path Folder() {
     if (!g_folder.empty()) {
@@ -107,130 +107,84 @@ std::vector<Line> ReadLines() {
         Line line;
         const Json& ms = JsonAt(parsed, "ms");
         line.ms = ms.is_number_integer() ? ms.get<long long>() : 0;
+        line.entry.ms = line.ms;
         line.entry.time = JsonStr(parsed, "time");
         line.entry.source = JsonStr(parsed, "src");
         line.entry.build = JsonStr(parsed, "build");
         line.entry.text = ToWide(JsonStr(parsed, "text"));
+        const Json& rev = JsonAt(parsed, "rev");
+        line.entry.reviewed = rev.is_boolean() && rev.get<bool>();
         lines.push_back(std::move(line));
     }
     return lines;
 }
 
-std::string Escape(const std::wstring& text) {
-    std::string out;
-    for (const char c : ToUtf8(text)) {
-        switch (c) {
-        case '<': out += "&lt;"; break;
-        case '>': out += "&gt;"; break;
-        case '&': out += "&amp;"; break;
-        case '"': out += "&quot;"; break;
-        default: out += c;
-        }
+// "rev" only when the line was reviewed, so an older file (no field) stays unreviewed.
+std::string DumpLine(const Line& line) {
+    Json obj{{"ms", line.ms},
+             {"time", line.entry.time},
+             {"src", line.entry.source},
+             {"build", line.entry.build},
+             {"text", ToUtf8(line.entry.text)}};
+    if (line.entry.reviewed) {
+        obj["rev"] = true;
     }
-    return out;
+    return obj.dump(-1, ' ', false, Json::error_handler_t::replace);
 }
 
-bool WritePageLocked();
+// journal.jsonl.new beside the file, then replaced. std::filesystem::rename does not replace on Windows.
+bool Rewrite(const std::vector<Line>& lines) {
+    const fs::path folder = Folder();
+    std::error_code error;
+    fs::create_directories(folder, error);
+    const fs::path fresh = folder / L"journal.jsonl.new";
+    {
+        std::ofstream out(fresh, std::ios::binary | std::ios::trunc);
+        if (!out) {
+            return false;
+        }
+        for (const Line& line : lines) {
+            const std::string dumped = DumpLine(line);
+            out.write(dumped.data(), static_cast<std::streamsize>(dumped.size()));
+            out.put('\n');
+        }
+        if (!out) {
+            return false;
+        }
+    }
+    const fs::path file = folder / L"journal.jsonl";
+    return MoveFileExW(fresh.c_str(), file.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+}
 
 void WriteLocked(long long ms, std::string_view source, std::wstring_view text) {
     const fs::path folder = Folder();
     std::error_code error;
     fs::create_directories(folder, error);
     const fs::path file = folder / L"journal.jsonl";
-    std::string line = Json{{"ms", ms}, {"time", LocalTime(ms)}, {"src", std::string(source)}, {"build", Build()},
-                            {"text", ToUtf8(std::wstring(text))}}
-                           .dump(-1, ' ', false, Json::error_handler_t::replace);
-    line += '\n';
+    Line line;
+    line.ms = ms;
+    line.entry.ms = ms;
+    line.entry.time = LocalTime(ms);
+    line.entry.source = std::string(source);
+    line.entry.build = Build();
+    line.entry.text = std::wstring(text);
     {
         std::ofstream out(file, std::ios::binary | std::ios::app);
-        out.write(line.data(), static_cast<std::streamsize>(line.size()));
+        const std::string dumped = DumpLine(line);
+        out.write(dumped.data(), static_cast<std::streamsize>(dumped.size()));
+        out.put('\n');
     }
-    if (fs::file_size(file, error) > kMostBytes) {  // the newest kept, written beside it and moved over
-        std::ifstream in(file, std::ios::binary);
-        std::deque<std::string> kept;
-        std::string row;
-        while (std::getline(in, row)) {
-            kept.push_back(std::move(row));
-            if (kept.size() > kKeepLines) {
-                kept.pop_front();
-            }
+    if (fs::file_size(file, error) > kMostBytes) {  // the newest kept; "rev" survives because the lines are read back
+        std::vector<Line> lines = ReadLines();
+        if (lines.size() > kKeepLines) {
+            lines.erase(lines.begin(), lines.end() - static_cast<std::ptrdiff_t>(kKeepLines));
+            Rewrite(lines);
         }
-        in.close();
-        const fs::path fresh = folder / L"journal.jsonl.new";
-        {
-            std::ofstream out(fresh, std::ios::binary | std::ios::trunc);
-            for (const std::string& kept_line : kept) {
-                out << kept_line << '\n';
-            }
-        }
-        fs::rename(fresh, file, error);
     }
     if (g_unseen) {
         ++*g_unseen;
     }
-    if (fs::exists(folder / L"journal.html", error)) {  // the page, if it was ever opened: the preview reloads it
-        WritePageLocked();
-    }
-}
-
-bool WritePageLocked() {
-    std::vector<Line> lines = ReadLines();
-    std::string rows;
-    for (auto it = lines.rbegin(); it != lines.rend(); ++it) {
-        const JournalEntry& e = it->entry;
-        const bool crash = e.source == "сбой";
-        rows += std::format("<article class=\"{}\"><header><time>{}</time><b>{}</b><span>{}</span></header><pre>{}</pre></article>\n",
-                            crash ? "crash" : "", e.time, Escape(ToWide(e.source)), Escape(ToWide(e.build)),
-                            Escape(e.text));
-    }
-    if (rows.empty()) {
-        rows = "<p class=\"empty\">Сбоев не было.</p>";
-    }
-    const std::string page =
-        "<!doctype html><html lang=\"ru\"><head><meta charset=\"utf-8\"><title>Журнал сбоев</title><style>\n"
-        ":root{color-scheme:dark}*{box-sizing:border-box}\n"
-        "body{margin:0;background:#0e0e0f;color:#f2f4f8;font:13px/1.5 Geist,'Segoe UI Variable Text','Segoe UI',sans-serif}\n"
-        ".bar{position:sticky;top:0;display:flex;gap:8px;align-items:center;padding:12px 16px;background:#121213;"
-        "border-bottom:1px solid #2c2c31}\n"
-        ".bar h1{font-size:14px;font-weight:600;margin:0 auto 0 0}\n"
-        "button{font:inherit;color:#f2f4f8;background:#232327;border:0;border-radius:8px;padding:6px 12px;cursor:pointer;"
-        "transition:background .14s ease-out}\n"
-        "button:hover{background:#2c2c31}button.primary{background:#4c92ff}button.primary:hover{background:#5d9dff}\n"
-        "button:focus-visible{outline:2px solid #4c92ff;outline-offset:2px}\n"
-        "main{padding:8px 16px 24px}\n"
-        "article{border-left:3px solid #2c2c31;background:#18181a;border-radius:8px;padding:8px 12px;margin:8px 0}\n"
-        "article.crash{border-left-color:#f06060}\n"
-        "header{display:flex;gap:12px;align-items:baseline;color:#9c9ea4;font-size:12px}\n"
-        "header b{color:#e8b04c;font-weight:600}article.crash header b{color:#f06060}\n"
-        "header span{margin-left:auto;font-family:Consolas,monospace}\n"
-        "pre{margin:4px 0 0;white-space:pre-wrap;word-break:break-word;font:12px/1.5 Consolas,'Cascadia Mono',monospace;"
-        "color:#dadde4}\n"
-        ".empty{color:#9c9ea4;padding:24px 0}\n"
-        "</style></head><body>\n"
-        "<div class=\"bar\"><h1>Журнал сбоев</h1><button id=\"copy\">Копировать</button>"
-        "<button class=\"primary\" id=\"chat\">Разобрать в чате</button></div>\n<main id=\"list\">\n" +
-        rows +
-        "</main>\n<script>\n"
-        "const post=m=>window.chrome&&chrome.webview&&chrome.webview.postMessage(JSON.stringify(m));\n"  // the window takes strings only
-        "document.getElementById('chat').onclick=()=>post({aic:'journal-chat'});\n"
-        "document.getElementById('copy').onclick=async e=>{const t=document.getElementById('list').innerText;"
-        "try{await navigator.clipboard.writeText(t)}catch{const a=document.createElement('textarea');a.value=t;"
-        "document.body.append(a);a.select();document.execCommand('copy');a.remove()}"
-        "e.target.textContent='Скопировано';setTimeout(()=>e.target.textContent='Копировать',1400)};\n"
-        "</script></body></html>\n";
-    const fs::path folder = Folder();
-    std::error_code error;
-    fs::create_directories(folder, error);
-    const fs::path fresh = folder / L"journal.html.new";
-    {
-        std::ofstream out(fresh, std::ios::binary | std::ios::trunc);
-        out << page;
-        if (!out) {
-            return false;
-        }
-    }
-    fs::rename(fresh, folder / L"journal.html", error);
-    return !error;
+    g_generation.fetch_add(1, std::memory_order_release);
 }
 
 std::wstring ReadWide(const fs::path& file) {
@@ -256,20 +210,48 @@ std::map<std::wstring, std::wstring> ReportFields(std::wstring_view report) {
     return fields;
 }
 
+// Newest group first. A later (older) copy moves firstMs back and adds to the counts.
+std::vector<JournalGroup> GroupLines(const std::vector<Line>& lines) {
+    std::vector<JournalGroup> groups;
+    for (auto it = lines.rbegin(); it != lines.rend(); ++it) {
+        const JournalEntry& entry = it->entry;
+        auto found = std::ranges::find_if(groups, [&](const JournalGroup& group) {
+            return group.source == entry.source && group.text == entry.text;
+        });
+        if (found == groups.end()) {
+            JournalGroup group;
+            group.ms = it->ms;
+            group.firstMs = it->ms;
+            group.time = entry.time;
+            group.source = entry.source;
+            group.build = entry.build;
+            group.text = entry.text;
+            group.count = 1;
+            group.fresh = entry.reviewed ? 0 : 1;
+            group.crash = entry.source == "сбой";
+            groups.push_back(std::move(group));
+        } else {
+            found->firstMs = it->ms;
+            ++found->count;
+            if (!entry.reviewed) {
+                ++found->fresh;
+            }
+        }
+    }
+    return groups;
+}
+
 }  // namespace
 
 std::wstring JournalFile() {
     return (Folder() / L"journal.jsonl").wstring();
 }
 
-std::wstring JournalPage() {
-    return (Folder() / L"journal.html").wstring();
-}
-
 void SetJournalFolder(const std::wstring& folder) {
     const std::lock_guard lock(g_journalMutex);
     g_folder = folder;
     g_unseen.reset();
+    g_generation.fetch_add(1, std::memory_order_release);
 }
 
 void JournalWrite(std::string_view source, std::wstring_view text) {
@@ -291,22 +273,83 @@ std::vector<JournalEntry> ReadJournal(size_t limit) {
     return entries;
 }
 
+std::vector<JournalGroup> ReadJournalGroups() {
+    const std::lock_guard lock(g_journalMutex);
+    return GroupLines(ReadLines());
+}
+
 size_t JournalUnseen() {
     const std::lock_guard lock(g_journalMutex);
     if (!g_unseen) {
-        const long long seen = ReadNumber(Folder() / L"journal.seen");
         const std::vector<Line> lines = ReadLines();
-        g_unseen = static_cast<size_t>(std::ranges::count_if(lines, [&](const Line& l) { return l.ms > seen; }));
+        g_unseen = static_cast<size_t>(std::ranges::count_if(lines, [](const Line& line) { return !line.entry.reviewed; }));
     }
     return *g_unseen;
 }
 
-void MarkJournalSeen() {
+uint64_t JournalGeneration() {
+    return g_generation.load(std::memory_order_acquire);
+}
+
+std::wstring TakeNewJournal() {
     const std::lock_guard lock(g_journalMutex);
-    std::error_code error;
-    fs::create_directories(Folder(), error);
-    WriteNumber(Folder() / L"journal.seen", NowMs());
-    g_unseen = 0;
+    std::vector<Line> lines = ReadLines();
+    std::vector<JournalGroup> groups = GroupLines(lines);
+    std::erase_if(groups, [](const JournalGroup& group) { return group.fresh == 0; });
+    if (groups.empty()) {
+        return {};
+    }
+    std::ranges::stable_sort(groups, {}, &JournalGroup::firstMs);
+    std::wstring brief;
+    for (size_t i = 0; i < groups.size(); ++i) {
+        const JournalGroup& group = groups[i];
+        if (i != 0) {
+            brief += L"\n\n";
+        }
+        brief += ToWide(group.time) + L" · " + ToWide(group.source);
+        if (group.fresh > 1) {
+            brief += L" · ×" + std::to_wstring(group.fresh);
+        }
+        brief += L"\n" + group.text;
+    }
+    for (Line& line : lines) {
+        if (!line.entry.reviewed) {
+            line.entry.reviewed = true;
+        }
+    }
+    if (!Rewrite(lines)) {
+        return {};
+    }
+    g_unseen.reset();
+    g_generation.fetch_add(1, std::memory_order_release);
+    return brief;
+}
+
+size_t ClearJournal(bool reviewedOnly) {
+    const std::lock_guard lock(g_journalMutex);
+    std::vector<Line> lines = ReadLines();
+    std::vector<Line> kept;
+    size_t removed = 0;
+    if (reviewedOnly) {
+        for (Line& line : lines) {
+            if (line.entry.reviewed) {
+                ++removed;
+            } else {
+                kept.push_back(std::move(line));
+            }
+        }
+    } else {
+        removed = lines.size();
+    }
+    if (removed == 0) {
+        return 0;
+    }
+    if (!Rewrite(reviewedOnly ? kept : std::vector<Line>{})) {
+        return 0;
+    }
+    g_unseen.reset();
+    g_generation.fetch_add(1, std::memory_order_release);
+    return removed;
 }
 
 std::wstring CrashSummary(std::wstring_view report) {
@@ -406,23 +449,6 @@ size_t ImportCrashReports() {
         WriteLocked(crash.ms, "сбой", crash.text);
     }
     return found.size();
-}
-
-bool WriteJournalPage() {
-    const std::lock_guard lock(g_journalMutex);
-    return WritePageLocked();
-}
-
-std::wstring JournalText(size_t most) {
-    const std::lock_guard lock(g_journalMutex);
-    const std::vector<Line> lines = ReadLines();
-    std::wstring text;
-    const size_t first = lines.size() > most ? lines.size() - most : 0;
-    for (size_t i = first; i < lines.size(); ++i) {
-        const JournalEntry& e = lines[i].entry;
-        text += ToWide(e.time) + L" · " + ToWide(e.source) + L" · " + ToWide(e.build) + L"\n" + e.text + L"\n\n";
-    }
-    return text;
 }
 
 }  // namespace aic

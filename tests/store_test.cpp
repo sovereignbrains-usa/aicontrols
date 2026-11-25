@@ -108,14 +108,46 @@ int main() {
         aic::JournalWrite("чат", L"Первый сбой");
         aic::JournalWrite("браузер", L"Второй");
         const auto entries = aic::ReadJournal();
-        Expect(entries.size() == 2 && entries.front().source == "чат" && entries.back().text == L"Второй",
+        Expect(entries.size() == 2 && entries.front().source == "чат" && entries.back().text == L"Второй" &&
+                   !entries.front().reviewed && !entries.back().reviewed,
                "the journal reads back, in the order written");
-        Expect(aic::JournalUnseen() == 2, "both are not seen");
-        aic::MarkJournalSeen();
-        Expect(aic::JournalUnseen() == 0, "seen after a look");
-        Expect(aic::WriteJournalPage() && fs::exists(aic::JournalPage()) &&
-                   ReadAll(aic::JournalPage()).find("Первый сбой") != std::string::npos,
-               "its page has the entries");
+        Expect(aic::JournalUnseen() == 2, "both are unreviewed");
+        std::ofstream(folder / L"journal.seen") << "9999999999999";
+        aic::SetJournalFolder(folder.wstring());
+        Expect(aic::JournalUnseen() == 2, "a journal.seen stamp does not review them");
+        aic::JournalWrite("чат", L"Первый сбой");
+        const auto groups = aic::ReadJournalGroups();
+        Expect(groups.size() == 2 && groups.front().text == L"Первый сбой" && groups.front().count == 2 &&
+                   groups.front().fresh == 2 && groups.back().text == L"Второй",
+               "the same text collapses, newest group first");
+        Expect(aic::JournalUnseen() == 3, "unseen counts copies, not groups");
+        const std::wstring brief = aic::TakeNewJournal();
+        const auto firstAt = brief.find(L"Первый сбой");
+        const auto secondAt = brief.find(L"Второй");
+        Expect(firstAt != std::wstring::npos && secondAt != std::wstring::npos && brief.find(L"×2") != std::wstring::npos &&
+                   brief.find(L"journal.jsonl") == std::wstring::npos && firstAt < secondAt,
+               "the new ones, oldest group first, without the path");
+        Expect(aic::TakeNewJournal().empty() && aic::JournalUnseen() == 0, "taken once, nothing new remains");
+        const auto reviewed = aic::ReadJournal();
+        Expect(std::ranges::all_of(reviewed, [](const aic::JournalEntry& entry) { return entry.reviewed; }),
+               "taking them marks every line reviewed");
+        aic::JournalWrite("чат", L"Третий");
+        Expect(aic::JournalUnseen() == 1, "a later line is new again");
+        Expect(!aic::TakeNewJournal().empty() && aic::JournalUnseen() == 0, "that one is taken too");
+        aic::JournalWrite("чат", L"Оставить");
+        Expect(aic::JournalUnseen() == 1, "one fresh line among the reviewed");
+        Expect(aic::ClearJournal(true) == 4, "clearing the reviewed leaves the fresh line");
+        const auto kept = aic::ReadJournal();
+        Expect(kept.size() == 1 && kept.front().text == L"Оставить" && aic::JournalUnseen() == 1,
+               "the fresh line stays, still unreviewed");
+        Expect(aic::ClearJournal(false) == 1 && aic::ReadJournal().empty() && aic::JournalUnseen() == 0,
+               "clearing everything empties the journal");
+        {
+            std::ofstream out(folder / L"journal.jsonl", std::ios::binary | std::ios::app);
+            out << R"({"ms":1,"time":"t","src":"чат","build":"b","text":"Сырой"})" << "\n";
+        }
+        aic::SetJournalFolder(folder.wstring());
+        Expect(aic::JournalUnseen() == 1, "a line without rev is unreviewed");
         const std::wstring report =
             L"EventType=BEX64\r\nSig[0].Value=aicontrols.exe\r\nSig[1].Value=0.1.98.0\r\nSig[2].Value=6ae8eed4\r\n"
             L"Sig[3].Value=aicontrols.exe\r\nSig[4].Value=0.1.98.0\r\nSig[5].Value=6ae8eed4\r\n"

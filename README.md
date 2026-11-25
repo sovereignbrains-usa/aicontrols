@@ -2,7 +2,7 @@ English · [Русский](README.ru.md)
 
 # AIControls
 
-[![release 0.1.131](https://img.shields.io/badge/release-0.1.131-4c92ff)](https://github.com/sovereignbrains/aicontrols/releases)
+[![release 0.1.132](https://img.shields.io/badge/release-0.1.132-4c92ff)](https://github.com/sovereignbrains/aicontrols/releases)
 [![MIT](https://img.shields.io/github/license/sovereignbrains/aicontrols)](LICENSE)
 [![build](https://github.com/sovereignbrains/aicontrols/actions/workflows/build.yml/badge.svg)](https://github.com/sovereignbrains/aicontrols/actions/workflows/build.yml)
 
@@ -13,7 +13,7 @@ C++23, Win32, Direct2D and DirectWrite. No Electron, one exe.
 > Not an official Anthropic or xAI product. “Claude” is a trademark of Anthropic.
 > The client starts the `claude.exe` and `grok.exe` you already installed and talks to them.
 
-Current build: **0.1.131**.
+Current build: **0.1.132**.
 
 ## What it does
 
@@ -52,7 +52,7 @@ and cut out of the output. Edit them in the sidebar.
   Under the address bar, bookmarks for the hosted chats (ChatGPT, Claude, Gemini, Grok, Qwen, DeepSeek, and others). A star in the field adds the page,
   right-click reorders or deletes, middle-click opens a new tab. The browser profile keeps the signed-in accounts.
 - The bug at the bottom of the sidebar is the failure journal: red lines from chats, browser and title errors, and crashes Windows recorded.
-  A red dot means something is unseen. «Разобрать в чате» puts the journal into the message.
+  A red dot means a failure is not reviewed yet. «Разобрать новые» puts only those, without repeats, into the message and marks them reviewed.
 - Scrollbars drag, and the middle button scrolls like a browser. The window draws its own title bar.
 - It updates itself. Check a downloaded installer against the `.sha256` beside it.
   After an update the same chat opens.
@@ -75,7 +75,7 @@ Installers are on the [releases](https://github.com/sovereignbrains/aicontrols/r
 ## Where your files are
 
 Settings: `%APPDATA%\AIControls\settings.json`. Secrets: `%APPDATA%\AIControls\secrets.bin`. Which parts belong to one chat: `%APPDATA%\AIControls\chats.json`.
-The failure journal: `%LOCALAPPDATA%\AIControls\journal.jsonl` (and `journal.html` beside it). Bookmarks: `%LOCALAPPDATA%\AIControls\bookmarks.json`, site icons in `favicons\`.
+The failure journal: `%LOCALAPPDATA%\AIControls\journal.jsonl`. Bookmarks: `%LOCALAPPDATA%\AIControls\bookmarks.json`, site icons in `favicons\`.
 The chats themselves stay with the CLI. Claude: `%USERPROFILE%\.claude\projects`. Grok: `%USERPROFILE%\.grok\sessions`.
 
 ## License

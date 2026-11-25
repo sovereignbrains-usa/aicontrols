@@ -55,5 +55,5 @@ docs       протокол claude.exe: docs/protocol.md
 
 Настройки — `%APPDATA%\AIControls\settings.json`, секреты — `%APPDATA%\AIControls\secrets.bin`,
 связка частей одного чата — `%APPDATA%\AIControls\chats.json`.
-Журнал сбоев — `%LOCALAPPDATA%\AIControls\journal.jsonl` (и страница `journal.html` рядом).
+Журнал сбоев — `%LOCALAPPDATA%\AIControls\journal.jsonl`.
 Сами чаты лежат у CLI: Claude — `%USERPROFILE%\.claude\projects`, Grok — `%USERPROFILE%\.grok\sessions`.
