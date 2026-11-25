@@ -222,8 +222,24 @@ void BrowserView::LayoutPage() {
         const int fieldTop = static_cast<int>(field.top);
         const int fieldBottom = static_cast<int>(field.bottom);
         const int right = (std::max)(left, fieldRight - Dip(34));  // the star sits in the field's right end
-        const int editH = (std::max)(Dip(16), (fieldBottom - fieldTop) - Dip(8));
-        const int top = fieldTop + (std::max)(0, (fieldBottom - fieldTop - editH) / 2);
+        // A single-line edit pins its caret to the top of the window, so the window is the font's
+        // line and sits in the middle of the pill. Geist at 13 DIP is 17 px; the old window was the
+        // pill minus 8 DIP (24 px) and the bar stood against the top.
+        int line = Dip(16);
+        if (font_ != nullptr) {
+            if (const HDC dc = GetDC(edit_); dc != nullptr) {
+                const HGDIOBJ old = SelectObject(dc, font_);
+                TEXTMETRICW metrics{};
+                if (GetTextMetricsW(dc, &metrics) && metrics.tmHeight > 0) {
+                    line = metrics.tmHeight;
+                }
+                SelectObject(dc, old);
+                ReleaseDC(edit_, dc);
+            }
+        }
+        const int room = fieldBottom - fieldTop;
+        const int editH = (std::min)((std::max)(line, 1), (std::max)(room, 1));
+        const int top = fieldTop + (std::max)(0, (room - editH) / 2);
         SetWindowPos(edit_, nullptr, left, top, right - left, editH, SWP_NOZORDER | SWP_NOACTIVATE);
     }
     const auto place = [&](ICoreWebView2Controller* controller, bool visible) {
