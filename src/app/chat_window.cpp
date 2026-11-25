@@ -7326,25 +7326,29 @@ void ChatWindow::ShowAccountMenu() {
     const std::wstring who = auth_.email.empty() ? AccountName() : ToWide(auth_.email);
     AppendMenuW(menu.get(), MF_STRING | MF_GRAYED, 1, who.c_str());
     AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
-    const std::wstring version = claudeVersion_.empty() ? std::wstring(L"Claude: версия неизвестна")
-                                                        : L"Claude " + ToWide(claudeVersion_);
-    AppendMenuW(menu.get(), MF_STRING | MF_GRAYED, 3, version.c_str());
-    const std::wstring update = L"Обновить Claude до " + ToWide(claudeLatest_);
-    AppendMenuW(menu.get(), MF_STRING | (setupBusy_ ? MF_GRAYED : 0), ClaudeUpdateAvailable() ? 4 : 5,
-                ClaudeUpdateAvailable() ? update.c_str() : L"Проверить обновления Claude");
-    const std::wstring grokVersion = grokVersion_.empty() ? std::wstring(L"Grok: версия неизвестна")
-                                                          : L"Grok " + ToWide(grokVersion_);
-    AppendMenuW(menu.get(), MF_STRING | MF_GRAYED, 7, grokVersion.c_str());
-    const std::wstring grokUpdate = L"Обновить Grok до " + ToWide(grokLatest_);
-    AppendMenuW(menu.get(), MF_STRING | (setupBusy_ ? MF_GRAYED : 0), GrokUpdateAvailable() ? 8 : 9,
-                GrokUpdateAvailable() ? grokUpdate.c_str() : L"Проверить обновления Grok");
+    // Name on the left, version or action in the dim column. One command per program.
+    const auto versionRow = [](const wchar_t* name, const std::string& installed, const std::string& latest,
+                               bool update) {
+        std::wstring side;
+        if (update) {
+            side = L"обновить до " + ToWide(latest);
+        } else if (installed.empty()) {
+            side = L"проверить";
+        } else {
+            side = ToWide(installed);
+        }
+        return std::wstring(name) + L"\t" + side;
+    };
+    const UINT busy = setupBusy_ ? MF_GRAYED : 0;
+    const std::wstring claudeRow = versionRow(L"Claude", claudeVersion_, claudeLatest_, ClaudeUpdateAvailable());
+    AppendMenuW(menu.get(), MF_STRING | busy, ClaudeUpdateAvailable() ? 4 : 5, claudeRow.c_str());
+    const std::wstring grokRow = versionRow(L"Grok", grokVersion_, grokLatest_, GrokUpdateAvailable());
+    AppendMenuW(menu.get(), MF_STRING | busy, GrokUpdateAvailable() ? 8 : 9, grokRow.c_str());
     AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu.get(), MF_STRING | (settings_.notifyAway ? MF_CHECKED : 0), 10,
-                L"Уведомления, когда окно не перед глазами");
-    AppendMenuW(menu.get(), MF_STRING | (settings_.directTraffic ? MF_CHECKED : 0), 11,
-                L"Трафик всегда напрямую");
+    AppendMenuW(menu.get(), MF_STRING | (settings_.notifyAway ? MF_CHECKED : 0), 10, L"Уведомления");
+    AppendMenuW(menu.get(), MF_STRING | (settings_.directTraffic ? MF_CHECKED : 0), 11, L"Напрямую");
     AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu.get(), MF_STRING, 6, L"Подключения: Claude, Grok, GitHub…");
+    AppendMenuW(menu.get(), MF_STRING, 6, L"Подключения");
     AppendMenuW(menu.get(), MF_STRING, 2, L"Выйти из Claude");  // only Claude's: Grok and GitHub stay connected
     switch (Menu(menu.get(), screen, true)) {
     case 2:
@@ -11642,7 +11646,7 @@ std::wstring ChatWindow::TooltipText() {
         if (GrokUpdateAvailable()) {
             return L"Аккаунт · вышел Grok " + ToWide(grokLatest_);
         }
-        return L"Аккаунт, подключения, уведомления, трафик, версии Claude и Grok, выход";
+        return L"Аккаунт, подключения, уведомления, версии Claude и Grok, выход";
     case Target::ConnectRow:  // a failure in full: the row has room for its start only
         return hover_.row < links_.size() && links_[hover_.row].state == LinkState::Failed ? links_[hover_.row].note
                                                                                             : std::wstring();
