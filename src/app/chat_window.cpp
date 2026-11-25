@@ -82,6 +82,12 @@ constexpr UINT kAuthStatus = WM_APP + 6;     // AuthStatus*: what `claude auth s
 constexpr UINT kAuthUrl = WM_APP + 7;        // std::string*: the sign-in page, for when the browser did not open
 constexpr UINT kAuthLogin = WM_APP + 8;      // LoginDone*: `claude auth login` ended
 constexpr UINT kAuthLogout = WM_APP + 9;     // `claude auth logout` ended
+constexpr UINT kGrokLogout = WM_APP + 22;    // GrokLogoutDone*: `grok logout` ended
+
+struct GrokLogoutDone {
+    bool cancelled = false;
+    std::string error;  // why it failed; empty when the CLI returned success
+};
 
 struct LoginDone {
     bool cancelled = false;
@@ -602,6 +608,7 @@ enum class Target {
     ConnectAll,     // the connect screen: "Войти во все"
     ConnectCancel,  // ... the same button while a row works
     ConnectRow,     // row: the account (Claude, Grok, GitHub): its own "Войти" or "Повторить"
+    ConnectSignOut, // row: the same, once it is in: "Выйти" from that one account
     ConnectLink,    // row: the same: Claude's sign-in link, copied, while the browser waits
     ConnectLater,   // "Позже" under it, or "Закрыть" when nothing is missing
     Account,  // the sidebar's account row
@@ -1085,9 +1092,13 @@ private:
     void RefreshAuth();
     void SignIn();
     void SignOut();
+    void SignOutLink(size_t row);
+    void SignOutGrok();
+    void SignOutGithub();
     void OnAuthStatus(const AuthStatus& status);
     void OnLoginDone(const LoginDone& done);
     void OnLogoutDone();
+    void OnGrokLogout(const GrokLogoutDone& done);
     void ShowAccountMenu();
 
     // The connect screen: Claude, Grok and GitHub, a row each, signed in one after another in the user's own
@@ -1585,6 +1596,8 @@ private:
     std::atomic<bool> cloneCancel_ = false;
     AuthStatus auth_;                // as last asked; auth_.known is false until the first answer
     bool authWorking_ = false;       // a CLI call (status, login, logout) is running
+    bool claudeLeaving_ = false;     // `claude auth logout` runs: a status answer waits, and the row shows it
+    bool grokLeaving_ = false;       // `grok logout` runs on the same thread
     bool loginWaiting_ = false;      // `claude auth login` runs: the user is in the browser
     bool restartAfterAuth_ = false;  // signed in: the CLI starts over to pick the account up
     std::string loginUrl_;
@@ -2340,6 +2353,11 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
     case kAuthLogout:
         OnLogoutDone();
         return 0;
+    case kGrokLogout: {
+        const std::unique_ptr<GrokLogoutDone> payload(reinterpret_cast<GrokLogoutDone*>(lParam));
+        OnGrokLogout(*payload);
+        return 0;
+    }
     case kSetupEvent: {
         const std::unique_ptr<SetupEvent> payload(reinterpret_cast<SetupEvent*>(lParam));
         OnSetupEvent(*payload);
@@ -2353,8 +2371,13 @@ LRESULT ChatWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
     case kRepos: {
         const std::unique_ptr<ReposResult> payload(reinterpret_cast<ReposResult*>(lParam));
         reposLoading_ = false;
-        repos_ = std::move(payload->repos);
-        reposError_ = ToWide(payload->error);
+        if (secrets_.Get("GITHUB").value_or("").empty()) {  // signed out while the list was on its way
+            repos_.clear();
+            reposError_ = L"нет секрета GITHUB";
+        } else {
+            repos_ = std::move(payload->repos);
+            reposError_ = ToWide(payload->error);
+        }
         return 0;
     }
     case kVoiceText: {
@@ -3240,6 +3263,9 @@ void ChatWindow::OnClick(float x, float y) {
         chain_.clear();  // this one alone
         Connect(hit.row);
         break;
+    case Target::ConnectSignOut:
+        SignOutLink(hit.row);
+        break;
     case Target::ConnectLink:
         if (SetClipboardText(hwnd_, ToWide(loginUrl_))) {
             Flash(L"Ссылка на вход скопирована: откройте её в нужном браузере");
@@ -4084,6 +4110,10 @@ Hit ChatWindow::HitTest(float x, float y) const {
             }
             if (connectRow_ == kNoLink && (state == LinkState::Missing || state == LinkState::Failed)) {
                 return {Target::ConnectRow, i};
+            }
+            if (connectRow_ == kNoLink && !authWorking_ && !githubBusy_ && !setupBusy_ &&
+                !claudeLeaving_ && !grokLeaving_ && state == LinkState::Done) {
+                return {Target::ConnectSignOut, i};
             }
         }
         if (Inside(g.connectAll, x, y)) {
@@ -7179,6 +7209,10 @@ void ChatWindow::RefreshAuth() {
 }
 
 void ChatWindow::OnAuthStatus(const AuthStatus& status) {
+    if (grokLeaving_ || claudeLeaving_) {  // this answer is from before logout; ask again when that ends
+        authAgain_ = true;
+        return;
+    }
     authWorking_ = false;
     if (authAgain_) {  // e.g. asked before claude.exe was installed
         RefreshAuth();
@@ -7277,7 +7311,7 @@ void ChatWindow::OnLoginDone(const LoginDone& done) {
 }
 
 void ChatWindow::SignOut() {
-    if (authWorking_) {
+    if (authWorking_ || claudeLeaving_ || grokLeaving_ || setupBusy_ || githubBusy_ || connectRow_ != kNoLink) {
         return;
     }
     const std::wstring exe = FindClaudeExe();
@@ -7290,25 +7324,41 @@ void ChatWindow::SignOut() {
                     MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES) {
         return;
     }
+    chain_.clear();  // a leftover "войти во все" must not resume once this row lets go
     if (authThread_.joinable()) {
         authThread_.join();
     }
     authWorking_ = true;
+    claudeLeaving_ = true;  // a status answer that is already posted must not sign him back in
+    connectRow_ = kClaudeLink;
+    linkCancelled_ = false;
+    authCancel_ = false;
+    SetTimer(hwnd_, kConnectTimer, kConnectFrame, nullptr);
     const HWND hwnd = hwnd_;
-    authThread_ = std::thread([hwnd, exe] {
-        RunCli(L"\"" + exe + L"\" auth logout", PickProxy(), 30);
+    const std::atomic<bool>* cancel = &authCancel_;
+    authThread_ = std::thread([hwnd, exe, cancel] {
+        RunCli(L"\"" + exe + L"\" auth logout", PickProxy(), 30, cancel);
         PostMessageW(hwnd, kAuthLogout, 0, 0);
     });
+    Refresh();
 }
 
 void ChatWindow::OnLogoutDone() {
     authWorking_ = false;
-    generation_ = ++generations_;  // the running CLI still holds the old account: it goes
-    runner_->agent->Stop();
-    running_ = false;
-    busy_ = false;
+    claudeLeaving_ = false;
+    const bool cancelled = authCancel_;  // cancel aborted the CLI: the chat keeps its process
+    if (connectRow_ == kClaudeLink) {
+        connectRow_ = kNoLink;  // before the status ask, or StepClaude would open the browser again
+        linkCancelled_ = false;
+    }
+    if (!cancelled && runner_->agent == &runner_->claude) {
+        generation_ = ++generations_;  // the running CLI still holds the old account: it goes
+        runner_->agent->Stop();
+        running_ = false;
+        busy_ = false;
+    }
     for (const std::unique_ptr<Parked>& chat : parked_) {
-        if (chat->runner->agent == &chat->runner->claude) {
+        if (!cancelled && chat->runner->agent == &chat->runner->claude) {
             chat->generation = 0;
             chat->runner->host.CancelAll();
             chat->runner->agent->Stop();
@@ -7316,6 +7366,171 @@ void ChatWindow::OnLogoutDone() {
         }
     }
     RefreshAuth();
+}
+
+void ChatWindow::SignOutLink(size_t row) {
+    switch (row) {
+    case kClaudeLink:
+        SignOut();
+        break;
+    case kGrokLink:
+        SignOutGrok();
+        break;
+    case kGithubLink:
+        SignOutGithub();
+        break;
+    default:
+        break;
+    }
+}
+
+// `grok logout` clears the CLI's own auth.json. A running grok keeps the old credentials if that file goes
+// unreadable, so every grok chat stops first. Claude is not touched.
+void ChatWindow::SignOutGrok() {
+    if (authWorking_ || claudeLeaving_ || grokLeaving_ || setupBusy_ || githubBusy_ || connectRow_ != kNoLink) {
+        return;
+    }
+    const std::wstring exe = FindGrokExe();
+    if (exe.empty()) {
+        return;
+    }
+    const std::string email = GrokSignedIn();
+    if (email.empty()) {
+        links_[kGrokLink] = GrokLink();
+        Refresh();
+        return;
+    }
+    const bool grokBusy = (busy_ && GrokRunning()) ||
+                          std::ranges::any_of(parked_, [](const std::unique_ptr<Parked>& chat) {
+                              return chat->busy && chat->runner->agent == &chat->runner->grok;
+                          });
+    std::wstring ask = L"Выйти из Grok" + (email == "-" ? std::wstring() : L" (" + ToWide(email) + L")") +
+                       L"?\nЧтобы снова пользоваться Grok, придётся войти заново. Claude и GitHub останутся.";
+    if (grokBusy) {
+        ask += L"\nСейчас Grok отвечает. Выход оборвёт ответ.";
+    }
+    if (MessageBoxW(hwnd_, ask.c_str(), L"AIControls", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES) {
+        return;
+    }
+    chain_.clear();
+    const auto stopGrok = [](Runner& runner, std::vector<FeedItem>& feed) {
+        runner.host.CancelAll();
+        for (FeedItem& item : feed) {
+            if (item.kind == Kind::Approval && item.verdict == Verdict::Pending) {
+                item.verdict = Verdict::Cancelled;
+            }
+        }
+        runner.agent->Stop();
+    };
+    if (GrokRunning()) {
+        generation_ = ++generations_;  // a late line from the process just stopped is not this chat's
+        stopGrok(*runner_, feed_);
+        running_ = false;
+        busy_ = false;
+    }
+    for (const std::unique_ptr<Parked>& chat : parked_) {
+        if (chat->runner->agent != &chat->runner->grok) {
+            continue;
+        }
+        chat->generation = 0;
+        stopGrok(*chat->runner, chat->feed);
+        chat->running = chat->busy = false;
+    }
+    if (authThread_.joinable()) {
+        authThread_.join();
+    }
+    authWorking_ = true;
+    grokLeaving_ = true;
+    connectRow_ = kGrokLink;
+    linkCancelled_ = false;
+    setupCancel_ = false;
+    links_[kGrokLink] = {LinkState::Working, {}, L"Выхожу…"};
+    SetTimer(hwnd_, kConnectTimer, kConnectFrame, nullptr);
+    const HWND hwnd = hwnd_;
+    const std::atomic<bool>* cancel = &setupCancel_;
+    authThread_ = std::thread([hwnd, exe, cancel] {
+        const CliResult run = RunCli(L"\"" + exe + L"\" logout", PickProxy(), 30, cancel);
+        auto done = std::make_unique<GrokLogoutDone>();
+        done->cancelled = run.cancelled;
+        if (run.cancelled) {
+            done->error = "Cancelled";
+        } else if (run.timedOut) {
+            done->error = "Не дождался конца выхода";
+        } else if (!run.started) {
+            done->error = "Не удалось запустить grok.exe";
+        } else if (run.exitCode != 0) {
+            done->error = run.output.size() > 300 ? run.output.substr(run.output.size() - 300) : run.output;
+            if (done->error.empty()) {
+                done->error = "Выход не удался (код " + std::to_string(run.exitCode) + ")";
+            }
+        }
+        if (PostMessageW(hwnd, kGrokLogout, 0, reinterpret_cast<LPARAM>(done.get()))) {
+            done.release();
+        }
+    });
+    Refresh();
+}
+
+void ChatWindow::OnGrokLogout(const GrokLogoutDone& done) {
+    authWorking_ = false;
+    grokLeaving_ = false;
+    if (connectRow_ == kGrokLink) {
+        connectRow_ = kNoLink;
+    }
+    linkCancelled_ = false;
+    const bool signedOut = GrokSignedIn().empty();  // the file, not the exit code: cancel can still have cleared it
+    links_[kGrokLink] = GrokLink();
+    if (signedOut) {
+        Flash(L"Вышли из Grok");
+    } else {
+        const std::wstring why = done.cancelled ? std::wstring(L"Отменено.")
+                                                : (done.error.empty() ? std::wstring(L"аккаунт на месте")
+                                                                      : ToWide(done.error));
+        Flash(L"Не удалось выйти из Grok: " + why, 8000);
+        if (GrokSelected() && !running_) {
+            StartClaude();  // the chat was stopped for the exit and is still signed in
+        }
+    }
+    if (authAgain_) {
+        RefreshAuth();
+    }
+    Refresh();
+}
+
+// The client forgets the GITHUB token. The browser session at github.com stays; nothing is revoked.
+void ChatWindow::SignOutGithub() {
+    if (authWorking_ || claudeLeaving_ || grokLeaving_ || setupBusy_ || githubBusy_ || connectRow_ != kNoLink) {
+        return;
+    }
+    if (secrets_.Get("GITHUB").value_or("").empty()) {
+        links_[kGithubLink] = {LinkState::Missing, {}, {}};
+        Refresh();
+        return;
+    }
+    const std::wstring who = links_[kGithubLink].who;
+    const std::wstring ask =
+        L"Выйти из GitHub" + (who.empty() ? std::wstring() : L" (" + who + L")") +
+        L"?\nКлиент забудет токен. Репозитории и запись памяти снова попросят вход. Claude и Grok останутся.\n"
+        L"Сайт github.com при этом не разлогинивается.";
+    if (MessageBoxW(hwnd_, ask.c_str(), L"AIControls", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES) {
+        return;
+    }
+    chain_.clear();
+    std::string token = secrets_.Get("GITHUB").value_or("");
+    secrets_.Remove("GITHUB");
+    if (!secrets_.Save()) {
+        secrets_.Set("GITHUB", token);
+        SecureZeroMemory(token.data(), token.size());
+        Flash(L"Не удалось сохранить файл секретов", 3500);
+        return;
+    }
+    SecureZeroMemory(token.data(), token.size());
+    repos_.clear();
+    reposError_ = L"нет секрета GITHUB";
+    reposLoading_ = false;
+    links_[kGithubLink] = {LinkState::Missing, {}, {}};
+    Flash(L"Вышли из GitHub");
+    Refresh();
 }
 
 void ChatWindow::ShowAccountMenu() {
@@ -7349,11 +7564,7 @@ void ChatWindow::ShowAccountMenu() {
     AppendMenuW(menu.get(), MF_STRING | (settings_.directTraffic ? MF_CHECKED : 0), 11, L"Напрямую");
     AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu.get(), MF_STRING, 6, L"Подключения");
-    AppendMenuW(menu.get(), MF_STRING, 2, L"Выйти из Claude");  // only Claude's: Grok and GitHub stay connected
     switch (Menu(menu.get(), screen, true)) {
-    case 2:
-        SignOut();
-        break;
     case 6:
         OpenConnect();
         break;
@@ -8114,7 +8325,7 @@ void ChatWindow::PaintConnect(const Geometry& g) {
             if (i == kClaudeLink) {
                 status = setupBusy_ ? (setupInstalling_ ? std::wstring(L"Устанавливаю…")
                                                         : L"Загружаю… " + std::to_wstring(setupPercent_) + L"%")
-                                    : loginWaiting_ ? L"Жду вход в браузере" : L"Проверяю…";
+                                    : loginWaiting_ ? L"Жду вход в браузере" : claudeLeaving_ ? L"Выхожу…" : L"Проверяю…";
             } else {
                 status = link.note.empty() ? std::wstring(L"Проверяю…") : link.note;
             }
@@ -8133,7 +8344,8 @@ void ChatWindow::PaintConnect(const Geometry& g) {
 
         // At the right: the row's button while it can be pressed, its arc while it works, a check once it is in.
         const bool onButton = hover_.row == i &&
-                              (hover_.target == Target::ConnectRow || hover_.target == Target::ConnectLink);
+                              (hover_.target == Target::ConnectRow || hover_.target == Target::ConnectLink ||
+                               hover_.target == Target::ConnectSignOut);
         if (working) {
             if (i == kClaudeLink && loginWaiting_ && !loginUrl_.empty()) {
                 Fill(button, 8.f, onButton ? kLine : kWindow);
@@ -8146,7 +8358,16 @@ void ChatWindow::PaintConnect(const Geometry& g) {
         } else if (link.state == LinkState::Checking) {
             spinner({button.right - 14.f, middle}, kSecondary);
         } else if (link.state == LinkState::Done) {
-            Check({button.right - 14.f, middle}, link.who.empty() && !link.note.empty() ? kSecondary : kAccent);
+            // Quiet, beside the account. Another row at work keeps the check; Claude's status keeps the arc.
+            const bool leaving = connectRow_ == kNoLink && !(i == kClaudeLink && authWorking_);
+            if (leaving) {
+                Fill(button, 8.f, onButton ? kLine : kWindow);
+                Text(L"Выйти", button_.get(), button, kPrimary);
+            } else if (i == kClaudeLink && authWorking_ && connectRow_ == kNoLink) {
+                spinner({button.right - 14.f, middle}, kAccent);
+            } else {
+                Check({button.right - 14.f, middle}, link.who.empty() && !link.note.empty() ? kSecondary : kAccent);
+            }
         } else {
             const bool free = connectRow_ == kNoLink;
             Fill(button, 8.f, onButton ? kAccent : kLine, free ? (onButton ? 0.85f : 1.f) : 0.45f);
@@ -11646,7 +11867,15 @@ std::wstring ChatWindow::TooltipText() {
         if (GrokUpdateAvailable()) {
             return L"Аккаунт · вышел Grok " + ToWide(grokLatest_);
         }
-        return L"Аккаунт, подключения, уведомления, версии Claude и Grok, выход";
+        return L"Аккаунт, подключения, уведомления, версии Claude и Grok";
+    case Target::ConnectSignOut:
+        if (hover_.row == kGrokLink) {
+            return L"Выйти только из Grok. Claude и GitHub останутся";
+        }
+        if (hover_.row == kGithubLink) {
+            return L"Забыть токен GitHub в клиенте. Сайт github.com останется в своём входе";
+        }
+        return L"Выйти только из Claude. Grok и GitHub останутся";
     case Target::ConnectRow:  // a failure in full: the row has room for its start only
         return hover_.row < links_.size() && links_[hover_.row].state == LinkState::Failed ? links_[hover_.row].note
                                                                                             : std::wstring();
@@ -11966,6 +12195,7 @@ D2D1_RECT_F ChatWindow::TipAnchor(const Geometry& g) const {
         return g.account;
     case Target::ConnectRow:
     case Target::ConnectLink:
+    case Target::ConnectSignOut:
         return row < g.linkButtons.size() ? g.links[row] : D2D1_RECT_F{};
     case Target::ConnectAll:
         return g.connectAll;
