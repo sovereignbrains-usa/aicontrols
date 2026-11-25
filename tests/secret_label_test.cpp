@@ -39,8 +39,8 @@ int main() {
            "netherlands server");
     Expect(otherServer.group == 0 && otherServer.title == "root@10.0.0.8", "an unknown server keeps user@host");
     Expect(key.group == 1 && key.heading == "Ключи SSH" && key.hint == "id_ed25519", "the ssh private key");
-    Expect(warp.group == 2 && warp.leaked && sub.group == 2 && sub.leaked && warp.rank < sub.rank, "leaked subscriptions");
-    Expect(aic::DescribeSecret("warp").leaked && aic::DescribeSecret("packetlab_sub").leaked, "leak mark ignores case");
+    Expect(warp.group == 2 && !warp.leaked && sub.group == 2 && !sub.leaked && warp.rank < sub.rank, "subscriptions");
+    Expect(!aic::DescribeSecret("warp").leaked && !aic::DescribeSecret("packetlab_sub").leaked, "rotated names stay unmarked");
     Expect(!github.leaked && !cloud.leaked && !router.leaked && !groq.leaked, "the rest are not marked leaked");
     Expect(github.group == 3 && aic::DescribeSecret("GITHUB_OAUTH_ID").group == 3 &&
                aic::DescribeSecret("GITHUB_OAUTH_SECRET").rank > aic::DescribeSecret("GITHUB_OAUTH_ID").rank,

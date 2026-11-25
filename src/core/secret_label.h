@@ -97,11 +97,12 @@ inline SecretFace DescribeSecret(std::string_view name) {
         SecretNameIs(name, "SSH_KEY")) {
         return Face(1, 0, "Ключи SSH", "Ключ серверов", std::string(name));
     }
+    // Unmarked after 25.11.2026: the subscription link was rotated, and WARP is a new device.
     if (SecretNameIs(name, "WARP")) {
-        return Face(2, 0, "Подписки", "WARP", "ключ аккаунта", true);
+        return Face(2, 0, "Подписки", "WARP", "ключ аккаунта", false);
     }
     if (SecretNameIs(name, "PACKETLAB_SUB")) {
-        return Face(2, 1, "Подписки", "packetlab", "ссылка подписки", true);
+        return Face(2, 1, "Подписки", "packetlab", "ссылка подписки", false);
     }
     if (SecretNameIs(name, "GITHUB")) {
         return Face(3, 0, "GitHub", "Токен", "пуш и релизы");
