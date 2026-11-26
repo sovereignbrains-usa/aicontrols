@@ -6,7 +6,7 @@ The client runs an agent’s command only after you confirm it. «Без воп�
 
 Secrets are stored with DPAPI, bound to your Windows account. The model sees names, not values. A value is filled into the command and cut out of what the command prints.
 
-Report a vulnerability in a private [advisory](https://github.com/sovereignbrains/aicontrols/security/advisories/new). Private vulnerability reporting is turned on under Settings → Security. If that page is closed, open an issue and add the label `security`. Do not paste secret values.
+Report a vulnerability in a private [advisory](https://github.com/sovereignbrains-usa/aicontrols/security/advisories/new). Private vulnerability reporting is turned on under Settings → Security. If that page is closed, open an issue and add the label `security`. Do not paste secret values.
 
 ## Русский
 
@@ -14,4 +14,4 @@ Report a vulnerability in a private [advisory](https://github.com/sovereignbrain
 
 Секреты лежат в DPAPI и привязаны к учётной записи Windows. Модель видит имена, не значения. Значение подставляется в команду и вырезается из вывода.
 
-Репорт — приватный [advisory](https://github.com/sovereignbrains/aicontrols/security/advisories/new). Приватные advisory включаются в Settings → Security. Если страница закрыта — issue с меткой `security`. Значения секретов не вставляйте.
+Репорт — приватный [advisory](https://github.com/sovereignbrains-usa/aicontrols/security/advisories/new). Приватные advisory включаются в Settings → Security. Если страница закрыта — issue с меткой `security`. Значения секретов не вставляйте.

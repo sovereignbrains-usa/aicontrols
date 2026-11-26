@@ -2,9 +2,9 @@ English · [Русский](README.ru.md)
 
 # AIControls
 
-[![release 0.1.133](https://img.shields.io/badge/release-0.1.133-4c92ff)](https://github.com/sovereignbrains/aicontrols/releases)
-[![MIT](https://img.shields.io/github/license/sovereignbrains/aicontrols)](LICENSE)
-[![build](https://github.com/sovereignbrains/aicontrols/actions/workflows/build.yml/badge.svg)](https://github.com/sovereignbrains/aicontrols/actions/workflows/build.yml)
+[![release 0.1.135](https://img.shields.io/badge/release-0.1.135-4c92ff)](https://github.com/sovereignbrains-usa/aicontrols/releases)
+[![MIT](https://img.shields.io/github/license/sovereignbrains-usa/aicontrols)](LICENSE)
+[![build](https://github.com/sovereignbrains-usa/aicontrols/actions/workflows/build.yml/badge.svg)](https://github.com/sovereignbrains-usa/aicontrols/actions/workflows/build.yml)
 
 Native Windows chat: [Claude Code](https://docs.claude.com/en/docs/claude-code) and Grok Build in one window.
 Tools ask before they act, secrets stay encrypted, and the window has a terminal, a browser, and GitHub repositories.
@@ -13,7 +13,7 @@ C++23, Win32, Direct2D and DirectWrite. No Electron, one exe.
 > Not an official Anthropic or xAI product. “Claude” is a trademark of Anthropic.
 > The client starts the `claude.exe` and `grok.exe` you already installed and talks to them.
 
-Current build: **0.1.133**.
+Current build: **0.1.135**.
 
 ## What it does
 
@@ -41,7 +41,7 @@ and show up as a line in the feed. One helper: `aicontrols:hand`, the same tools
 
 **Secrets** are name → value in one file, encrypted with DPAPI and bound to the Windows account.
 The model sees names only. Values are filled into the command (`env_secrets` or `{{secret:NAME}}`)
-and cut out of the output. Edit them in the sidebar.
+and cut out of the output. The sidebar groups them: servers, SSH keys, subscriptions, GitHub, Google Drive, Cloudflare, Groq, home, other. A leaked name is marked.
 
 **Window**
 - On the left, «Чаты | Проекты»: search, how old a chat is, a model dot, a draft, delete into the trash with «Вернуть».
@@ -70,7 +70,7 @@ and cut out of the output. Edit them in the sidebar.
 - For GitHub repositories, `git` on `PATH` and a token in the secret `GITHUB`.
 - For the browser tab, the WebView2 runtime (Windows 11 already has it).
 
-Installers are on the [releases](https://github.com/sovereignbrains/aicontrols/releases) page. Building from source is in [docs/build.md](docs/build.md).
+Installers are on the [releases](https://github.com/sovereignbrains-usa/aicontrols/releases) page. Building from source is in [docs/build.md](docs/build.md).
 
 ## Where your files are
 

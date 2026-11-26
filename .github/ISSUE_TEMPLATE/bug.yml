@@ -6,8 +6,8 @@ body:
     id: build
     attributes:
       label: Версия сборки
-      description: Версия установщика (0.1.113) или штамп из строки журнала (6910abcd, у сборки не из установщика — с хвостом dev).
-      placeholder: "0.1.113"
+      description: Версия установщика (0.1.135) или штамп из строки журнала (6910abcd, у сборки не из установщика — с хвостом dev).
+      placeholder: "0.1.135"
     validations:
       required: true
   - type: input

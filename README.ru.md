@@ -2,9 +2,9 @@
 
 # AIControls
 
-[![release 0.1.133](https://img.shields.io/badge/release-0.1.133-4c92ff)](https://github.com/sovereignbrains/aicontrols/releases)
-[![MIT](https://img.shields.io/github/license/sovereignbrains/aicontrols)](LICENSE)
-[![build](https://github.com/sovereignbrains/aicontrols/actions/workflows/build.yml/badge.svg)](https://github.com/sovereignbrains/aicontrols/actions/workflows/build.yml)
+[![release 0.1.135](https://img.shields.io/badge/release-0.1.135-4c92ff)](https://github.com/sovereignbrains-usa/aicontrols/releases)
+[![MIT](https://img.shields.io/github/license/sovereignbrains-usa/aicontrols)](LICENSE)
+[![build](https://github.com/sovereignbrains-usa/aicontrols/actions/workflows/build.yml/badge.svg)](https://github.com/sovereignbrains-usa/aicontrols/actions/workflows/build.yml)
 
 Нативный клиент чата под Windows: [Claude Code](https://docs.claude.com/en/docs/claude-code) и Grok Build в одном окне.
 Инструменты с подтверждением, секреты, терминал, браузер и репозитории GitHub.
@@ -13,7 +13,7 @@ C++23, Win32, Direct2D и DirectWrite. Без Electron, один exe.
 > Не официальный продукт Anthropic или xAI. «Claude» — товарный знак Anthropic.
 > Клиент запускает установленные у вас `claude.exe` и `grok.exe` и разговаривает с ними.
 
-Текущая сборка — **0.1.133**.
+Текущая сборка — **0.1.135**.
 
 ## Что умеет
 
@@ -41,7 +41,7 @@ C++23, Win32, Direct2D и DirectWrite. Без Electron, один exe.
 
 **Секреты** — «имя → значение» в файле, зашифрованном DPAPI (привязан к учётной записи Windows).
 Модель видит только имена: значения подставляются в команду (`env_secrets` или `{{secret:ИМЯ}}`)
-и вырезаются из вывода. Правка — в сайдбаре.
+и вырезаются из вывода. В сайдбаре они по группам: серверы, ключи SSH, подписки, GitHub, Google Drive, Cloudflare, Groq, дом, другое. У утёкшего имени стоит метка.
 
 **Окно**
 - Слева вкладки «Чаты | Проекты»: поиск, возраст чата, точка модели, черновик, удаление в корзину с «Вернуть».
@@ -70,7 +70,7 @@ C++23, Win32, Direct2D и DirectWrite. Без Electron, один exe.
 - Для репозиториев GitHub — `git` в `PATH` и токен в секрете `GITHUB`.
 - Для вкладки браузера — среда WebView2 (на Windows 11 она уже есть).
 
-Готовые установщики — на странице [releases](https://github.com/sovereignbrains/aicontrols/releases). Сборка из исходников — в [docs/build.md](docs/build.md).
+Готовые установщики — на странице [releases](https://github.com/sovereignbrains-usa/aicontrols/releases). Сборка из исходников — в [docs/build.md](docs/build.md).
 
 ## Где что лежит
 
